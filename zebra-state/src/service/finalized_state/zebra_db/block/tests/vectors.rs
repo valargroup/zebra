@@ -23,6 +23,7 @@ use zebra_chain::{
         Block, Height,
     },
     block_info::BlockInfo,
+    history_tree::HistoryTreeBlockParts,
     orchard,
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
@@ -1386,6 +1387,13 @@ fn synthetic_headers_from_state(
     let mut previous_hash = anchor_hash;
     let mut previous_height = anchor_height;
     let mut nonce_tag = nonce_seed;
+    // Running ZIP-221 MMR of the (zero) `root_at` roots, so each synthetic header commits the
+    // ChainHistoryRoot that header-sync verification reconstructs from those same roots
+    // (design §6). Anchored at genesis in these tests, so it starts empty.
+    let mut history_tree = zebra_chain::history_tree::HistoryTree::default();
+    let empty_sapling = sapling::tree::NoteCommitmentTree::default().root();
+    let empty_orchard = orchard::tree::NoteCommitmentTree::default().root();
+    let empty_ironwood = zebra_chain::ironwood::tree::NoteCommitmentTree::default().root();
 
     (0..count)
         .map(|_| {
@@ -1414,8 +1422,36 @@ fn synthetic_headers_from_state(
             header.nonce.0[0] = header.nonce.0[0].wrapping_add(nonce_tag);
             nonce_tag = nonce_tag.wrapping_add(1);
 
+            // Commit the running MMR root (ChainHistoryRoot) for Heartwood+ heights; the
+            // Heartwood activation block commits the all-zero reserved value; pre-Heartwood
+            // keeps the template's reserved commitment.
+            match history_tree.hash() {
+                Some(root) => header.commitment_bytes = <[u8; 32]>::from(root).into(),
+                None if Some(candidate_height)
+                    == NetworkUpgrade::Heartwood.activation_height(&network) =>
+                {
+                    header.commitment_bytes = [0u8; 32].into();
+                }
+                None => {}
+            }
+
             let header = Arc::new(header);
             previous_hash = block::Hash::from(&*header);
+            history_tree
+                .push_from_parts(
+                    &network,
+                    HistoryTreeBlockParts {
+                        header: &header,
+                        height: candidate_height,
+                        sapling_root: &empty_sapling,
+                        orchard_root: &empty_orchard,
+                        ironwood_root: &empty_ironwood,
+                        sapling_tx: 0,
+                        orchard_tx: 0,
+                        ironwood_tx: 0,
+                    },
+                )
+                .expect("folding the synthetic zero roots into the test MMR succeeds");
             previous_height = candidate_height;
             context.insert(0, (header.difficulty_threshold, header.time));
             context.truncate(crate::service::check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN);

@@ -23,7 +23,12 @@ use std::{
 };
 
 use zebra_chain::{
-    block, ironwood, orchard, parallel::tree::NoteCommitmentTrees, parameters::Network, sapling,
+    block, ironwood, orchard,
+    parallel::{
+        commitment_aux::BlockCommitmentRoots, commitment_aux_verify, tree::NoteCommitmentTrees,
+    },
+    parameters::Network,
+    sapling,
 };
 use zebra_db::{
     block::{RetentionPlan, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT},
@@ -75,7 +80,6 @@ static COMMIT_COMPUTE_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
 pub mod column_family;
 
 pub(crate) mod commitment_aux;
-pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
 mod vct;
@@ -100,7 +104,7 @@ pub use disk_format::{
     FromDisk, IntoDisk, OutputLocation, RawBytes, TransactionIndex, TransactionLocation,
     MAX_ON_DISK_HEIGHT,
 };
-pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError, NextVctBlock};
+pub use vct::{validate_final_frontiers_bytes, FinalFrontiersValidationError};
 pub use zebra_db::ZebraDb;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -614,7 +618,6 @@ impl FinalizedState {
         &mut self,
         ordered_block: QueuedCheckpointVerified,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
         (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
@@ -623,7 +626,6 @@ impl FinalizedState {
         let result = self.commit_finalized_direct(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
-            next_vct_block,
             "commit checkpoint-verified request",
         );
 
@@ -671,7 +673,6 @@ impl FinalizedState {
         &mut self,
         finalizable_block: FinalizableBlock,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
-        next_vct_block: Option<NextVctBlock>,
         source: &str,
     ) -> Result<(block::Hash, NoteCommitmentTrees), CommitCheckpointVerifiedError> {
         let (height, hash, finalized, prev_note_commitment_trees, retention, fast_write) =
@@ -704,8 +705,8 @@ impl FinalizedState {
 
                     // In vct mode, if the source has this height's roots at or below the
                     // last checkpoint height, we skip the per-block note-commitment frontier recompute
-                    // (`update_trees_parallel`). Instead, we validate the peer-supplied roots
-                    // against the successor block's header/MMR.
+                    // (`update_trees_parallel`) and fold the supplied roots into the anchor
+                    // set and history leaf instead.
                     let vct_roots = self.vct.source().and_then(|v| {
                         if vct_last_checkpoint_height
                             .is_some_and(|last_checkpoint_height| height > last_checkpoint_height)
@@ -727,105 +728,53 @@ impl FinalizedState {
                             .source()
                             .and_then(|v| v.final_frontiers_for_last_checkpoint(height));
 
-                        // This block's own commitment check is identical to the
-                        // previous vct block's look-ahead. When that look-ahead
-                        // already validated this exact header, skip the duplicate.
-                        let block_hash = block.hash();
+                        // These supplied roots were already verified against the
+                        // checkpoint-committed header chain at header-sync commit (design §6)
+                        // before they were persisted, so the committer trusts them. It
+                        // re-checks this block's own header commitment against the running tree
+                        // as a cheap consensus-equivalence invariant and folds the roots — but
+                        // no longer waits for a buffered successor to confirm them, removing the
+                        // successor dependency that deadlocked the write worker.
+                        let roots = BlockCommitmentRoots {
+                            height,
+                            sapling_root,
+                            orchard_root,
+                            ironwood_root,
+                            sapling_tx: block.sapling_transactions_count(),
+                            orchard_tx: block.orchard_transactions_count(),
+                            ironwood_tx: block.ironwood_transactions_count(),
+                            auth_data_root: precomputed_auth_data_root
+                                .unwrap_or_else(|| block.auth_data_root()),
+                        };
 
-                        // Defense in depth: only a witness that links to this block can
-                        // authenticate its roots — a non-successor's commitment binds a
-                        // different parent tree, so verifying against it would fail and
-                        // wrongly evict a good supplied root. Treat a non-linking witness
-                        // as absent, so the await-successor deferral below handles it. The
-                        // write worker only buffers direct successors, so this should
-                        // never fire.
-                        let next_vct_block = next_vct_block.filter(|next_vct_block| {
-                            let links =
-                                next_vct_block.block.header.previous_block_hash == block_hash;
-                            if !links {
-                                tracing::warn!(
-                                    ?height,
-                                    witness_parent = ?next_vct_block.block.header.previous_block_hash,
-                                    expected_parent = ?block_hash,
-                                    "VCT: ignoring a successor witness that does not link \
-                                     to the block being committed"
-                                );
-                            }
-                            links
-                        });
-
-                        let is_prevalidated =
-                            self.vct.prevalidated_next() == Some((height, block_hash));
-                        if is_prevalidated {
-                            if let Some(v) = self.vct.source() {
-                                v.record_prevalidated();
-                            }
-                            // Observability: the previous fast block's look-ahead already
-                            // validated this header, so its commitment check was skipped (the
-                            // dedup). A subset of `state.vct.fast.block.count`.
-                            metrics::counter!("state.vct.prevalidated.block.count").increment(1);
-                        }
-
-                        let mut verification_items = vec![
-                            commitment_aux_verify::CommitmentRootVerification::with_roots(
-                                block.clone(),
-                                sapling_root,
-                                orchard_root,
-                                ironwood_root,
-                                precomputed_auth_data_root,
-                                is_prevalidated,
-                            ),
-                        ];
-
-                        // If a buffered VCT successor block is available, we verify the current block's
-                        // supplied roots against the successor block's header/MMR.
-                        if let Some(next_vct_block) = &next_vct_block {
-                            verification_items.push(
-                                commitment_aux_verify::CommitmentRootVerification::header_only(
-                                    next_vct_block.block.clone(),
-                                    next_vct_block.auth_data_root,
-                                ),
-                            );
-                        }
-
-                        // Verifies this block's own header, folds its supplied roots into
-                        // the candidate tree, and when buffered checks the successor header
-                        // against that candidate (the one-block lag).
+                        // Confirms this block's own header commitment against the running tree
+                        // and folds its supplied roots into the candidate tree.
                         let candidate = COMMIT_COMPUTE_POOL
                             .install(|| {
-                                commitment_aux_verify::verify_commitment_roots(
+                                commitment_aux_verify::header_commitment_is_valid_for_chain_history(
+                                    &block.header,
+                                    height,
+                                    &network,
+                                    &history_tree,
+                                    roots.auth_data_root,
+                                )
+                                .map_err(|error| (height, error))?;
+
+                                commitment_aux_verify::append_confirmed_roots(
                                     &network,
                                     (*history_tree).clone(),
-                                    verification_items,
+                                    std::iter::once((block.header.as_ref(), &roots)),
                                 )
+                                .map_err(|(fold_height, error)| {
+                                    (
+                                        fold_height,
+                                        commitment_aux_verify::SuppliedRootsError::from(error),
+                                    )
+                                })
                             })
                             .map_err(|(_fail_height, error)| {
-                                self.vct.clear_prevalidated_next();
                                 self.vct_reject_supplied_root(height, error)
                             })?;
-
-                        if let Some(next_vct_block) = &next_vct_block {
-                            self.vct.mark_prevalidated(
-                                (height + 1).expect("checkpoint block heights are valid"),
-                                next_vct_block.block.hash(),
-                            );
-                        } else if self
-                            .vct
-                            .source()
-                            .is_some_and(|v| v.vct_root_needs_successor(height, &network))
-                        {
-                            // Untrusted root at/above Heartwood, no successor to confirm it,
-                            // not the last checkpoint: defer rather than persist it unverified. Leaves
-                            // the database untouched; the block re-commits once the successor
-                            // is buffered.
-                            metrics::counter!("state.vct.root.await_successor.count").increment(1);
-                            return Err(ValidateContextError::VctSuppliedRootAwaitingSuccessor {
-                                height,
-                            }
-                            .into());
-                        } else {
-                            self.vct.clear_prevalidated_next();
-                        }
 
                         history_tree = Arc::new(candidate);
                         if let Some(v) = self.vct.source() {
@@ -904,10 +853,6 @@ impl FinalizedState {
                             ValidateContextError::VctSuppliedRootUnavailable { height }.into()
                         );
                     } else {
-                        // Not a fast block: any cached pre-validation does not apply to
-                        // the next fast block (its parent frontier differs), so clear it.
-                        self.vct.clear_prevalidated_next();
-
                         // Observability: this block recomputed the note-commitment frontier
                         // (the legacy path) — either VCT is off, or the fast path's roots were
                         // unavailable for this height and it safely fell back.
@@ -1111,28 +1056,6 @@ impl FinalizedState {
             .is_some_and(|v| v.is_enabled() && v.vct_roots_at_height(height).is_some())
     }
 
-    /// Clears any cached successor prevalidation.
-    ///
-    /// The finalized write loop calls this when it discards checkpoint queue state, so a
-    /// look-ahead header that no longer corresponds to the next committed block cannot
-    /// authorize a later fast-path skip.
-    pub(crate) fn clear_vct_prevalidated_next(&mut self) {
-        self.vct.clear_prevalidated_next();
-    }
-
-    /// `true` when committing `height` on the fast path needs a buffered successor before
-    /// it can safely persist this block's supplied roots.
-    ///
-    /// Only untrusted peer-supplied roots at or above Heartwood require this. The
-    /// checkpoint handoff is exempt because its embedded final frontiers are verified
-    /// against this block's roots before the real tip treestate is written; trusted
-    /// local fixtures can commit their tip root on the in-arrears check.
-    pub(crate) fn vct_fast_needs_successor(&self, height: block::Height) -> bool {
-        self.vct
-            .source()
-            .is_some_and(|v| v.vct_root_needs_successor(height, &self.network()))
-    }
-
     /// Verify checkpoint handoff frontiers against this block's supplied roots.
     #[allow(clippy::too_many_arguments)]
     fn vct_verify_last_checkpoint_frontier_roots(
@@ -1149,7 +1072,6 @@ impl FinalizedState {
             || orchard_frontier.root() != *orchard_root
             || ironwood_frontier.root() != *ironwood_root
         {
-            self.vct.clear_prevalidated_next();
             return Err(self.vct_reject_supplied_root(
                 height,
                 ValidateContextError::VctSuppliedRootUnavailable { height },
@@ -1173,7 +1095,7 @@ impl FinalizedState {
     fn vct_reject_supplied_root(
         &self,
         height: block::Height,
-        error: ValidateContextError,
+        error: impl std::fmt::Debug,
     ) -> CommitCheckpointVerifiedError {
         if let Some(v) = self.vct.source() {
             v.invalidate_fast_root(height);
@@ -1190,17 +1112,13 @@ impl FinalizedState {
     /// Test-only: enable fast mode reading roots/frontiers from an arbitrary
     /// [`commitment_aux::CommitmentRootSource`] (e.g. a payload produced from a
     /// database via [`commitment_aux::produce_block_roots`]), so the producer→consumer
-    /// round-trip can be exercised in-process. `requires_verified_successor` marks
-    /// whether the installed source is untrusted and must defer tip roots until their
-    /// successor is buffered.
+    /// round-trip can be exercised in-process.
     #[cfg(test)]
     pub(in crate::service::finalized_state) fn enable_vct_fast_source(
         &mut self,
         source: Box<dyn commitment_aux::CommitmentRootSource>,
-        requires_verified_successor: bool,
     ) {
-        self.vct
-            .install_test_source(source, requires_verified_successor);
+        self.vct.install_test_source(source);
     }
 
     /// Test-only: the fast-sync handoff height recorded in the database marker, if any.
@@ -1213,16 +1131,6 @@ impl FinalizedState {
     #[cfg(test)]
     pub(crate) fn vct_fast_count(&self) -> u64 {
         self.vct.source().map(|v| v.vct_count()).unwrap_or(0)
-    }
-
-    /// Test-only: number of fast blocks whose own commitment check was skipped by
-    /// the dedup (the previous block's look-ahead already validated them).
-    #[cfg(test)]
-    pub(crate) fn vct_prevalidated_count(&self) -> u64 {
-        self.vct
-            .source()
-            .map(|v| v.prevalidated_count())
-            .unwrap_or(0)
     }
 
     /// POC: log the consensus-equivalence digest (anchor sets + history root) and

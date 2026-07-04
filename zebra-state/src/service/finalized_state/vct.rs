@@ -13,27 +13,12 @@ use std::sync::{
 use thiserror::Error;
 #[cfg(test)]
 use zebra_chain::parallel::tree::NoteCommitmentTrees;
-use zebra_chain::{
-    block::{self, merkle::AuthDataRoot, Block},
-    ironwood, orchard,
-    parameters::{Network, NetworkUpgrade},
-    sapling, sprout,
-};
+use zebra_chain::{block, ironwood, orchard, parameters::Network, sapling, sprout};
 
 use super::{
     commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource},
     ZebraDb,
 };
-
-/// A buffered VCT successor block used to authenticate the current block's
-/// supplied note-commitment roots.
-#[derive(Clone, Debug)]
-pub struct NextVctBlock {
-    /// The successor block whose header commits to the current block's VCT roots.
-    pub(crate) block: Arc<Block>,
-    /// The successor block's precomputed ZIP-244 auth-data root, if available.
-    pub(crate) auth_data_root: Option<AuthDataRoot>,
-}
 
 /// Embedded verified final note-commitment frontiers for Mainnet.
 const MAINNET_FINAL_FRONTIERS: &[u8] = include_bytes!("vct/mainnet-frontier.bin");
@@ -71,15 +56,8 @@ pub(crate) struct VctState {
     /// Where the verified per-block roots and final frontier come from. The
     /// committer reads roots/final frontier through this seam only.
     source: Box<dyn CommitmentRootSource>,
-    /// Whether roots from this VCT state must be confirmed against a buffered successor
-    /// before they are committed.
-    requires_verified_successor: bool,
     /// Count of blocks that took the VCT fast-sync, for the run summary.
     vct_count: AtomicU64,
-    /// Count of VCT fast-sync blocks whose own commitment check was skipped because the
-    /// previous block's look-ahead already validated it (the dedup). Lets tests
-    /// assert the dedup actually engages, so it can't be silently regressed.
-    prevalidated_count: AtomicU64,
 }
 
 /// Which commitment-root source the committer uses, resolved from the (already read)
@@ -146,9 +124,7 @@ impl VctState {
                 Some(Arc::new(VctState {
                     enabled: true,
                     source: Box::new(source),
-                    requires_verified_successor: true,
                     vct_count: AtomicU64::new(0),
-                    prevalidated_count: AtomicU64::new(0),
                 }))
             }
 
@@ -183,25 +159,6 @@ impl VctState {
         }
 
         self.source.vct_root(height)
-    }
-
-    /// `true` when committing `height` on the vct path needs a buffered successor before
-    /// it can safely persist this block's supplied roots.
-    ///
-    /// Only untrusted peer-supplied roots at or above Heartwood require this. The
-    /// checkpoint handoff is exempt because its embedded final frontiers are verified
-    /// against this block's roots before the real tip treestate is written; trusted
-    /// local fixtures can commit their tip root on the in-arrears check.
-    pub(super) fn vct_root_needs_successor(
-        &self,
-        height: block::Height,
-        network: &Network,
-    ) -> bool {
-        self.enabled
-            && self.vct_roots_at_height(height).is_some()
-            && self.requires_verified_successor
-            && self.source.final_frontiers().height != height
-            && Some(height) >= NetworkUpgrade::Heartwood.activation_height(network)
     }
 
     /// Discard the supplied root for `height` after it failed verification, so a re-fetch
@@ -245,43 +202,27 @@ impl VctState {
         self.vct_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a fast block whose own commitment check was skipped by the dedup.
-    pub(super) fn record_prevalidated(&self) {
-        self.prevalidated_count.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Number of blocks that took the fast path so far.
     pub(super) fn vct_count(&self) -> u64 {
         self.vct_count.load(Ordering::Relaxed)
-    }
-
-    /// Number of VCT fast-sync blocks whose own commitment check the dedup skipped.
-    #[cfg(test)]
-    pub(super) fn prevalidated_count(&self) -> u64 {
-        self.prevalidated_count.load(Ordering::Relaxed)
     }
 
     /// Test-only: build fast-mode state from an arbitrary commitment-root source
     /// (e.g. a payload produced from a database), so the producer→consumer round-trip
     /// can be exercised without networking.
     #[cfg(test)]
-    pub(super) fn test_with_source(
-        source: Box<dyn CommitmentRootSource>,
-        requires_verified_successor: bool,
-    ) -> Arc<Self> {
+    pub(super) fn test_with_source(source: Box<dyn CommitmentRootSource>) -> Arc<Self> {
         Arc::new(VctState {
             enabled: true,
             source,
-            requires_verified_successor,
             vct_count: AtomicU64::new(0),
-            prevalidated_count: AtomicU64::new(0),
         })
     }
 }
 
 /// Commit-time vct state carried by [`super::FinalizedState`]: the configured
-/// root source plus the commit-loop dedup and below-last-checkpoint state its
-/// fast path depends on, grouped so their invariants live next to the data they guard.
+/// root source plus the below-last-checkpoint state its fast path depends on,
+/// grouped so their invariants live next to the data they guard.
 #[derive(Clone, Debug)]
 pub(crate) struct VctCommitState {
     /// The root source (peer/fixture/capture mode), or `None` for any of:
@@ -289,11 +230,6 @@ pub(crate) struct VctCommitState {
     /// - vct fast sync is disabled
     /// - legacy Zebra checkpoint sync
     source: Option<Arc<VctState>>,
-
-    /// `(height, hash)` of the next block already validated by the previous fast
-    /// commit's look-ahead, so its own commitment check can be skipped. Guarded by
-    /// hash identity, so a stale or cloned value can't cause an incorrect skip.
-    prevalidated_next: Option<(block::Height, block::Hash)>,
 
     /// `true` while a vct sync is in-progress below the last checkpoint height.
     /// During this time, we do not reconstruct per-height note-commitment trees.
@@ -310,7 +246,6 @@ impl VctCommitState {
     ) -> Self {
         VctCommitState {
             source,
-            prevalidated_next: None,
             is_vct_sync_below_last_checkpoint,
         }
     }
@@ -323,29 +258,6 @@ impl VctCommitState {
     /// `true` while the note-commitment frontier is below the last checkpoint height.
     pub(super) fn is_below_last_checkpoint(&self) -> bool {
         self.is_vct_sync_below_last_checkpoint
-    }
-
-    /// The cached successor prevalidation, if any.
-    pub(super) fn prevalidated_next(&self) -> Option<(block::Height, block::Hash)> {
-        self.prevalidated_next
-    }
-
-    /// Caches the next block's `(height, hash)` as already validated by this
-    /// fast commit's look-ahead.
-    pub(super) fn mark_prevalidated(&mut self, height: block::Height, hash: block::Hash) {
-        self.prevalidated_next = Some((height, hash));
-    }
-
-    /// Clears any cached successor prevalidation.
-    pub(super) fn clear_prevalidated_next(&mut self) {
-        self.prevalidated_next = None;
-    }
-
-    /// Test-only: overwrites the cached successor prevalidation, so tests can
-    /// install a stale or forged entry to exercise the dedup's guard checks.
-    #[cfg(test)]
-    pub(super) fn set_prevalidated_next(&mut self, next: Option<(block::Height, block::Hash)>) {
-        self.prevalidated_next = next;
     }
 
     /// Starts a VCT sync below the last checkpoint height: below the last checkpoint height,
@@ -362,18 +274,9 @@ impl VctCommitState {
 
     /// Test-only: installs an arbitrary [`CommitmentRootSource`] as fast-mode
     /// state, so the producer→consumer round-trip can be exercised in-process.
-    /// `requires_verified_successor` marks an untrusted source that must defer
-    /// tip roots until their successor is buffered.
     #[cfg(test)]
-    pub(super) fn install_test_source(
-        &mut self,
-        source: Box<dyn CommitmentRootSource>,
-        requires_verified_successor: bool,
-    ) {
-        self.source = Some(VctState::test_with_source(
-            source,
-            requires_verified_successor,
-        ));
+    pub(super) fn install_test_source(&mut self, source: Box<dyn CommitmentRootSource>) {
+        self.source = Some(VctState::test_with_source(source));
     }
 }
 
@@ -519,54 +422,6 @@ mod tests {
     }
 
     #[test]
-    fn successor_policy_is_vct_state_data() {
-        let network = Network::Mainnet;
-        let height = NetworkUpgrade::Heartwood
-            .activation_height(&network)
-            .expect("mainnet has a Heartwood activation height");
-        let root_map = || {
-            std::iter::once((
-                height.0,
-                (Default::default(), Default::default(), Default::default()),
-            ))
-            .collect()
-        };
-        // The handoff is above the height under test, so the handoff exemption
-        // does not mask the successor policy.
-        let frontiers = || FinalFrontiers {
-            height: (height + 1_000).expect("test height is valid"),
-            sapling: Arc::new(Default::default()),
-            orchard: Arc::new(Default::default()),
-            sprout: Arc::new(Default::default()),
-            ironwood: Arc::new(Default::default()),
-        };
-
-        let trusted = VctState::test_with_source(
-            Box::new(super::super::commitment_aux::FixtureSource::new(
-                root_map(),
-                frontiers(),
-            )),
-            false,
-        );
-        assert!(
-            !trusted.vct_root_needs_successor(height, &network),
-            "trusted fixture roots can commit without a buffered successor"
-        );
-
-        let untrusted = VctState::test_with_source(
-            Box::new(super::super::commitment_aux::FixtureSource::new(
-                root_map(),
-                frontiers(),
-            )),
-            true,
-        );
-        assert!(
-            untrusted.vct_root_needs_successor(height, &network),
-            "untrusted roots defer until a buffered successor verifies them"
-        );
-    }
-
-    #[test]
     fn vct_root_is_bounded_by_handoff_height() {
         let handoff = block::Height(10);
         let after_handoff = (handoff + 1).expect("test height is valid");
@@ -588,12 +443,9 @@ mod tests {
             ironwood: Arc::new(ironwood::tree::NoteCommitmentTree::default()),
         };
 
-        let bounded = VctState::test_with_source(
-            Box::new(super::super::commitment_aux::FixtureSource::new(
-                roots, frontiers,
-            )),
-            false,
-        );
+        let bounded = VctState::test_with_source(Box::new(
+            super::super::commitment_aux::FixtureSource::new(roots, frontiers),
+        ));
         assert!(
             bounded.vct_roots_at_height(handoff).is_some(),
             "the handoff root remains fast-path eligible"

@@ -49,17 +49,20 @@ use crate::{
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
-fn roots_from_height(start: Height, count: u32) -> Vec<BlockCommitmentRoots> {
+fn roots_from_height(start: Height, count: usize) -> Vec<BlockCommitmentRoots> {
     (0..count)
-        .map(|offset| BlockCommitmentRoots {
-            height: Height(start.0 + offset),
-            sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-            orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-            ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-            sapling_tx: 0,
-            orchard_tx: 0,
-            ironwood_tx: 0,
-            auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+        .map(|offset| {
+            let offset = u32::try_from(offset).expect("test root count fits in u32");
+            BlockCommitmentRoots {
+                height: Height(start.0 + offset),
+                sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+                orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+                ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+                sapling_tx: 0,
+                orchard_tx: 0,
+                ironwood_tx: 0,
+                auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
+            }
         })
         .collect()
 }
@@ -753,6 +756,19 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
             Height(1).into()
         ),
         None
+    );
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::BestHeaderHistoryTree {
+                verified_block_tip: Height(0),
+                best_header_tip: Height(2),
+            })
+            .await?,
+        ReadResponse::BestHeaderHistoryTree {
+            tree: Arc::new(zebra_chain::history_tree::HistoryTree::default()),
+            frontier: (Height(2), block2_hash),
+        },
     );
     assert_eq!(
         read_state

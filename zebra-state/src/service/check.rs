@@ -174,7 +174,38 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
     history_tree: &HistoryTree,
     precomputed_auth_data_root: Option<AuthDataRoot>,
 ) -> Result<(), ValidateContextError> {
-    match block.commitment(network)? {
+    let height = block
+        .coinbase_height()
+        .ok_or(CommitmentError::MissingBlockHeight {
+            block_hash: block.hash(),
+        })?;
+    // Use the auth data root precomputed by the verifier when available (byte-identical to
+    // recomputing it here), so the single-threaded committer does not repeat the work.
+    let auth_data_root = precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root());
+    header_commitment_is_valid_for_chain_history(
+        &block.header,
+        height,
+        network,
+        history_tree,
+        auth_data_root,
+    )
+}
+
+/// Header-driven core of [`block_commitment_is_valid_for_chain_history`]: check a block's
+/// header commitment against `history_tree` (the history tree as of its parent) plus the
+/// block's own `auth_data_root`, without needing the block body.
+///
+/// This is what lets header-sync verification (design §6) authenticate supplied roots against
+/// the checkpoint-committed header chain before any body is downloaded. The block-based entry
+/// point above delegates here after resolving the height and auth-data root from the block.
+pub(crate) fn header_commitment_is_valid_for_chain_history(
+    header: &block::Header,
+    height: block::Height,
+    network: &Network,
+    history_tree: &HistoryTree,
+    auth_data_root: AuthDataRoot,
+) -> Result<(), ValidateContextError> {
+    match header.commitment(network, height)? {
         block::Commitment::PreSaplingReserved(_)
         | block::Commitment::FinalSaplingRoot(_)
         | block::Commitment::ChainHistoryActivationReserved => {
@@ -227,16 +258,13 @@ pub(crate) fn block_commitment_is_valid_for_chain_history(
             let history_tree_root = history_tree
                 .hash()
                 .or_else(|| {
-                    (NetworkUpgrade::Heartwood.activation_height(network)
-                        == block.coinbase_height())
-                    .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
+                    (NetworkUpgrade::Heartwood.activation_height(network) == Some(height))
+                        .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
                 })
                 .expect(
                     "the history tree of the previous block must exist \
                  since the current block has a ChainHistoryBlockTxAuthCommitment",
                 );
-            let auth_data_root =
-                precomputed_auth_data_root.unwrap_or_else(|| block.auth_data_root());
             let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
                 &history_tree_root,
                 &auth_data_root,

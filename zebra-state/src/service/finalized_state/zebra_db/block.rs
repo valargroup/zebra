@@ -22,7 +22,10 @@ use zebra_chain::{
     amount::NonNegative,
     block::{self, Block, Height},
     ironwood, orchard,
-    parallel::{commitment_aux::BlockCommitmentRoots, tree::NoteCommitmentTrees},
+    parallel::{
+        commitment_aux::BlockCommitmentRoots, commitment_aux_verify::VerifiedHeaderCommitmentRoots,
+        tree::NoteCommitmentTrees,
+    },
     parameters::{Network, GENESIS_PREVIOUS_BLOCK_HASH},
     sapling,
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashSerialize as _},
@@ -1982,6 +1985,47 @@ impl DiskWriteBatch {
         body_sizes: &[u32],
         tree_aux_roots: &[BlockCommitmentRoots],
     ) -> Result<block::Hash, CommitHeaderRangeError> {
+        self.prepare_header_range_batch_inner(
+            zebra_db,
+            anchor,
+            headers,
+            body_sizes,
+            tree_aux_roots,
+            None,
+        )
+    }
+
+    /// Prepare a database batch containing a contextually validated header range
+    /// and any header-layer verified tree-aux roots for its confirmed prefix.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn prepare_header_range_batch_with_verified_roots(
+        &mut self,
+        zebra_db: &ZebraDb,
+        anchor: block::Hash,
+        headers: &[Arc<block::Header>],
+        body_sizes: &[u32],
+        verified_roots: &VerifiedHeaderCommitmentRoots,
+    ) -> Result<block::Hash, CommitHeaderRangeError> {
+        self.prepare_header_range_batch_inner(
+            zebra_db,
+            anchor,
+            headers,
+            body_sizes,
+            verified_roots.confirmed_roots(),
+            Some(verified_roots),
+        )
+    }
+
+    #[allow(clippy::unwrap_in_result)]
+    fn prepare_header_range_batch_inner(
+        &mut self,
+        zebra_db: &ZebraDb,
+        anchor: block::Hash,
+        headers: &[Arc<block::Header>],
+        body_sizes: &[u32],
+        tree_aux_roots: &[BlockCommitmentRoots],
+        verified_roots: Option<&VerifiedHeaderCommitmentRoots>,
+    ) -> Result<block::Hash, CommitHeaderRangeError> {
         if headers.is_empty() {
             return Err(CommitHeaderRangeError::EmptyRange);
         }
@@ -2182,8 +2226,40 @@ impl DiskWriteBatch {
             }
         }
 
-        for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
-        {
+        let confirmed_roots_by_height = if let Some(verified_roots) = verified_roots {
+            let range_start = validated_headers
+                .first()
+                .map(|(height, _hash, _header, _body_size)| *height)
+                .expect("headers is non-empty");
+            let range_tip = validated_headers
+                .last()
+                .map(|(height, _hash, _header, _body_size)| *height)
+                .expect("headers is non-empty");
+
+            for (index, roots) in verified_roots.confirmed_roots().iter().enumerate() {
+                let offset =
+                    u32::try_from(index).map_err(|_| CommitHeaderRangeError::HeightOverflow)?;
+                let expected_height = (range_start + i64::from(offset))
+                    .ok_or(CommitHeaderRangeError::HeightOverflow)?;
+
+                if roots.height != expected_height || roots.height > range_tip {
+                    return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
+                        expected_height,
+                        root_height: roots.height,
+                    });
+                }
+            }
+
+            verified_roots
+                .confirmed_roots()
+                .iter()
+                .map(|roots| (roots.height, roots))
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
+
+        for (height, hash, header, body_size) in validated_headers.into_iter() {
             let same_header = zebra_db.zakura_header_hash(height) == Some(hash);
             let advertised_body_size = match (
                 same_header,
@@ -2210,8 +2286,8 @@ impl DiskWriteBatch {
             // over committed heights (a header store behind the body store, or a
             // late range response racing body sync) must never overwrite the
             // verified row: committed roots win on any overlap (design §9). The tip's root is absent
-            // from the confirmed prefix (`tree_aux_roots.get` is `None`), so it is never persisted.
-            if let Some(roots) = tree_aux_roots.get(index) {
+            // from the confirmed prefix, so it is never persisted.
+            if let Some(roots) = confirmed_roots_by_height.get(&height) {
                 if !zebra_db.contains_body_at_height(height) {
                     self.zs_insert(
                         &roots_by_height,
