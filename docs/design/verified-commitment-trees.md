@@ -50,9 +50,9 @@ peer GetHeaders { want_tree_aux_roots } ─▶ header-sync reactor ─▶ header
 (1) Node starts under `consensus.checkpoint_sync = true` on
 Mainnet → the committer is built in peer mode.
 (2) Header sync requests the per-height roots in-band with the finalized header ranges it already fetches (`want_tree_aux_roots`) and persists the received roots provisionally into the database ahead of the committer (§4.2). (3) Each checkpoint block: look up its root; verify it (own header now, successor header next block, plus
-the direct below-Heartwood/below-NU5 checks); fold it in; freeze the frontier (§6, §7).
+the direct below-Heartwood/below-NU5/below-Nu6_3 checks); fold it in; freeze the frontier (§6, §7).
 (4) At the last checkpoint height, verify and write the embedded frontier and unfreeze.
-(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad/missing root anywhere in the frozen window parks the block and retries in place as header sync re-delivers the root; it never writes wrong state.
+(5) Above the last checkpoint height, ordinary semantic verification resumes from the real frontier. A bad/missing root anywhere in the frozen window parks the block and retries in place; it never writes wrong state. Roots are not individually re-requested, so a hole that no in-flight re-delivery of the same header range fills is a fail-closed stall, surfaced loudly by the §8 metrics.
 
 **Glossary.**
 
@@ -60,10 +60,10 @@ the direct below-Heartwood/below-NU5 checks); fold it in; freeze the frontier (�
 | --- | --- |
 | **Checkpoint sync** | `consensus.checkpoint_sync = true`: trust the embedded checkpoint list for headers/PoW up to the max checkpoint. Precondition for VCT. |
 | **last checkpoint height** | The network's max checkpoint height; the boundary where the fast path ends and the embedded final frontier is written. |
-| **Fast root** | A peer-supplied `(sapling_root, orchard_root)` for one height, folded in after verification instead of being recomputed. |
-| **Final frontier** | The real Sapling/Orchard/Sprout note-commitment trees at the last checkpoint height, embedded in the binary (§5.2) and written as the tip treestate at last checkpoint height. |
+| **Fast root** | A peer-supplied `(sapling_root, orchard_root, ironwood_root)` for one height, folded in after verification instead of being recomputed. |
+| **Final frontier** | The real Sapling/Orchard/Sprout/Ironwood note-commitment trees at the last checkpoint height, embedded in the binary (§5.2) and written as the tip treestate at last checkpoint height. |
 | **Frozen frontier** | During VCT fast sync below the last checkpoint, Zebra folds verified roots into the root indexes but does not advance the full on-disk note-commitment trees for every block. If a required root is missing, the committer must stop and retry later, because recomputing from the stale frontier would write invalid state (§8). |
-| **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5 checks) before it affects state (§6). |
+| **Verify-before-commit** | Authenticating each root against the node's header commitments (ZIP-221 MMR one-block-lag + direct sub-Heartwood/sub-NU5/sub-Nu6_3 checks) before it affects state (§6). |
 | **Fail closed** | Stop and retry without writing state when a required root is missing or invalid (§8). |
 | **Provisional roots** | Peer-supplied roots carried in the header-sync `Headers` message and persisted to `commitment_roots_by_height` ahead of body commit. Advisory until verify-before-commit authenticates them (§4.2, §6). |
 | **All-or-nothing** | A `Headers` message carries roots for _every_ header in the range or none; a partial root set is rejected on the wire and never served (§5.4). |
@@ -130,8 +130,8 @@ skipping the frontier recompute entirely — without weakening any consensus che
 The fast path needs two things, and they are sourced differently:
 
 - **Per-block roots travel over the network**, carried in-band on the header-sync `Headers`
-  message (§4.2, §5.4). `BlockCommitmentRoots { height, sapling_root, orchard_root }` (§5.1) is
-  the wire payload.
+  message (§4.2, §5.4). `BlockCommitmentRoots { height, sapling_root, orchard_root,
+  ironwood_root, .. }` (§5.1) is the wire payload.
 - **The final frontier is embedded in the binary** (§5.2), refreshed per release like a
   checkpoint, _not_ sent on the wire. There is no `GetFinalFrontiers`/`FinalFrontiers` message
   and no frontier-serving path to attack or keep available.
@@ -148,11 +148,14 @@ serialized-body-size hint per header. These size hints are not commitment roots 
 only to schedule block downloads (§5.4). The header-sync stream version is bumped (2 → 4) for
 the new field.
 
-Roots are requested and accepted **only for finalized (checkpoint-verified) header ranges** — the
-reactor rejects roots on a non-finalized range, and rejects roots a request opted out of, as
-`MalformedMessage` (§8.1). When a finalized header range commits via `CommitHeaderRange`, its
-roots are **persisted into the `commitment_roots_by_height` column family ahead of
-body commit** (§5.3). The committer then reads them per height through the `PeerSource` seam.
+Header sync sets `want_tree_aux_roots` on all of its range requests — the finalized
+(checkpoint-verified) ranges below the last checkpoint and the non-finalized forward range
+alike. The wire rejects roots a request opted out of, a root count that does not match the
+header count, and per-height misalignment as `MalformedMessage` (§8.1). When a header range
+commits via `CommitHeaderRange`, its roots are **persisted into the
+`commitment_roots_by_height` column family ahead of body commit** (§5.3). Only roots below
+the last checkpoint are ever _consumed_ by the committer, and only after verify-before-commit
+(§6); roots for header-ahead heights above it are provisional serving data only (§9). The committer then reads them per height through the `PeerSource` seam.
 The same header commit stores non-zero advertised body-size hints in
 `zakura_header_body_size_by_height`, so block sync can later request realistic ranges even
 before the corresponding bodies are committed. Headers, body-size hints, and roots arrive
@@ -186,8 +189,8 @@ orthogonal pruning axis). The resulting modes:
 | --- | --- | --- |
 | **Archive** (default) | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, `storage_mode = archive` | Fast — verified roots folded in, recompute skipped. Unpruned (raw tx + indexes kept). No per-height tree history below the last checkpoint height _for now_ (§7, §10). |
 | **Pruning** | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, `storage_mode.pruned` | Fast — same as Archive, **plus** raw-tx/index pruning outside the retention window. |
-| **Force-disabled VCT** | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = false` (any storage mode) | Legacy — keeps checkpoint sync enabled but fully reconstructs the Sapling/Orchard trees per block. |
-| **Checkpoint sync disabled** | `consensus.checkpoint_sync = false` (any storage mode) | Legacy — fully reconstructs the Sapling/Orchard trees per block, using only mandatory checkpoints. |
+| **Force-disabled VCT** | `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = false` (any storage mode) | Legacy — keeps checkpoint sync enabled but fully reconstructs the Sapling/Orchard/Ironwood trees per block. |
+| **Checkpoint sync disabled** | `consensus.checkpoint_sync = false` (any storage mode) | Legacy — fully reconstructs the Sapling/Orchard/Ironwood trees per block, using only mandatory checkpoints. |
 
 Gating fast on `checkpoint_sync` is also a correctness precondition: the embedded last checkpoint height
 frontier is pinned to the network's **full** max checkpoint height (§5.2), which only applies
@@ -196,6 +199,13 @@ Canopy mandatory checkpoint, so there is no valid last checkpoint height to resu
 `consensus.checkpoint_sync` into the state config at startup
 (`state_config.checkpoint_sync`), so the state makes the decision without depending on
 `zebra-consensus`.
+
+In the config file, `consensus.vct_fast_sync` is tri-state: unset (the default) means enabled,
+and the generated default config does not write the key, so configs stay readable by older
+zebrad versions. Explicitly setting `vct_fast_sync = true` together with
+`checkpoint_sync = false` is rejected at zebrad startup as a contradiction; leaving it unset
+with checkpoint sync disabled is fine (the node runs legacy either way), so pre-VCT configs
+that disable checkpoint sync keep working unchanged.
 
 Precedence is resolved by a pure, unit-tested `select_source_mode` (no process env, no embedded
 files in the decision — `consensus.checkpoint_sync`, `consensus.vct_fast_sync`, and the
@@ -217,11 +227,13 @@ the status note at the top of this document).
 ### 5.1 Per-block commitment roots (the wire payload)
 
 `zebra_chain::parallel::commitment_aux::BlockCommitmentRoots` holds `{ height, sapling_root,
-orchard_root }` with `ZcashSerialize`/`ZcashDeserialize`. It lives in `zebra-chain` so
-`zebra-network` and `zebra-state` share one type without a dependency cycle. `orchard_root` is
-the empty/default root below NU5. The deserializer treats `height` as an unvalidated `u32`: a
-wrong or out-of-range height simply fails to match any local header during verification (§6),
-so it is harmless; malformed root bytes are rejected by the root parsers.
+orchard_root, ironwood_root, sapling_tx, orchard_tx, ironwood_tx, auth_data_root }` with
+`ZcashSerialize`/`ZcashDeserialize`. It lives in `zebra-chain` so `zebra-network` and
+`zebra-state` share one type without a dependency cycle. `orchard_root` is the empty/default
+root below NU5, and `ironwood_root` is the empty/default root below `Nu6_3` (§6.1). The
+deserializer treats `height` as an unvalidated `u32`: a wrong or out-of-range height simply
+fails to match any local header during verification (§6), so it is harmless; malformed root
+bytes are rejected by the root parsers.
 
 The payload carries **no trust**: a recipient re-verifies every root against its own
 checkpoint-committed headers (§6) before folding it in, so a forwarding/serving node is
@@ -229,9 +241,9 @@ exactly as trustworthy as an originating one.
 
 ### 5.2 The final frontier last checkpoint height (embedded)
 
-Fast mode never advances the running Sapling/Orchard frontiers below the checkpoint, so the
-real frontiers at the checkpoint must be supplied for the resume. `FinalFrontiers { height,
-sapling, orchard, sprout }` is embedded in the binary
+Fast mode never advances the running Sapling/Orchard/Ironwood frontiers below the checkpoint,
+so the real frontiers at the checkpoint must be supplied for the resume. `FinalFrontiers {
+height, sapling, orchard, sprout, ironwood }` is embedded in the binary
 (`zebra-state/src/service/finalized_state/vct/mainnet-frontier.bin`, via `include_bytes!`),
 tied to the network's max checkpoint height (validated on load:
 `embedded VCT final frontier height must match the network's max checkpoint height`). When the
@@ -239,6 +251,12 @@ Mainnet checkpoint list advances, this file is regenerated alongside the checkpo
 by the maintenance tool described in §16.
 
 - **Sprout** is frozen far below any modern checkpoint, so the tip Sprout tree is its frontier.
+- **Ironwood** is carried the same way as Sapling/Orchard, and is authenticated at the
+  handoff (§7) against the supplied Ironwood root before it is written as the tip treestate.
+  The on-disk byte format is backward compatible: the Ironwood tree is a 4th length-prefixed
+  blob appended after Sprout, and bytes written before Ironwood existed (no 4th blob) parse
+  with the Ironwood frontier defaulted to the empty tree — the existing embedded
+  `mainnet-frontier.bin` needs no regeneration for this.
 - **Subtree tips are not carried**: the resuming chain recomputes them from the frontier
   position.
 - **Regtest** has no fixed checkpoint (its list is derived at runtime), so there is no constant
@@ -267,8 +285,8 @@ Implementations:
   `commitment_roots_by_height` column family that header sync persisted (§4.2). The
   last checkpoint height frontier is held immutably from the embedded constant, so only roots come
   from the network. `invalidate` **deletes** a rejected root from that column family so the next
-  read misses and header sync can re-deliver a verifiable replacement from another peer (the key
-  to not letting one malicious peer wedge a bad root in place — §8, §11). The earlier in-memory
+  read misses instead of re-reading the same rejected root forever; a verifiable replacement only
+  arrives if the same header range is re-delivered (§8.1). The earlier in-memory
   cache variant and its `PeerSourceWriter` are removed; proptests fill roots by writing to an
   ephemeral database through the same header-sync persistence path production uses.
 - `FixtureSource` — a crate-local `#[cfg(test)]` source over the same height→roots map, used only
@@ -292,8 +310,9 @@ boundary.
 There is no separate roots stream. The header-sync `HeaderSyncMessage` carries roots in two
 places (`zebra-network/src/zakura/header_sync/wire.rs`):
 
-- `GetHeaders { start_height, count, want_tree_aux_roots }` — the requester sets
-  `want_tree_aux_roots` only for finalized ranges.
+- `GetHeaders { start_height, count, want_tree_aux_roots }` — header sync sets
+  `want_tree_aux_roots` on its range requests (finalized and non-finalized alike; only roots
+  below the last checkpoint are ever consumed by the committer, §4.2).
 - `Headers { headers, body_sizes, tree_aux_roots }` — `tree_aux_roots` is **all-or-nothing**:
   either empty, or exactly one `BlockCommitmentRoots` per header, in ascending height order
   aligned to `start_height`. A one-byte `has_roots` marker precedes the roots on the wire.
@@ -323,9 +342,9 @@ Wire and DoS bounds:
   the header count (`TreeAuxRootCountMismatch`); and the root vector is preallocated only with
   the already-bounded header count, never an independent untrusted length.
 - The reactor additionally checks each root's height is `start_height + offset`
-  (`TreeAuxRootHeightMismatch` / `validate_tree_aux_root_heights`) and rejects any roots on a
-  non-finalized range, before the roots reach state. State re-checks both invariants in
-  `CommitHeaderRange` (`prepare_header_range_batch_with_roots`) as defense in depth, and never
+  (`TreeAuxRootHeightMismatch` / `validate_tree_aux_root_heights`) before the roots reach
+  state. State re-checks the count and alignment invariants in `CommitHeaderRange`
+  (`prepare_header_range_batch_with_roots`) as defense in depth, and never
   writes peer-supplied roots for a height whose body is already committed — a re-delivered header range over committed heights cannot overwrite the verified serving-index rows.
 
 `BlockCommitmentRoots` still carries no trust: a recipient re-verifies every root against its
@@ -346,9 +365,9 @@ is checked against that candidate. A wrong root makes that check fail and the bl
 offending height; over `[start..=end]` it confirms `[start..=end-1]`, and `end+1` confirms
 `end`.
 
-### 6.1 Direct header checks below Heartwood and NU5
+### 6.1 Direct header checks below Heartwood, NU5, and Nu6_3
 
-The ZIP-221 MMR does not authenticate everything, so two gaps are closed by direct comparison
+The ZIP-221 MMR does not authenticate everything, so three gaps are closed by direct comparison
 (no one-block lag — a wrong root is rejected at the block's own commit):
 
 - **Sapling below Heartwood** (`verify_supplied_sapling_root_below_heartwood`): there is no MMR
@@ -363,6 +382,12 @@ The ZIP-221 MMR does not authenticate everything, so two gaps are closed by dire
   breaking the §11 trust boundary and consensus equivalence. This was a real hole, masked only
   while the source was a trusted fixture; the in-flight peer source would have armed it
   (fix in commit #190).
+- **Ironwood below Nu6_3** (`verify_supplied_ironwood_root_below_nu6_3`): `Nu6_3` is the first
+  upgrade whose history leaf (`IronwoodOnward`/V3) commits to an Ironwood root; below it, no
+  header commits to one and the Ironwood tree is provably empty (no Ironwood actions are
+  allowed), so the supplied root is pinned to the empty-tree root — the same pattern as the
+  below-NU5 Orchard pin, and closing the same class of hole. At/above `Nu6_3` the MMR path
+  authenticates it.
 
 ### 6.2 The one-block lag and the dedup
 
@@ -398,23 +423,26 @@ The commit-path hook lives in `finalized_state.rs`; everything about _where data
 lives in the `vct` and `commitment_aux` submodules, so the commit path holds only the last checkpoint height
 logic. For a checkpoint-verified block at `height`:
 
-1. **Fast-root lookup.** `vct.vct_root(height)` returns the supplied roots, or `None`.
+1. **Fast-root lookup.** `vct.vct_root(height)` returns the supplied `(sapling, orchard,
+   ironwood)` roots, or `None`.
 2. **If supplied (fast path):**
    - run the own-commitment check unless the dedup (§6.2) already validated it;
-   - apply the direct below-Heartwood/below-NU5 checks (§6.1);
+   - apply the direct below-Heartwood/below-NU5/below-Nu6_3 checks (§6.1);
    - build a candidate history tree with the roots folded in (`HistoryTree::push`);
    - **verify-before-commit:** either check the buffered successor's commitment against the
      candidate (the one-block-lag confirmation) and cache `(height+1, next_hash)` as
-     pre-validated, or, at the checkpoint last checkpoint height only, verify the embedded final frontiers
-     against this height's roots; a failure means _this_ height's root is bad → reject and
-     evict (§8);
-   - fold the roots into the anchor set, skip the frontier recompute, and **freeze** the
-     note-commitment frontier (`vct_frontier_frozen = true`) for non-last checkpoint height fast blocks.
-3. **Checkpoint last checkpoint height** (when `height` is the last checkpoint height): verify the embedded frontier
-   against this block's verified root (`frontier.root() == verified root`; collision resistance
-   makes the root a binding commitment to the frontier), write it as the real tip treestate via
-   the normal write path, and **unfreeze** — heights at/above the last checkpoint height resume legacy
-   recompute from a correct frontier.
+     pre-validated, or, at the checkpoint last checkpoint height only, verify the embedded final
+     frontiers — including Ironwood — against this height's roots; a failure means _this_
+     height's root is bad → reject and evict (§8);
+   - fold the roots (Sapling, Orchard, and Ironwood) into their anchor sets, skip the frontier
+     recompute, and **freeze** the note-commitment frontier (`vct_frontier_frozen = true`) for
+     non-last checkpoint height fast blocks.
+3. **Checkpoint last checkpoint height** (when `height` is the last checkpoint height): verify the embedded
+   Sapling/Orchard/Ironwood frontiers against this block's verified roots (`frontier.root() ==
+   verified root` for each pool; collision resistance makes each root a binding commitment to
+   its frontier), write them as the real tip treestate via the normal write path, and
+   **unfreeze** — heights at/above the last checkpoint height resume legacy recompute from a
+   correct frontier.
 4. **If not supplied:** §8.
 
 The write worker enforces the successor side of this contract before calling the committer: if
@@ -450,13 +478,13 @@ the real frontier), the on-disk frontier is **stale**. A legacy recompute in tha
 extend the stale frontier and fold a _wrong_ root into the MMR — corrupting consensus state.
 So the committer **fails closed** rather than falling back to recompute (commit #211):
 
-- A supplied root that fails _any_ verification step is **evicted** from its source (so a
-  re-fetch from another peer can replace it) and the commit is **refused** with the typed,
+- A supplied root that fails _any_ verification step is **evicted** from its source (so the
+  same rejected root is never re-read) and the commit is **refused** with the typed,
   **retryable** `VctSuppliedRootUnavailable { height }` error — not retried against the same
   rejected root forever, and not recomputed locally.
-- A frozen-frontier height with **no** valid supplied root (never fetched, or just evicted)
+- A frozen-frontier height with **no** valid supplied root (never delivered, or just evicted)
   refuses with the same retryable error and leaves the database untouched. The block commits
-  once a verifiable root is fetched.
+  only if a verifiable root arrives via a re-delivery of its header range (§8.1).
 - A non-last checkpoint height fast block with a valid supplied root but **no buffered successor** is not a
   root failure: the write worker defers it locally until `H+1` is available to authenticate
   the candidate history tree. If a direct committer caller bypasses that deferral, the
@@ -468,9 +496,13 @@ So the committer **fails closed** rather than falling back to recompute (commit 
 
 Outside the frozen window (legacy), a missing root is
 simply the ordinary legacy recompute — bit-identical to today. Inside the frozen window, a
-missing root parks the current checkpoint block and retries the same commit **in place** once
-header sync re-delivers the root for that finalized range — **without resetting the block
-queue**. A peer-supplied root that has no buffered successor to confirm it against the header
+missing root parks the current checkpoint block and retries the same commit **in place** —
+**without resetting the block queue**. Nothing re-requests an individual root: the retry is
+satisfied only if the same header range is re-delivered while still in flight (header sync
+fans each range across several peers, so another peer's response for that range may still
+land and re-persist its roots). If no re-delivery fills the hole, the node stays parked
+fail-closed at that height (§8.1). A peer-supplied root that has no buffered successor to
+confirm it against the header
 chain (the one-block lag) is likewise **deferred, not committed on faith**: an untrusted tip
 root is rejected before it is persisted, rather than one block too late (when it would be
 irreversibly on disk and could wedge the sync). Test-only trusted local sources are exempt and
@@ -501,19 +533,22 @@ provenance/cooldown/demotion/hedging policy. Bad roots are handled in two layers
 - **At verify-before-commit**, a well-formed but _wrong_ root fails authentication against the
   header commitment (§6). The committer evicts it (`PeerSource::invalidate` **deletes** it from
   `commitment_roots_by_height`) and refuses the commit with the retryable
-  `VctSuppliedRootUnavailable` error (§8). Header sync then re-requests that finalized range and
-  delivers a replacement root from whichever peer answers; the block commits in place once a
-  verifiable root arrives, without resetting the block queue.
+  `VctSuppliedRootUnavailable` error (§8). Header sync does **not** re-request that range —
+  its headers are already committed and covered — so the hole is filled only if another
+  response for the same range is still in flight from the request fanout; the block then
+  commits in place, without resetting the block queue.
 
-This keeps the honest-peer-available liveness loop: a lying peer causes at most one retryable
-refusal per height, its persisted root is dropped, and the height is re-fetched over header sync
-from another peer. Peer accountability rides header sync's general misbehavior scoring rather
-than a roots-specific cooldown table, so the committer still attributes nothing to peers itself
-and `zebra-state` keeps no dependency on `zebra-network` peer types.
-
-This still cannot guarantee liveness under a true eclipse where every selectable peer withholds
-or lies. In that case the node remains **fail-closed**: no wrong state is written, the root stays
-retryable, and the §8 stall metrics/logs surface the unservable height.
+Safety is unconditional, liveness is not: a lying peer can never corrupt state, but a
+well-formed wrong root (or a rootless serve) that ends up as the settled delivery for its
+height halts the fast sync at that height — fail-closed, surfaced by the §8 stall
+metrics/logs, and persisting across restarts (header sync resumes from the durable header tip
+and does not re-fetch committed ranges). This is a deliberate simplicity trade-off in the
+current increment: there is no roots-specific refetch, cooldown, or provenance machinery.
+Restoring liveness after a settled bad root requires re-delivering the affected finalized
+range (a possible follow-up mechanism) or a fresh sync. Peer accountability rides header
+sync's general misbehavior scoring rather than a roots-specific cooldown table, so the
+committer still attributes nothing to peers itself and `zebra-state` keeps no dependency on
+`zebra-network` peer types.
 
 ## 9. The serving read path (`BlockRoots`)
 
@@ -540,8 +575,8 @@ driver maps read errors and wrong responses to a rootless serve, never wrong dat
 Fast-synced nodes serve roots from `commitment_roots_by_height`, while older archive-produced
 nodes can still derive roots from per-height trees. This keeps the root-serving fleet available
 as more nodes fast-sync. A client that finds no serving peer degrades to legacy speed before
-freeze or retries the finalized range over header sync in the frozen window; it does not corrupt
-state. Two mechanisms address it, in order of cost:
+freeze; in the frozen window it parks fail-closed on the missing roots (§8) rather than
+corrupting state. Two mechanisms address it, in order of cost:
 
 - **Roots-index CF (lightweight, preferred).** A fast node already verified every root it
   folded in. Persisting them into a compact column family (~160 bytes/block, ~550 MB for all of
@@ -555,9 +590,10 @@ state. Two mechanisms address it, in order of cost:
   archive node. This pays back the cost fast-sync avoided, so it is the archive/RPC path
   (increments 7–8), not a default.
 
-Protocol hygiene that reduces the failure surface meanwhile: header sync already fans requests
-across peers and retries a finalized range from another peer on failure, so a peer that cannot
-serve roots for a range simply yields rootless headers and the requester re-asks elsewhere.
+Protocol hygiene that reduces the failure surface meanwhile: header sync fans each range
+request across several peers, so a peer that cannot serve roots and yields rootless headers
+does not preclude another fanout response for the same range delivering the roots — though
+once a range settles rootless, it is not re-requested (§8.1).
 Serving provisional header-ahead roots in addition to committed ones (§9) widens the servable
 range to the header tip without per-height trees.
 
@@ -573,10 +609,10 @@ commitment before it influences the anchor set or the history MMR.** Consequence
   legacy recompute never produces — a consensus-equivalence break, not just a slowdown.
 - The frozen-frontier fail-closed policy (§8) means a hostile root never corrupts state: it is
   deleted and refused. A malformed root set is rejected at the header-sync reactor before it
-  reaches state and is scored through header sync's misbehavior path; a well-formed wrong root is
-  evicted on verify-before-commit and re-fetched over header sync from another peer (§8.1). This
-  prevents one lying-but-well-formed peer from grinding the sync height by height when honest
-  peers are available.
+  reaches state and is scored through header sync's misbehavior path; a well-formed wrong root
+  is evicted on verify-before-commit and the commit stays parked (§8.1). The trade-off is
+  availability, not integrity: a settled bad root stalls the fast sync at that height instead
+  of writing wrong state (§8.1).
 - DoS bounds on the header-sync roots fields (§5.4) — the all-or-nothing count check, the
   per-height alignment check, the bounded preallocation, and the message byte budget — protect
   the serving and client paths from unbounded memory growth.
@@ -596,11 +632,12 @@ commitment before it influences the anchor set or the history MMR.** Consequence
   and ran a roots-specific cooldown/demotion/disconnect policy over the `tree_aux` stream.
 - **Increment 6c — fold roots into header sync (current).** The standalone `tree_aux` stream,
   its driver, in-memory cache writer, and bespoke peer policy are **removed**. Roots now ride the
-  header-sync `Headers` message as all-or-nothing finalized-range metadata (§4.2, §5.4), are
+  header-sync `Headers` message as all-or-nothing metadata (§4.2, §5.4), are
   persisted provisionally to `commitment_roots_by_height` ahead of body commit, and
   are read back by a DB-backed `PeerSource`. Recovery from a bad/missing root is an in-place
-  commit retry fed by header sync re-delivery; peer accountability rides header sync's existing
-  misbehavior scoring (§8.1).
+  commit retry fed only by an in-flight fanout re-delivery of the same header range — roots
+  are not individually re-requested, so a settled hole is a fail-closed stall (§8.1); peer
+  accountability rides header sync's existing misbehavior scoring.
 - **Increment 7 — indexing follower lane (archive only).** Relocate `tx_by_loc` + address
   indexes and the per-height trees + subtree CFs onto an async follower, so archive mode regains
   historical RPC without re-adding the frontier recompute to the consensus path.
@@ -628,7 +665,7 @@ Live commit-path counters distinguish the fast and legacy paths and the failure 
 | `state.vct.fast.block.count` | block folded supplied roots, skipped the recompute |
 | `state.vct.legacy.block.count` | block recomputed the frontier (`consensus.vct_fast_sync = false`, `consensus.checkpoint_sync = false`, or fell back outside the frozen window) |
 | `state.vct.prevalidated.block.count` | dedup sub-case: the previous fast block's look-ahead already validated this header |
-| `state.vct.root.rejected.count` | supplied root failed verification and was deleted for re-delivery |
+| `state.vct.root.rejected.count` | supplied root failed verification and was deleted so it is never re-read |
 | `state.vct.root.unavailable.count` | frozen-frontier height with no valid root; commit refused (retryable) |
 | `state.vct.root.retry.count` | park-and-retry attempts on a retryable VCT root stall |
 | `state.vct.fast_path.hit` | a finalized commit consumed header-carried roots to skip the recompute |
@@ -645,8 +682,7 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
 - **Unit:** the `BlockCommitmentRoots` wire round-trip; the header-sync `Headers`/`GetHeaders`
   round-trip carrying roots, plus the all-or-nothing / count-mismatch / height-misalignment /
   invalid-marker / unrequested-roots rejections
-  (`decode_rejects_tree_aux_roots_when_not_requested`,
-  `non_finalized_response_carrying_tree_aux_roots_is_malformed`) and the byte-budget clamp with
+  (`decode_rejects_tree_aux_roots_when_not_requested`) and the byte-budget clamp with
   roots requested; `select_source_mode` precedence (`consensus.vct_fast_sync = false` or
   `consensus.checkpoint_sync = false` ⇒ legacy regardless of storage mode or embedded frontier;
   checkpoint sync + enabled VCT + embedded frontier ⇒ peer); a completed fast-synced DB reopens
@@ -732,15 +768,17 @@ genesis, because there is no updated last checkpoint height to pair with the fro
 
 The frontier generator must read Zebra's finalized state, not reconstruct trees from RPC block
 data. Checkpoint generation only needs block hashes and sizes, but frontier generation needs the
-exact Sapling, Orchard, and Sprout note-commitment trees. The utility therefore opens Zebra
-state read-only and calls `zebra-state` helpers that:
+exact Sapling, Orchard, Sprout, and Ironwood note-commitment trees. The utility therefore opens
+Zebra state read-only and calls `zebra-state` helpers that:
 
 - opens the finalized DB read-only from the supplied state cache directory;
-- reads the Sapling and Orchard trees at the requested height;
+- reads the Sapling, Orchard, and Ironwood trees at the requested height;
 - reads the tip Sprout tree (Sprout is frozen far below modern checkpoints);
-- serializes `FinalFrontiers { height, sapling, orchard, sprout }` using the same byte format
-  parsed by node startup: `height` as `u32` little-endian, followed by length-prefixed
-  `IntoDisk` blobs for Sapling, Orchard, and Sprout;
+- serializes `FinalFrontiers { height, sapling, orchard, sprout, ironwood }` using the same byte
+  format parsed by node startup: `height` as `u32` little-endian, followed by length-prefixed
+  `IntoDisk` blobs for Sapling, Orchard, Sprout, and Ironwood. The Ironwood blob is a
+  backward-compatible tail: bytes written before Ironwood existed (3 blobs, no trailing bytes
+  after Sprout) still parse, with the Ironwood frontier defaulted to the empty tree;
 - immediately validates the generated bytes by parsing them through the same height-checking
   path used for the embedded frontier (`produce_final_frontiers_bytes` followed by
   `validate_final_frontiers_bytes`).
@@ -759,8 +797,8 @@ Local testing proves byte compatibility with the node loader:
 - write the bytes to a temporary file;
 - load the file through the same loader/parser path used by `VCT_REGTEST_FRONTIER` and the
   embedded Mainnet frontier;
-- assert the parsed height matches, the parsed Sapling/Orchard/Sprout roots match the DB, and
-  parsing with a different expected height fails.
+- assert the parsed height matches, the parsed Sapling/Orchard/Sprout/Ironwood roots match the
+  DB, and parsing with a different expected height fails.
 
 That test is the compatibility contract: if the local tool writes bytes that pass this path, the
 node will parse the artifact in the same way at startup.

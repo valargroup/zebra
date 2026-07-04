@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   `mining.extra_coinbase_data` option is now limited to 86 bytes (was 94);
   Zebra refuses to start if it is exceeded.
 
+### Changed
+
+- Verified-commitment-trees fast sync is now enabled by default when checkpoint
+  sync is enabled. Operators can keep checkpoint sync but opt out of the new
+  path by setting `consensus.vct_fast_sync = false`.
+
 ### Removed
 
 - Removed two Zakura block-sync config fields that never needed operator
@@ -29,7 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   queue. Status send bookkeeping now only records queued frames, header sync
   retries unsent status advertisements, and block sync replies to the first
   inbound status so peers converge after dropped connect-time advertisements.
-
+- Raised the default Zakura per-IP admission cap from 1 to 16 so NATed or
+  co-hosted v2 peers are not rejected while the legacy TCP per-IP default
+  remains 1.
 - Fixed an out-of-memory crash during Zakura block sync when the header chain
   runs far ahead of the commit tip. The block-sync applying buffer holds decoded
   block bodies ahead of the in-order committer; its look-ahead budget counted
