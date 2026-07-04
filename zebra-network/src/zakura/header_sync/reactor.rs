@@ -1200,55 +1200,65 @@ impl HeaderSyncReactor {
             }
         }
 
-        let verified_roots = match self.validate_forward_header_aux_commitments(
-            &peer,
-            outstanding.range,
-            &headers,
-            &tree_aux_roots,
-        ) {
-            Ok(verified_roots) => verified_roots,
-            Err(error) if matches!(error, HeaderSyncWireError::MissingHeaderHistoryTree { .. }) => {
-                debug!(
-                    ?peer,
-                    ?error,
-                    start_height = ?outstanding.range.start_height,
-                    count = ?header_count,
-                    "Zakura header-sync skipped header auxiliary validation"
-                );
-                self.trace_range_validation_rejected(
-                    &peer,
-                    outstanding.range,
-                    header_count,
-                    "header_aux",
-                    header_sync_wire_error_kind(&error),
-                );
-                self.maybe_reload_missing_header_history_tree(&error);
-                self.state.schedule.clear_assignment(outstanding.range);
-                self.state.schedule.retry(outstanding.range);
-                self.schedule().await;
-                return;
+        // Backward (checkpoint-backfill) ranges are authenticated by the checkpoint hash, not by
+        // ZIP-221 header commitments: they fill headers below the sync anchor and fold onto the
+        // previous checkpoint's tree, not the forward frontier this reactor caches. Commit their
+        // headers with no provisional roots. Only forward ranges carry a verifiable frontier tree.
+        let verified_roots = if outstanding.range.priority == RangePriority::Forward {
+            match self.validate_forward_header_aux_commitments(
+                &peer,
+                outstanding.range,
+                &headers,
+                &tree_aux_roots,
+            ) {
+                Ok(verified_roots) => Some(verified_roots),
+                Err(error)
+                    if matches!(error, HeaderSyncWireError::MissingHeaderHistoryTree { .. }) =>
+                {
+                    debug!(
+                        ?peer,
+                        ?error,
+                        start_height = ?outstanding.range.start_height,
+                        count = ?header_count,
+                        "Zakura header-sync skipped header auxiliary validation"
+                    );
+                    self.trace_range_validation_rejected(
+                        &peer,
+                        outstanding.range,
+                        header_count,
+                        "header_aux",
+                        header_sync_wire_error_kind(&error),
+                    );
+                    self.maybe_reload_missing_header_history_tree(&error);
+                    self.state.schedule.clear_assignment(outstanding.range);
+                    self.state.schedule.retry(outstanding.range);
+                    self.schedule().await;
+                    return;
+                }
+                Err(error) => {
+                    debug!(
+                        ?peer,
+                        ?error,
+                        start_height = ?outstanding.range.start_height,
+                        count = ?header_count,
+                        "Zakura header-sync rejected header auxiliary data"
+                    );
+                    self.trace_range_validation_rejected(
+                        &peer,
+                        outstanding.range,
+                        header_count,
+                        "header_aux",
+                        header_sync_wire_error_kind(&error),
+                    );
+                    self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
+                        .await;
+                    self.state.schedule.retry(outstanding.range);
+                    self.schedule().await;
+                    return;
+                }
             }
-            Err(error) => {
-                debug!(
-                    ?peer,
-                    ?error,
-                    start_height = ?outstanding.range.start_height,
-                    count = ?header_count,
-                    "Zakura header-sync rejected header auxiliary data"
-                );
-                self.trace_range_validation_rejected(
-                    &peer,
-                    outstanding.range,
-                    header_count,
-                    "header_aux",
-                    header_sync_wire_error_kind(&error),
-                );
-                self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
-                    .await;
-                self.state.schedule.retry(outstanding.range);
-                self.schedule().await;
-                return;
-            }
+        } else {
+            None
         };
 
         self.state.pending_commits.insert(
@@ -1268,7 +1278,7 @@ impl HeaderSyncReactor {
             start_height: outstanding.range.start_height,
             headers,
             body_sizes,
-            verified_roots,
+            verified_roots: verified_roots.map(Box::new),
             finalized: outstanding.range.finalized,
         });
     }
@@ -1354,6 +1364,8 @@ impl HeaderSyncReactor {
     }
 
     // Returns the history tree for the pending commit that matches the given start and tip heights.
+    // Backward (checkpoint-authenticated) commits carry no verified roots, so they never install a
+    // frontier tree; the caller keeps its existing tree in that case.
     fn pending_header_history_tree(
         &self,
         start_height: block::Height,
@@ -1365,7 +1377,8 @@ impl HeaderSyncReactor {
             .find(|commit| {
                 commit.range.start_height == start_height && commit.range.end_height() == tip_height
             })
-            .map(|commit| Arc::new(commit.verified_roots.tree().clone()))
+            .and_then(|commit| commit.verified_roots.as_ref())
+            .map(|verified_roots| Arc::new(verified_roots.tree().clone()))
     }
 
     async fn handle_possible_stale_anchor_link_failure(

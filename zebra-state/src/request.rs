@@ -935,11 +935,12 @@ pub enum Request {
         /// The header-authenticated confirmed prefix of the range's tree-aux roots, aligned from the
         /// first header's height.
         ///
-        /// This must be exactly one shorter than `headers`: the range tip's root is only
-        /// authenticated once the next range delivers its successor header (the one-block
-        /// confirmation lag), so the caller omits it and the state persists exactly the roots it is
-        /// given. Roots remain advisory (superseded by the verified row) until the block body is
-        /// committed.
+        /// For a semantically-validated forward range this is exactly one shorter than `headers`:
+        /// the range tip's root is only authenticated once the next range delivers its successor
+        /// header (the one-block confirmation lag), so the caller omits it and the state persists
+        /// exactly the roots it is given. Checkpoint-authenticated backfill ranges carry no roots,
+        /// so an empty vector is also accepted (nothing is persisted). Roots remain advisory
+        /// (superseded by the verified row) until the block body is committed.
         tree_aux_roots: Vec<zebra_chain::parallel::commitment_aux::BlockCommitmentRoots>,
     },
 

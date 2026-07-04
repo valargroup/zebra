@@ -154,8 +154,10 @@ impl HeaderSyncCore {
 #[derive(Clone, Debug)]
 pub(super) struct PendingHeaderCommit {
     pub(super) range: RangeRequest,
+    /// `Some` for aux-validated forward ranges; `None` for checkpoint-authenticated backward
+    /// backfill ranges, which persist no provisional roots and never install a frontier tree.
     pub(super) verified_roots:
-        zebra_chain::parallel::commitment_aux_verify::VerifiedHeaderCommitmentRoots,
+        Option<zebra_chain::parallel::commitment_aux_verify::VerifiedHeaderCommitmentRoots>,
 }
 
 #[derive(Clone, Debug, Default)]

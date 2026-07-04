@@ -318,7 +318,11 @@ pub enum HeaderSyncAction {
         /// Advisory serialized body sizes, parallel to `headers`.
         body_sizes: Vec<u32>,
         /// Header-layer verified commitment roots for the confirmed prefix of `headers`.
-        verified_roots: VerifiedHeaderCommitmentRoots,
+        ///
+        /// `Some` for semantically-validated forward ranges (the confirmed prefix is persisted).
+        /// `None` for checkpoint-authenticated backward backfill ranges, which fold onto the
+        /// previous checkpoint's tree rather than the forward frontier and persist no roots.
+        verified_roots: Option<Box<VerifiedHeaderCommitmentRoots>>,
         /// Whether the range is expected to be finalized by checkpoint policy.
         finalized: bool,
     },

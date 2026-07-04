@@ -440,8 +440,15 @@ other peers are already header-authenticated, and so a restart never trusts an u
   one block — the next request re-anchors at the tip's parent — and `CommitHeaderRange` persists
   only the header-authenticated confirmed prefix; the range tip's root is never written. The state
   writes exactly the roots it is handed (`prepare_header_range_batch_with_roots` accepts a prefix one
-  shorter than the headers), so the "one root per header" wire invariant (§5.4) and the persisted
-  set are deliberately distinct.
+  shorter than the headers, or none — see the checkpoint-backfill note below), so the "one root per
+  header" wire invariant (§5.4) and the persisted set are deliberately distinct.
+- **Checkpoint backfill skips this gate.** Only *forward* ranges carry a frontier tree that can be
+  folded and checked. *Backward* checkpoint-backfill ranges (headers below the sync anchor) are
+  authenticated by the checkpoint hash and fold onto the previous checkpoint's tree, not the forward
+  frontier the reactor caches, so they are committed without header-commitment validation and
+  persist no provisional roots. `prepare_header_range_batch_with_roots` accepts an empty roots vector
+  for exactly this shape; a full-length (tip-included) vector is still rejected, so the trust
+  boundary is unchanged — nothing unauthenticated is ever written.
 - **Reconstruct at startup.** The durable roots CF therefore holds a contiguous run of confirmed
   roots above the verified body tip, but never the header tip's own root. On startup
   `ReadRequest::BestHeaderHistoryTree` folds the durable confirmed roots onto the verified-tip

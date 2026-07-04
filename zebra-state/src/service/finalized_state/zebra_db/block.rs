@@ -1966,12 +1966,13 @@ impl DiskWriteBatch {
     /// Prepare a database batch containing a contextually validated header range
     /// and the tree-aux roots supplied for it.
     ///
-    /// `tree_aux_roots` is the caller's confirmed prefix, aligned from the range start, and is
-    /// required to be exactly one shorter than `headers` (zero roots for a single-header range):
-    /// the range tip's root is only authenticated by the next range's successor header, so it is
-    /// never confirmed here. This is enforced, not merely expected, so it is structurally impossible
-    /// to persist the unconfirmed tip root and expose peer-supplied data to startup history-tree
-    /// reconstruction.
+    /// `tree_aux_roots` is the caller's confirmed prefix, aligned from the range start. For a
+    /// semantically-validated forward range it is exactly one shorter than `headers` (zero roots
+    /// for a single-header range): the range tip's root is only authenticated by the next range's
+    /// successor header, so it is never confirmed here. Checkpoint-authenticated backfill ranges
+    /// pass an empty vector and persist no roots. Both shapes are enforced, not merely expected, so
+    /// it is structurally impossible to persist the unconfirmed tip root and expose peer-supplied
+    /// data to startup history-tree reconstruction.
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_header_range_batch_with_roots(
         &mut self,
@@ -1992,15 +1993,17 @@ impl DiskWriteBatch {
             });
         }
 
-        // A header range only ever carries its *confirmed prefix* of roots: header `H + 1`
-        // authenticates the root for `H`, so over `[start..=tip]` the roots confirmed are
+        // A semantically-validated header range carries its *confirmed prefix* of roots: header
+        // `H + 1` authenticates the root for `H`, so over `[start..=tip]` the roots confirmed are
         // `[start..=tip - 1]` and the tip's own root stays unconfirmed until the next overlapping
-        // range delivers its successor header. The confirmed prefix is therefore always exactly one
-        // shorter than the headers (zero roots for a single-header range). Enforcing this here makes
-        // the trust boundary a state invariant: it is structurally impossible to persist the
-        // unconfirmed tip root, even if a future caller mistakenly passed the full peer-supplied
-        // vector. A longer or shorter payload is rejected.
-        if tree_aux_roots.len() + 1 != headers.len() {
+        // range delivers its successor header. That prefix is always exactly one shorter than the
+        // headers (zero roots for a single-header range).
+        //
+        // Checkpoint-authenticated backfill ranges (backward ranges) carry no provisional roots at
+        // all, so an empty vector is also accepted. Both accepted shapes keep the trust boundary a
+        // state invariant: the unconfirmed tip root can never be persisted, because a full-length
+        // (or otherwise-longer) vector is still rejected, and an empty vector persists nothing.
+        if !(tree_aux_roots.is_empty() || tree_aux_roots.len() + 1 == headers.len()) {
             return Err(CommitHeaderRangeError::TreeAuxRootCountMismatch {
                 headers: headers.len(),
                 roots: tree_aux_roots.len(),

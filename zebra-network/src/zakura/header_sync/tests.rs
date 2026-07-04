@@ -244,6 +244,36 @@ fn roots_from_height(start_height: block::Height, count: usize) -> Vec<BlockComm
         .collect()
 }
 
+/// Builds tree-aux roots whose Sapling root matches each header's own commitment on `network`, so a
+/// multi-block forward range passes header-auxiliary validation. Orchard/Ironwood roots stay empty
+/// (these fixtures are pre-NU5). Pre-Sapling heights keep the empty Sapling root.
+fn header_matching_roots(
+    network: &Network,
+    start_height: block::Height,
+    headers: &[Arc<block::Header>],
+) -> Vec<BlockCommitmentRoots> {
+    headers
+        .iter()
+        .enumerate()
+        .map(|(offset, header)| {
+            let offset = u32::try_from(offset).expect("test root count fits in u32");
+            let height = block::Height(start_height.0 + offset);
+            let sapling_root = match header
+                .commitment(network, height)
+                .expect("test header commitment parses")
+            {
+                zebra_chain::block::Commitment::FinalSaplingRoot(root) => root,
+                _ => sapling::tree::NoteCommitmentTree::default().root(),
+            };
+            BlockCommitmentRoots {
+                height,
+                sapling_root,
+                ..root_at(height)
+            }
+        })
+        .collect()
+}
+
 fn roots_message_from(
     _start_height: block::Height,
     headers: Vec<Arc<block::Header>>,
@@ -4616,11 +4646,15 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
         }
     }
 
+    // Supply roots matching each header's own Sapling commitment: this multi-block forward range is
+    // aux-validated (Sapling activates at height 2 on this fixture network), so empty roots would be
+    // correctly rejected. The commit path is exercised with roots that pass validation.
+    let matching_roots = header_matching_roots(&network, block::Height(1), &headers);
     fixture
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: finalized_headers_message(headers.to_vec()),
+            msg: roots_message_from(block::Height(1), headers.to_vec(), matching_roots),
         })
         .await
         .unwrap();

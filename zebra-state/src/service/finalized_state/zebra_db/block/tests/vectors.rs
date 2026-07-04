@@ -712,13 +712,12 @@ fn header_range_commit_persists_only_the_confirmed_root_prefix() {
         "the unconfirmed range tip must not have a persisted root",
     );
 
-    // A prefix shorter than headers - 1 would silently drop a confirmed root, so it is rejected.
+    // An empty vector is the checkpoint-authenticated backfill shape: it is accepted and persists no
+    // provisional roots, so the trust boundary is never crossed.
     let mut batch = DiskWriteBatch::new();
-    assert!(matches!(
-        batch
-            .prepare_header_range_batch_with_roots(&state, genesis.hash(), &headers, &[0, 0], &[],),
-        Err(CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }),
-    ));
+    batch
+        .prepare_header_range_batch_with_roots(&state, genesis.hash(), &headers, &[0, 0], &[])
+        .expect("an empty root vector is accepted for checkpoint-authenticated backfill");
 
     // A full-length vector would include the unauthenticated tip root, so it is rejected.
     let mut batch = DiskWriteBatch::new();

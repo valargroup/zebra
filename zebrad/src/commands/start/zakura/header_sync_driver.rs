@@ -600,7 +600,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 // Persist only the header-authenticated confirmed prefix. The range tip's root is
                 // unconfirmed until the next overlapping range delivers its successor header, so it
                 // is deliberately excluded here; the state writes exactly what it is given.
-                let committed_roots = verified_roots.confirmed_roots().to_vec();
+                let committed_roots = verified_roots
+                    .as_deref()
+                    .map_or_else(Vec::new, |verified_roots| {
+                        verified_roots.confirmed_roots().to_vec()
+                    });
                 let tree_aux_roots_len = u32::try_from(committed_roots.len()).unwrap_or(u32::MAX);
                 let tip_parent_hash = header_range_tip_parent_hash(anchor, start_height, &headers);
                 emit_commit_state(
