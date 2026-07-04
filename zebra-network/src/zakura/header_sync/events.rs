@@ -1,3 +1,9 @@
+use std::sync::Arc;
+
+use zebra_chain::{
+    history_tree::HistoryTree, parallel::commitment_aux_verify::VerifiedHeaderCommitmentRoots,
+};
+
 use super::{config::*, error::*, validation::*, wire::*, *};
 use crate::zakura::{
     FrontierUpdate, HeaderSyncPeerSession, HeaderSyncServiceSummary, ServicePeerSnapshot,
@@ -26,6 +32,13 @@ pub struct HeaderSyncStartup {
     pub frontiers: HeaderSyncFrontiers,
     /// Durable best header tip loaded from storage at startup.
     pub best_header_tip: Option<(block::Height, block::Hash)>,
+    /// Hash of the durable best header tip's parent, if the tip is above genesis.
+    pub best_header_parent_hash: Option<block::Hash>,
+    /// History tree positioned at the durable best header tip.
+    ///
+    /// Pre-Heartwood or empty state uses the default (empty) tree; post-Heartwood this is the tree
+    /// reconstructed from durable roots so header-sync root verification can start immediately.
+    pub best_header_history_tree: Arc<HistoryTree>,
     /// Shared sync exchange frontier stream.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
     /// Local stream-5 advertisement.
@@ -61,6 +74,8 @@ impl HeaderSyncStartup {
             anchor,
             frontiers,
             best_header_tip,
+            best_header_parent_hash: None,
+            best_header_history_tree: Arc::new(HistoryTree::default()),
             frontier_updates: None,
             config,
             max_frame_bytes,
@@ -217,6 +232,16 @@ pub enum HeaderSyncEvent {
     },
     /// State finalized or verified-body frontiers changed.
     StateFrontiersChanged(HeaderSyncFrontiers),
+    /// State returned the history tree rebuilt for the current best header tip.
+    ///
+    /// Used to repopulate the header-frontier history tree after a re-anchor, where the in-memory
+    /// tree no longer matches the reset best header tip.
+    BestHeaderHistoryTreeLoaded {
+        /// Best header tip the tree is positioned at when this reload was requested.
+        best_header_tip: block::Height,
+        /// History tree reconstructed by state, positioned at `best_header_tip`.
+        history_tree: Arc<HistoryTree>,
+    },
     /// State successfully committed a header range.
     HeaderRangeCommitted {
         /// First committed height.
@@ -225,6 +250,8 @@ pub enum HeaderSyncEvent {
         tip_height: block::Height,
         /// New best header tip hash.
         tip_hash: block::Hash,
+        /// Hash of the new best header tip's parent, if known.
+        tip_parent_hash: Option<block::Hash>,
     },
     /// State rejected a previously requested range.
     HeaderRangeCommitFailed {
@@ -290,13 +317,18 @@ pub enum HeaderSyncAction {
         headers: Vec<Arc<block::Header>>,
         /// Advisory serialized body sizes, parallel to `headers`.
         body_sizes: Vec<u32>,
-        /// Per-height commitment roots, parallel to `headers`.
-        tree_aux_roots: Vec<BlockCommitmentRoots>,
+        /// Header-layer verified commitment roots for the confirmed prefix of `headers`.
+        verified_roots: VerifiedHeaderCommitmentRoots,
         /// Whether the range is expected to be finalized by checkpoint policy.
         finalized: bool,
     },
-    /// Ask state for the durable best header tip.
-    QueryBestHeaderTip,
+    /// Ask state to rebuild the header-frontier history tree at the current best header tip.
+    QueryBestHeaderHistoryTree {
+        /// Verified block tip that is the reconstruction base.
+        verified_block_tip: block::Height,
+        /// Header tip the rebuilt tree must be positioned at.
+        best_header_tip: block::Height,
+    },
     /// Ask state for a bounded contiguous range of headers.
     QueryHeadersByHeightRange {
         /// Peer that requested the range.

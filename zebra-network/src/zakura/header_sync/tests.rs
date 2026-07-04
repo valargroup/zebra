@@ -14,6 +14,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use zebra_chain::{
+    history_tree::HistoryTree,
     orchard,
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
@@ -28,7 +29,7 @@ use zebra_chain::{
 };
 use zebra_test::vectors::{
     BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_4_BYTES,
-    BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_GENESIS_BYTES,
+    BLOCK_MAINNET_5_BYTES, BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_GENESIS_BYTES,
 };
 
 #[derive(Default)]
@@ -243,6 +244,18 @@ fn roots_from_height(start_height: block::Height, count: usize) -> Vec<BlockComm
         .collect()
 }
 
+fn roots_message_from(
+    _start_height: block::Height,
+    headers: Vec<Arc<block::Header>>,
+    tree_aux_roots: Vec<BlockCommitmentRoots>,
+) -> HeaderSyncMessage {
+    HeaderSyncMessage::Headers {
+        body_sizes: vec![0; headers.len()],
+        headers,
+        tree_aux_roots,
+    }
+}
+
 async fn validate_headers_stateless_after_equihash_acceptance(
     headers: Vec<Arc<block::Header>>,
     context: HeaderSyncValidationContext<'_>,
@@ -318,6 +331,30 @@ fn advisory_header_summary(
 
 fn regtest_network() -> Network {
     Network::new_regtest(Default::default())
+}
+
+fn pre_sapling_checkpoint_regtest(
+    checkpoint_height: block::Height,
+    checkpoint_hash: block::Hash,
+) -> Network {
+    let default_regtest = regtest_network();
+    Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            before_overwinter: Some(10),
+            ..Default::default()
+        },
+        checkpoints: Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), default_regtest.genesis_hash()),
+            (checkpoint_height, checkpoint_hash),
+        ])),
+        ..Default::default()
+    })
+}
+
+fn pre_sapling_test_header(bytes: &[u8], previous_hash: block::Hash) -> Arc<block::Header> {
+    let mut header = *mainnet_header(bytes);
+    header.previous_block_hash = previous_hash;
+    Arc::new(header)
 }
 
 fn checkpoint_testnet_with_hash(
@@ -772,8 +809,7 @@ async fn next_non_query_action(actions: &mut mpsc::Receiver<HeaderSyncAction>) -
         let action = next_action(actions).await;
         if !matches!(
             action,
-            HeaderSyncAction::QueryBestHeaderTip
-                | HeaderSyncAction::QueryMissingBlockBodies { .. }
+            HeaderSyncAction::QueryMissingBlockBodies { .. }
                 | HeaderSyncAction::QueryHeadersByHeightRange { .. }
                 | HeaderSyncAction::HeaderAdvanced { .. }
         ) {
@@ -1049,6 +1085,30 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
     assert!(matches!(
         HeaderSyncMessage::decode(&with_trailing, finalized_headers_context(1, 1)),
         Err(HeaderSyncWireError::TrailingBytes)
+    ));
+}
+
+#[test]
+fn header_aux_validation_rejects_bad_roots_before_state_commit() {
+    let header = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let mut roots = root_at(block::Height(1));
+    roots.orchard_root =
+        orchard::tree::Root::try_from([0u8; 32]).expect("zero is a valid Pallas base field");
+
+    assert_ne!(
+        roots.orchard_root,
+        orchard::tree::NoteCommitmentTree::default().root(),
+        "the bad root must differ from the pre-NU5 empty Orchard root"
+    );
+
+    assert!(matches!(
+        validate_header_aux_commitments(
+            &Network::Mainnet,
+            &HistoryTree::default(),
+            &[header],
+            &[roots]
+        ),
+        Err(HeaderSyncWireError::InvalidHeaderCommitment(_))
     ));
 }
 
@@ -1540,6 +1600,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
             start_height: start,
             tip_height: chunk_tip,
             tip_hash: block::Hash([4; 32]),
+            tip_parent_hash: Some(block::Hash([3; 32])),
         })
         .await
         .unwrap();
@@ -1555,10 +1616,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
             ..
         } = next_non_query_action(&mut fixture.actions).await
         {
-            assert_eq!(
-                start_height,
-                next_height(chunk_tip).expect("committed chunk tip has successor")
-            );
+            assert_eq!(start_height, chunk_tip,);
             assert_eq!(count, clamped_count);
             break;
         }
@@ -2157,6 +2215,7 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
             start_height: block::Height(1),
             tip_height: block::Height(2),
             tip_hash: block::Hash([2; 32]),
+            tip_parent_hash: None,
         })
         .await
         .unwrap();
@@ -2214,6 +2273,7 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
             start_height: block::Height(1),
             tip_height: block::Height(1),
             tip_hash: committed_hash,
+            tip_parent_hash: None,
         })
         .await
         .unwrap();
@@ -2386,6 +2446,7 @@ async fn material_tip_advance_sends_rate_limited_unsolicited_status() {
                 tip_hash: block::Hash(
                     [u8::try_from(height.0).expect("test heights fit in u8"); 32],
                 ),
+                tip_parent_hash: None,
             })
             .await
             .unwrap();
@@ -3818,6 +3879,7 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation()
             start_height: next_height(first_checkpoint).expect("checkpoint has a successor"),
             tip_height: next_height(first_checkpoint).expect("checkpoint has a successor"),
             tip_hash: committed_hash,
+            tip_parent_hash: None,
         })
         .await
         .unwrap();
@@ -3938,6 +4000,7 @@ async fn committed_range_updates_best_tip_watch_and_does_not_advance_finality() 
             start_height: block::Height(1),
             tip_height: block::Height(1),
             tip_hash,
+            tip_parent_hash: None,
         })
         .await
         .unwrap();
@@ -3945,6 +4008,307 @@ async fn committed_range_updates_best_tip_watch_and_does_not_advance_finality() 
     tip.changed().await.unwrap();
     assert_eq!(*tip.borrow(), (block::Height(1), tip_hash));
     assert_ne!(fixture.handle.best_header_tip().0, block::Height(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_header_aux_roots_score_before_commit() {
+    let default_regtest = regtest_network();
+    let block1 = pre_sapling_test_header(&BLOCK_MAINNET_1_BYTES, default_regtest.genesis_hash());
+    let block1_hash = block::Hash::from(block1.as_ref());
+    let network = pre_sapling_checkpoint_regtest(block::Height(1), block1_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(81);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    let mut roots = roots_from_height(start_height, 1);
+    roots[0].sapling_root =
+        sapling::tree::Root::try_from([1u8; 32]).expect("test Sapling root is valid");
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: roots_message_from(start_height, vec![block1], roots),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+                break;
+            }
+            HeaderSyncAction::CommitHeaderRange { .. } => {
+                panic!("invalid header aux roots must not reach state commit")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_header_aux_roots_reach_commit_before_advancing_tip() {
+    let default_regtest = regtest_network();
+    let block1 = pre_sapling_test_header(&BLOCK_MAINNET_1_BYTES, default_regtest.genesis_hash());
+    let block1_hash = block::Hash::from(block1.as_ref());
+    let network = pre_sapling_checkpoint_regtest(block::Height(1), block1_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(82);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: finalized_headers_message_from(start_height, vec![block1]),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                peer,
+                start_height,
+                headers,
+                verified_roots,
+                ..
+            } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(start_height, block::Height(1));
+                assert_eq!(headers.len(), 1);
+                assert!(
+                    verified_roots.confirmed_roots().is_empty(),
+                    "a one-header range verifies but has no confirmed prefix yet"
+                );
+                assert_eq!(fixture.handle.best_header_tip().0, block::Height(0));
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_header_aux_tree_retries_without_scoring() {
+    let block4 = mainnet_header(&BLOCK_MAINNET_4_BYTES);
+    let block4_hash = block::Hash::from(block4.as_ref());
+    let block5 = mainnet_header(&BLOCK_MAINNET_5_BYTES);
+    let block5_hash = block::Hash::from(block5.as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(5), block5_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(4), block4_hash)),
+    ));
+    let peer_id = peer(83);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(5),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(5));
+    assert_eq!(count, 1);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id,
+            msg: finalized_headers_message_from(start_height, vec![block5]),
+        })
+        .await
+        .unwrap();
+
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+}
+
+/// A gossiped `NewBlock` commits ahead of any forward header range, advancing the header tip.
+/// The in-memory frontier tree would otherwise stay stale at its old position, so the reactor must
+/// rebuild it from durable state at the new tip (a single tip read, since `best == verified`),
+/// exactly as the re-anchor path does. Without this a later forward range stalls on a stale tree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gossip_tip_advance_rebuilds_header_frontier_tree() {
+    let network = Network::Mainnet;
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let hash = block.hash();
+    let height = block.coinbase_height().expect("test block has height");
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::NewBlockAccepted {
+            peer: peer(84),
+            height,
+            hash,
+            block,
+        })
+        .await
+        .unwrap();
+
+    let mut saw_rebuild = false;
+    for _ in 0..16 {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            fixture.actions.recv(),
+        )
+        .await
+        {
+            Ok(Some(HeaderSyncAction::QueryBestHeaderHistoryTree {
+                verified_block_tip,
+                best_header_tip,
+            })) => {
+                assert_eq!(verified_block_tip, height);
+                assert_eq!(best_header_tip, height);
+                saw_rebuild = true;
+                break;
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+
+    assert!(
+        saw_rebuild,
+        "a gossip tip advance must rebuild the in-memory header-frontier tree at the new tip"
+    );
+    assert_eq!(fixture.handle.best_header_tip().0, height);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_current_tip_history_tree_dispatches_guarded_rebuild() {
+    let mainnet = Network::Mainnet;
+    let network = Parameters::build()
+        .with_network_name("HeadersyncMissingTreeReload")
+        .expect("custom network name is valid")
+        .with_genesis_hash(mainnet.genesis_hash())
+        .expect("mainnet genesis hash is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(1),
+            blossom: Some(1),
+            heartwood: Some(1),
+            canopy: Some(1),
+            ..Default::default()
+        })
+        .expect("custom activation heights are in order")
+        .clear_funding_streams()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![(
+            block::Height(0),
+            mainnet.genesis_hash(),
+        )]))
+        .expect("custom checkpoints are valid")
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    let anchor = (block::Height(0), network.genesis_hash());
+    let block4 = mainnet_block(&BLOCK_MAINNET_4_BYTES);
+    let block5 = mainnet_header(&BLOCK_MAINNET_5_BYTES);
+    let best_tip = (
+        block4.coinbase_height().expect("test block has height"),
+        block4.hash(),
+    );
+    let mut startup = startup_for(network.clone(), anchor, Some(best_tip));
+    startup.frontiers.verified_block_tip = best_tip.0;
+    startup.frontiers.verified_block_hash = best_tip.1;
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(85);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        anchor.0,
+        block::Height(5),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(5));
+    assert_eq!(count, 1);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id,
+            msg: headers_message_from(start_height, vec![block5]),
+        })
+        .await
+        .unwrap();
+
+    for _ in 0..16 {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryBestHeaderHistoryTree {
+                verified_block_tip,
+                best_header_tip,
+            } => {
+                assert_eq!(verified_block_tip, best_tip.0);
+                assert_eq!(best_header_tip, best_tip.0);
+                return;
+            }
+            HeaderSyncAction::CommitHeaderRange { .. } => {
+                panic!("stale tree must reload before committing the forward range");
+            }
+            _ => {}
+        }
+    }
+
+    panic!("missing current-tip history tree did not dispatch a guarded rebuild");
 }
 
 #[tokio::test(flavor = "current_thread")]

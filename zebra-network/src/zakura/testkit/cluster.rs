@@ -961,6 +961,7 @@ mod tests {
                                     start_height,
                                     tip_height,
                                     tip_hash,
+                                    tip_parent_hash: None,
                                 })
                                 .await;
                             let _ = local
@@ -981,18 +982,18 @@ mod tests {
                         }
                     }
                 }
-                HeaderSyncAction::QueryBestHeaderTip => {
-                    let (tip_height, tip_hash) = local
-                        .store
-                        .lock()
-                        .expect("test store mutex is not poisoned")
-                        .best_header_tip();
+                HeaderSyncAction::QueryBestHeaderHistoryTree {
+                    best_header_tip, ..
+                } => {
+                    // The e2e header store uses pre-Heartwood vectors, so the empty tree is the
+                    // correct reconstruction; a post-Heartwood tree would be rejected on height.
                     let _ = local
                         .handle
-                        .send(HeaderSyncEvent::HeaderRangeCommitted {
-                            start_height: tip_height,
-                            tip_height,
-                            tip_hash,
+                        .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
+                            best_header_tip,
+                            history_tree: Arc::new(
+                                zebra_chain::history_tree::HistoryTree::default(),
+                            ),
                         })
                         .await;
                 }
@@ -1345,7 +1346,7 @@ mod tests {
                             .send(HeaderSyncEvent::NewBlockDuplicate { peer, height, hash })
                             .await;
                     }
-                    HeaderSyncAction::QueryBestHeaderTip
+                    HeaderSyncAction::QueryBestHeaderHistoryTree { .. }
                     | HeaderSyncAction::QueryMissingBlockBodies { .. }
                     | HeaderSyncAction::BodyGaps { .. }
                     | HeaderSyncAction::HeaderAdvanced { .. }

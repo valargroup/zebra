@@ -1957,12 +1957,21 @@ impl DiskWriteBatch {
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
     ) -> Result<block::Hash, CommitHeaderRangeError> {
-        let roots = inferred_header_range_roots(zebra_db, anchor, headers.len())?;
+        // The commit path only accepts the confirmed prefix (one root shorter than the headers, and
+        // none for a single-header range), so infer exactly that many placeholder roots.
+        let roots = inferred_header_range_roots(zebra_db, anchor, headers.len().saturating_sub(1))?;
         self.prepare_header_range_batch_with_roots(zebra_db, anchor, headers, body_sizes, &roots)
     }
 
     /// Prepare a database batch containing a contextually validated header range
-    /// and one provisional tree-aux root per header.
+    /// and the tree-aux roots supplied for it.
+    ///
+    /// `tree_aux_roots` is the caller's confirmed prefix, aligned from the range start, and is
+    /// required to be exactly one shorter than `headers` (zero roots for a single-header range):
+    /// the range tip's root is only authenticated by the next range's successor header, so it is
+    /// never confirmed here. This is enforced, not merely expected, so it is structurally impossible
+    /// to persist the unconfirmed tip root and expose peer-supplied data to startup history-tree
+    /// reconstruction.
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_header_range_batch_with_roots(
         &mut self,
@@ -1983,7 +1992,15 @@ impl DiskWriteBatch {
             });
         }
 
-        if headers.len() != tree_aux_roots.len() {
+        // A header range only ever carries its *confirmed prefix* of roots: header `H + 1`
+        // authenticates the root for `H`, so over `[start..=tip]` the roots confirmed are
+        // `[start..=tip - 1]` and the tip's own root stays unconfirmed until the next overlapping
+        // range delivers its successor header. The confirmed prefix is therefore always exactly one
+        // shorter than the headers (zero roots for a single-header range). Enforcing this here makes
+        // the trust boundary a state invariant: it is structurally impossible to persist the
+        // unconfirmed tip root, even if a future caller mistakenly passed the full peer-supplied
+        // vector. A longer or shorter payload is rejected.
+        if tree_aux_roots.len() + 1 != headers.len() {
             return Err(CommitHeaderRangeError::TreeAuxRootCountMismatch {
                 headers: headers.len(),
                 roots: tree_aux_roots.len(),
@@ -2038,12 +2055,15 @@ impl DiskWriteBatch {
                 .ok_or(CommitHeaderRangeError::HeightOverflow)?;
             let hash = block::Hash::from(&**header);
             let body_size = body_sizes[index];
-            let roots = &tree_aux_roots[index];
-            if roots.height != height {
-                return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
-                    expected_height: height,
-                    root_height: roots.height,
-                });
+            // The tip's root is omitted from the confirmed prefix, so the last header may have no
+            // matching root. Present roots must align with their header height.
+            if let Some(roots) = tree_aux_roots.get(index) {
+                if roots.height != height {
+                    return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
+                        expected_height: height,
+                        root_height: roots.height,
+                    });
+                }
             }
 
             if let Some(expected) = checkpoints.hash(height) {
@@ -2186,22 +2206,24 @@ impl DiskWriteBatch {
             // only ever runs above the body tip — so a header range re-delivered
             // over committed heights (a header store behind the body store, or a
             // late range response racing body sync) must never overwrite the
-            // verified row: committed roots win on any overlap (design §9).
-            if !zebra_db.contains_body_at_height(height) {
-                let roots = &tree_aux_roots[index];
-                self.zs_insert(
-                    &roots_by_height,
-                    height,
-                    CommitmentRootsByHeight {
-                        sapling: roots.sapling_root,
-                        orchard: roots.orchard_root,
-                        ironwood: roots.ironwood_root,
-                        sapling_tx: roots.sapling_tx,
-                        orchard_tx: roots.orchard_tx,
-                        ironwood_tx: roots.ironwood_tx,
-                        auth_data_root: roots.auth_data_root,
-                    },
-                );
+            // verified row: committed roots win on any overlap (design §9). The tip's root is absent
+            // from the confirmed prefix (`tree_aux_roots.get` is `None`), so it is never persisted.
+            if let Some(roots) = tree_aux_roots.get(index) {
+                if !zebra_db.contains_body_at_height(height) {
+                    self.zs_insert(
+                        &roots_by_height,
+                        height,
+                        CommitmentRootsByHeight {
+                            sapling: roots.sapling_root,
+                            orchard: roots.orchard_root,
+                            ironwood: roots.ironwood_root,
+                            sapling_tx: roots.sapling_tx,
+                            orchard_tx: roots.orchard_tx,
+                            ironwood_tx: roots.ironwood_tx,
+                            auth_data_root: roots.auth_data_root,
+                        },
+                    );
+                }
             }
         }
 

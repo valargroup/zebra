@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use zebra_chain::history_tree::HistoryTree;
+
 use super::{error::*, events::*, scheduler::*, validation::*, wire::*, *};
 use crate::zakura::{
     HeaderSyncServiceSummary, ServicePeerDirection, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
@@ -17,12 +21,19 @@ pub(super) struct HeaderSyncCore {
     pub(super) verified_block_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
+    pub(super) best_header_parent_hash: Option<block::Hash>,
+    /// History tree positioned at the parent of the next forward range.
+    ///
+    /// Seeded at startup from durable state and repositioned as ranges commit, so peer-supplied
+    /// roots can be folded and authenticated against header commitments. The empty tree is the
+    /// natural pre-Heartwood value.
+    pub(super) best_header_history_tree: Arc<HistoryTree>,
     pub(super) peers: HashMap<ZakuraPeerId, PeerHeaderState>,
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
     pub(super) seen: HeaderHashDedup,
     pub(super) pending_new_blocks: HashSet<block::Hash>,
     pub(super) schedule: RangeScheduler,
-    pub(super) pending_commits: HashMap<PendingCommitKey, RangeRequest>,
+    pub(super) pending_commits: HashMap<PendingCommitKey, PendingHeaderCommit>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
     pub(super) stale_anchor: StaleAnchorFailures,
 }
@@ -31,6 +42,7 @@ impl HeaderSyncCore {
     pub(super) fn new(startup: &HeaderSyncStartup) -> Result<Self, HeaderSyncStartError> {
         validate_anchor(&startup.network, startup.anchor)?;
         let (best_header_tip, best_header_hash) = startup.best_header_tip.unwrap_or(startup.anchor);
+        let best_header_history_tree = startup.best_header_history_tree.clone();
 
         Ok(Self {
             anchor: startup.anchor,
@@ -39,6 +51,8 @@ impl HeaderSyncCore {
             verified_block_hash: startup.frontiers.verified_block_hash,
             best_header_tip,
             best_header_hash,
+            best_header_parent_hash: startup.best_header_parent_hash,
+            best_header_history_tree,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
             seen: HeaderHashDedup::default(),
@@ -63,7 +77,16 @@ impl HeaderSyncCore {
         }
 
         let checkpoints = startup.network.checkpoint_list();
-        let Some(start) = next_height(self.best_header_tip) else {
+        // Root-carrying ranges leave the best tip's roots unconfirmed, so the next request
+        // redelivers the tip header anchored at its parent.
+        let overlap_forward_range = self
+            .best_header_parent_hash
+            .is_some_and(|_| self.best_header_tip > block::Height(0));
+        let Some(start) = (if overlap_forward_range {
+            Some(self.best_header_tip)
+        } else {
+            next_height(self.best_header_tip)
+        }) else {
             return;
         };
         let mut end = best_peer_tip;
@@ -85,7 +108,12 @@ impl HeaderSyncCore {
         self.schedule.ensure_forward(RangeRequest {
             start_height: start,
             count,
-            anchor_hash: self.best_header_hash,
+            anchor_hash: if overlap_forward_range {
+                self.best_header_parent_hash
+                    .expect("overlapped ranges have a parent hash")
+            } else {
+                self.best_header_hash
+            },
             finalized,
             want_tree_aux_roots: true,
             priority: RangePriority::Forward,
@@ -121,6 +149,13 @@ impl HeaderSyncCore {
             priority: RangePriority::Backward,
         });
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingHeaderCommit {
+    pub(super) range: RangeRequest,
+    pub(super) verified_roots:
+        zebra_chain::parallel::commitment_aux_verify::VerifiedHeaderCommitmentRoots,
 }
 
 #[derive(Clone, Debug, Default)]

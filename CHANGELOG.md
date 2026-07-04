@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Zebra now tags the coinbase input of every block it mines with a `🌸`. The
   `mining.extra_coinbase_data` option is now limited to 86 bytes (was 94);
   Zebra refuses to start if it is exceeded.
+- Zakura header sync now verifies peer-supplied commitment (tree-aux) roots
+  against block header commitments before persisting them, writing only the
+  header-authenticated confirmed prefix (the range tip's root is confirmed by
+  the next overlapping range). The ZIP-221 history tree is reconstructed from
+  the durable confirmed roots at startup and header sync resumes from that
+  frontier, so unauthenticated peer data is never folded into the header-sync
+  history tree.
 
 ### Changed
 
