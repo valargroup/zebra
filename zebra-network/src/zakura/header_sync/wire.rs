@@ -54,6 +54,19 @@ pub(super) const DEFAULT_HS_STATUS_REFRESH_INTERVAL: Duration = Duration::from_s
 pub(super) const DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL: Duration = Duration::from_secs(5);
 pub(super) const DEFAULT_HS_INBOUND_NEW_BLOCK_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How far the verified body tip may lead the Zakura header-sync frontier before header sync
+/// re-anchors up to it.
+///
+/// The verified body tip can outrun the header-sync frontier when legacy body sync catches up while
+/// this node has no Zakura header-sync peer ahead of it (its overlay peers are behind). Those blocks
+/// are locally verified — their headers and roots are the trusted committed rows — so header sync
+/// should follow the verified tip rather than sit behind it. Following is gated on this gap so the
+/// re-anchor (which broadcasts a status refresh) fires at most once per this many blocks of drift,
+/// keeping it well under [`DEFAULT_HS_INBOUND_STATUS_MIN_INTERVAL`] even while the verified tip
+/// climbs fast: the tightest case is a full-speed legacy catch-up (~tens of blocks/sec), where a
+/// 256-block gap still spaces re-anchors seconds apart.
+pub(super) const HEADER_SYNC_FOLLOW_VERIFIED_TIP_GAP: u32 = 256;
+
 const _: () = assert!(MAX_HS_MESSAGE_BYTES < LOCAL_MAX_MESSAGE_BYTES as usize);
 const _: () = assert!(
     HEADER_SYNC_MESSAGE_TYPE_BYTES

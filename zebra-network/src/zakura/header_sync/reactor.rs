@@ -589,6 +589,25 @@ impl HeaderSyncReactor {
         self.state.finalized_height = frontiers.finalized_height;
         self.state.verified_block_tip = frontiers.verified_block_tip;
         self.state.verified_block_hash = frontiers.verified_block_hash;
+
+        // The verified body tip can lead the header-sync frontier when legacy body sync catches up
+        // while this node has no Zakura header-sync peer ahead of it (its overlay peers are behind).
+        // Those blocks are locally verified, so once the gap is large enough advance the header
+        // frontier up to the verified tip instead of sitting behind it, reusing the re-anchor path
+        // (which repositions the tip and reloads the history tree at the verified tip). Gated on
+        // `HEADER_SYNC_FOLLOW_VERIFIED_TIP_GAP` so the re-anchor's status broadcast stays under the
+        // status-spam limit even while the verified tip climbs.
+        if self.state.verified_block_tip.0
+            > self
+                .state
+                .best_header_tip
+                .0
+                .saturating_add(HEADER_SYNC_FOLLOW_VERIFIED_TIP_GAP)
+        {
+            self.reanchor_to_verified_block_tip().await;
+            return;
+        }
+
         if self.state.best_header_tip <= self.state.verified_block_tip {
             self.state.stale_anchor.reset();
         }
