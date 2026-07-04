@@ -5707,22 +5707,27 @@ async fn block_sync_add_peer_replaces_same_peer_even_at_full_cap() {
 }
 
 #[tokio::test]
-async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
+async fn reactor_does_not_refetch_height_after_non_advancing_duplicate_result() {
+    // Complements `reactor_releases_budget_after_non_advancing_duplicate_result`:
+    // releasing the duplicate's slot must not cause its height to be re-fetched.
+    // The download floor advanced past the height when its body drained into
+    // `applying` and does not roll back on a `Duplicate` result, so an offer of
+    // that same already-applied height (e.g. a stale needed-blocks snapshot) is
+    // filtered out and never re-requested. The header tip is pinned at the applied
+    // height so no successor exists to confound the "no re-fetch" assertion.
     let blocks = mainnet_blocks_1_to_3();
     let block1_size = block_size(&blocks[0]);
     let mut config = immediate_body_download_config();
-    // One block's size hint of budget: size-based reservation now means one
-    // advertised body fills the budget, throttling to one in-flight request.
     config.max_inflight_block_bytes = u64::from(block1_size);
 
-    let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         },
-        (block::Height(2), blocks[1].hash()),
+        (block::Height(1), blocks[0].hash()),
         tip_rx,
         config.clone(),
     );
@@ -5732,26 +5737,20 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
         &service,
         &mut actions,
         42,
-        block::Height(2),
-        blocks[1].hash(),
+        block::Height(1),
+        blocks[0].hash(),
         1,
         MAX_BS_RESPONSE_BYTES,
     )
     .await;
 
+    let needed = vec![BlockSyncBlockMeta {
+        height: block::Height(1),
+        hash: blocks[0].hash(),
+        size: BlockSizeEstimate::Advertised(block1_size),
+    }];
     handle
-        .send(BlockSyncEvent::NeededBlocks(vec![
-            BlockSyncBlockMeta {
-                height: block::Height(1),
-                hash: blocks[0].hash(),
-                size: BlockSizeEstimate::Advertised(block1_size),
-            },
-            BlockSyncBlockMeta {
-                height: block::Height(2),
-                hash: blocks[1].hash(),
-                size: BlockSizeEstimate::Advertised(block1_size),
-            },
-        ]))
+        .send(BlockSyncEvent::NeededBlocks(needed.clone()))
         .await
         .expect("needed metadata queues");
     assert_eq!(
@@ -5786,38 +5785,162 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
         .await
         .expect("non-advancing duplicate completion queues");
 
+    // Re-offer the already-applied height as if a stale snapshot still listed it.
     handle
-        .send(BlockSyncEvent::NeededBlocks(vec![
-            BlockSyncBlockMeta {
-                height: block::Height(1),
-                hash: blocks[0].hash(),
-                size: BlockSizeEstimate::Advertised(block1_size),
-            },
-            BlockSyncBlockMeta {
-                height: block::Height(2),
-                hash: blocks[1].hash(),
-                size: BlockSizeEstimate::Advertised(block1_size),
-            },
-        ]))
+        .send(BlockSyncEvent::NeededBlocks(needed))
         .await
         .expect("needed metadata after duplicate queues");
 
     // A re-request would land on this peer's own real outbound, so watch the wire.
-    let no_duplicate_request = tokio::time::timeout(Duration::from_millis(100), async {
+    let no_refetch = tokio::time::timeout(Duration::from_millis(100), async {
         while let Some(frame) = outbound_rx.recv().await {
             if let BlockSyncMessage::GetBlocks {
                 start_height,
                 count,
             } = BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes")
             {
-                panic!("non-advancing duplicate result re-requested {start_height:?}/{count}");
+                panic!("duplicate height was re-requested: {start_height:?}/{count}");
             }
         }
     })
     .await;
     assert!(
-        no_duplicate_request.is_err(),
-        "reactor should keep waiting after a duplicate result that did not advance the frontier",
+        no_refetch.is_err(),
+        "the already-applied duplicate height must not be re-requested",
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_releases_budget_after_non_advancing_duplicate_result() {
+    // Regression repro for a body-sync stall. When a submitted body finishes as a
+    // `Duplicate` for a height above the verified tip (e.g. a block already
+    // committed via a near-tip reorg or a re-request), the sequencer must release
+    // that body's `applying` slot and byte-budget reservation, exactly as it does
+    // for a `Committed` result. The apply is genuinely done — the body is in the
+    // state — so pinning its reservation freezes downloads: with a one-block
+    // budget the whole download budget stays consumed and the next needed height
+    // is never fetched until an external frontier advance or a restart. The
+    // download floor (not a retained `applying` entry) is what keeps the duplicate
+    // height itself from being re-requested, so releasing the budget is safe.
+    let blocks = mainnet_blocks_1_to_3();
+    let block1_size = block_size(&blocks[0]);
+    let mut config = immediate_body_download_config();
+    // One block's worth of budget: a single in-flight body fills it, so a leaked
+    // reservation blocks every later download.
+    config.max_inflight_block_bytes = u64::from(block1_size);
+
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(2), blocks[1].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        42,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    let needed = vec![
+        BlockSyncBlockMeta {
+            height: block::Height(1),
+            hash: blocks[0].hash(),
+            size: BlockSizeEstimate::Advertised(block1_size),
+        },
+        BlockSyncBlockMeta {
+            height: block::Height(2),
+            hash: blocks[1].hash(),
+            size: BlockSizeEstimate::Advertised(block1_size),
+        },
+    ];
+    handle
+        .send(BlockSyncEvent::NeededBlocks(needed.clone()))
+        .await
+        .expect("needed metadata queues");
+    // The one-block budget only covers height 1, so it is fetched first.
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(1), 1)
+    );
+
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[0].clone())).await;
+    let submit_token = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { token, block } => {
+                assert_eq!(block.hash(), blocks[0].hash());
+                break token;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action before submit: {action:?}"),
+        }
+    };
+
+    // The submitted body returns a duplicate whose local frontier does not advance
+    // the verified tip (still height 0, below the applied height 1).
+    handle
+        .send(BlockSyncEvent::BlockApplyFinished {
+            token: submit_token,
+            height: block::Height(1),
+            hash: blocks[0].hash(),
+            result: BlockApplyResult::Duplicate,
+            local_frontier: Some(BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            }),
+        })
+        .await
+        .expect("non-advancing duplicate completion queues");
+
+    // Re-offer the same needed set; height 1 is now below the download floor, so
+    // only height 2 is eligible.
+    handle
+        .send(BlockSyncEvent::NeededBlocks(needed))
+        .await
+        .expect("needed metadata after duplicate queues");
+
+    // The duplicate freed height 1's slot and budget, so the successor height 2
+    // must now be requested. On the buggy path the reservation leaks and this
+    // request never arrives — the download pipeline is stalled.
+    let requested = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = outbound_rx
+                .recv()
+                .await
+                .expect("peer outbound stream stays open");
+            match BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes") {
+                BlockSyncMessage::GetBlocks {
+                    start_height,
+                    count,
+                } => break (start_height, count),
+                BlockSyncMessage::Status(_) => {}
+                msg => panic!("unexpected outbound message before GetBlocks: {msg:?}"),
+            }
+        }
+    })
+    .await
+    .expect(
+        "successor height 2 must be requested after the duplicate frees the budget \
+         (a timeout here means the leaked reservation stalled downloads)",
+    );
+    assert_eq!(
+        requested,
+        (block::Height(2), 1),
+        "the freed budget must fetch the successor height 2, not re-request the duplicate",
     );
 
     reactor_task.abort();

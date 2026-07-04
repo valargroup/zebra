@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed a Zakura block-sync stall during near-tip, post-checkpoint (full)
+  verification. When a re-submitted body committed as a duplicate above the
+  verified tip (e.g. a near-tip reorg or a re-requested block), the sequencer
+  leaked that body's apply slot and in-flight byte-budget reservation instead of
+  releasing them, so downloads eventually froze until an external frontier
+  advance or a node restart. Duplicate commit results now release their slot and
+  budget like committed blocks, while the unchanged download floor still keeps
+  the already-applied height from being re-fetched.
 - Fixed Zakura header-sync and block-sync peers getting stuck unable to serve
   requests when an initial `Status` advertisement was dropped by a full outbound
   queue. Status send bookkeeping now only records queued frames, header sync

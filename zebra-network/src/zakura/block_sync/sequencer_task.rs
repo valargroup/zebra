@@ -535,12 +535,14 @@ impl SequencerTask {
             None
         };
 
-        if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
-            // Stale duplicate for a height we have not verified to: the reactor
-            // needs the serving/query tail only when the accepted local frontier
-            // actually advanced serving.
-            return accepted_local_frontier.is_some();
-        }
+        // A `Duplicate` result means the body is already in the state, so — like a
+        // `Committed` result — its `applying` slot and byte-budget reservation must
+        // be released here, even when it applies above the verified tip (a near-tip
+        // reorg or a re-requested body). Retaining the reservation to "wait for the
+        // frontier to catch up" leaks the slot and its budget until an external
+        // frontier advance or a restart, stalling downloads. Re-requesting the
+        // duplicate height is already prevented by the download floor, which does
+        // not roll back on `Committed`/`Duplicate`, so releasing the slot is safe.
         let applying = self
             .sequencer
             .remove_applying(height)
