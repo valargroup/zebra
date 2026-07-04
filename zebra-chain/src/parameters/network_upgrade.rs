@@ -245,7 +245,7 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     // configures a NU6.3 activation height, including no-`zcash_unstable` test
     // builds, where a missing entry makes `branch_id()` return `None` and panics
     // ("must have branch ID for chain history network upgrades").
-    (Nu6_3, ConsensusBranchId(0xffffffff)),
+    (Nu6_3, ConsensusBranchId(0x37a5165b)),
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     (Nu7, ConsensusBranchId(0xfffffffe)),
     #[cfg(zcash_unstable = "zfuture")]
