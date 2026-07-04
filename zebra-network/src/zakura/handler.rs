@@ -1046,6 +1046,10 @@ impl ZakuraSupervisorHandle {
                 }
             }
         }
+        if state.next_registration_id == u64::MAX {
+            metrics::counter!("zakura.p2p.conn.rejected.admission").increment(1);
+            return ZakuraRegistration::Rejected(ZakuraRejectReason::TemporaryUnavailable);
+        }
 
         match state
             .supervisor
@@ -1053,10 +1057,7 @@ impl ZakuraSupervisorHandle {
         {
             ZakuraUpgradeOutcome::Upgraded { .. } => {
                 let conn_id = state.next_registration_id;
-                state.next_registration_id = state
-                    .next_registration_id
-                    .checked_add(1)
-                    .expect("registration ids do not exhaust u64 in a single process");
+                state.next_registration_id += 1;
                 let entry = ZakuraPeerConnectionEntry {
                     conn_id,
                     outbound_handle,
@@ -5192,6 +5193,39 @@ mod tests {
         assert!(
             matches!(redial, ZakuraRegistration::Registered { .. }),
             "after drop cleanup, the deterministic same-direction redial can register again",
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_generation_exhaustion_rejects_without_mutating_state() {
+        let supervisor = ZakuraSupervisorHandle::new(2);
+        let peer = test_peer(25);
+
+        {
+            let mut state = supervisor.inner.lock().await;
+            state.next_registration_id = u64::MAX;
+        }
+
+        let registration = register_test_peer_with_hash_and_ip(
+            &supervisor,
+            test_conn_id(),
+            &peer,
+            None,
+            [0x25; TRANSCRIPT_HASH_BYTES],
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                registration,
+                ZakuraRegistration::Rejected(ZakuraRejectReason::TemporaryUnavailable)
+            ),
+            "exhausted registration generations reject the new connection instead of panicking",
+        );
+        assert!(
+            supervisor.registered_ids().await.is_empty(),
+            "failed registration must not mutate active supervisor state",
         );
     }
 
