@@ -422,7 +422,7 @@ is now locked together: `auth_data_root` is `pub(crate)`, `CheckpointVerifiedBlo
 
 ### 6.4 Header-sync-layer authentication and startup reconstruction
 
-§6.1–§6.3 are the consensus-critical gate at block-commit time. Header sync adds an *earlier* gate
+§6.1–§6.3 are the consensus-critical gate at block-commit time. Header sync adds an _earlier_ gate
 in the network reactor, so the roots it persists to `commitment_roots_by_height` and serves to
 other peers are already header-authenticated, and so a restart never trusts an unconfirmed root.
 
@@ -442,8 +442,8 @@ other peers are already header-authenticated, and so a restart never trusts an u
   writes exactly the roots it is handed (`prepare_header_range_batch_with_roots` accepts a prefix one
   shorter than the headers, or none — see the checkpoint-backfill note below), so the "one root per
   header" wire invariant (§5.4) and the persisted set are deliberately distinct.
-- **Checkpoint backfill skips this gate.** Only *forward* ranges carry a frontier tree that can be
-  folded and checked. *Backward* checkpoint-backfill ranges (headers below the sync anchor) are
+- **Checkpoint backfill skips this gate.** Only _forward_ ranges carry a frontier tree that can be
+  folded and checked. _Backward_ checkpoint-backfill ranges (headers below the sync anchor) are
   authenticated by the checkpoint hash and fold onto the previous checkpoint's tree, not the forward
   frontier the reactor caches, so they are committed without header-commitment validation and
   persist no provisional roots. `prepare_header_range_batch_with_roots` accepts an empty roots vector
@@ -452,7 +452,7 @@ other peers are already header-authenticated, and so a restart never trusts an u
 - **Reconstruct at startup.** The durable roots CF therefore holds a contiguous run of confirmed
   roots above the verified body tip, but never the header tip's own root. On startup
   `ReadRequest::BestHeaderHistoryTree` folds the durable confirmed roots onto the verified-tip
-  history tree up to the highest *contiguous* frontier and returns that frontier `(height, hash)`.
+  history tree up to the highest _contiguous_ frontier and returns that frontier `(height, hash)`.
   Header sync resumes from `frontier + 1` with an overlapping range that re-validates the next root,
   so a restart never folds an unauthenticated root into the header-frontier tree and never caps back
   to the verified tip on a one-block gap in the persisted roots.
