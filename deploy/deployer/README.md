@@ -52,6 +52,98 @@ python3 deploy.py logs fetch  --config nodes.toml --lines 2000    # last N lines
 python3 deploy.py logs follow --config nodes.toml --node node-a   # live tail -F
 ```
 
+## GitHub Actions testnet fleet deploy
+
+`.github/workflows/zakura-testnet-deploy.yml` runs this deployer on a Linux x86_64
+self-hosted runner, expected to be `zakura-testnet-1` with the
+`zakura-testnet-deployer` label. The runner builds the native `zebrad` binary and
+then deploys it to:
+
+- `zakura-testnet-1` — `root@167.99.103.111`
+- `zakura-testnet-2` — `root@167.99.110.145`
+- `zakura-testnet-3` — `root@138.68.229.254`
+
+One-time runner bootstrap from an operator machine with SSH access and CI
+credentials in `~/agents-env`:
+
+```bash
+cd deploy/deployer
+./testnet/bootstrap-zakura-testnet-runner.sh
+```
+
+Useful overrides:
+
+```bash
+ENV_FILE=~/agents-env ./testnet/bootstrap-zakura-testnet-runner.sh
+FORCE_REGISTER=1 ./testnet/bootstrap-zakura-testnet-runner.sh
+RUNNER_SSH=root@167.99.103.111 ./testnet/bootstrap-zakura-testnet-runner.sh
+```
+
+The workflow is manual (`workflow_dispatch`). Inputs:
+
+- `ref` — branch, tag, or SHA to build and deploy, default `ironwood-main`.
+- `force_rebuild` — pass `--force` to rebuild the cached binary.
+- `no_restart` — stage binary/config/unit without restarting, default `false`.
+- `node` — optional deployer node name; blank deploys the whole fleet.
+
+The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
+explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
+while forcing the legacy non-VCT path. It also writes `/etc/zakura/zebrad.toml`
+and uses each node's existing `/mnt/zakura-testnet-*-data/zebra-cache` snapshot
+directory, so CI restarts the current `zebrad.service` against the existing state
+instead of creating a fresh database.
+
+The workflow also refreshes a simple fleet status dashboard on
+`zakura-testnet-1`:
+
+- service: `zakura-testnet-dashboard.service`
+- URL: `http://167.99.103.111:8090/`
+- install dir: `/opt/zakura-testnet-dashboard`
+
+The dashboard reads the generated deployer node config and polls each node over
+SSH. It shows the running commit from the node log, last restart time, current
+RPC height, whether the height advanced in the last five minutes, and an upgrade
+ETA for Ironwood testnet activation height `4134000`. The ETA uses observed
+cluster block movement when enough samples are available, otherwise it falls back
+to `--target-spacing 7.5`.
+
+The workflow also refreshes a static Zakura Ironwood testnet snapshots website on
+`zakura-testnet-1`:
+
+- service: `zakura-testnet-snapshots.service`
+- URL: `http://167.99.103.111:8091/`
+- install dir: `/opt/zakura-testnet-snapshots/site`
+- upload dir: `/opt/zakura-testnet-snapshots/site/files`
+- metadata: `/opt/zakura-testnet-snapshots/site/snapshots.json`
+
+The deploy refreshes `index.html` but does not delete uploaded snapshot files or
+overwrite an existing host-side `snapshots.json`. To publish a snapshot manually,
+upload the archive and then edit the metadata on the runner host:
+
+```bash
+scp zakura-ironwood-testnet-archive-YYYYMMDD-height.tar.zst \
+  root@167.99.103.111:/opt/zakura-testnet-snapshots/site/files/
+
+ssh root@167.99.103.111 \
+  '$EDITOR /opt/zakura-testnet-snapshots/site/snapshots.json'
+```
+
+Each enabled metadata entry needs `kind` (`archive` or `pruned`), `group`
+(`daily`, `monthly`, or `historical`), `file`, `published`, and `sha256`.
+Optional display fields include `name`, `size`, `height`, `zebraVersion`, and
+`dbFormat`. Entries with `"enabled": false` are kept as hidden examples.
+
+Manual run from a host with SSH access to every node:
+
+```bash
+python3 deploy/runner/zebra-cluster-status.py \
+  --config deploy/deployer/nodes.toml \
+  --host 0.0.0.0 \
+  --port 8090 \
+  --upgrade-height 4134000 \
+  --target-spacing 7.5
+```
+
 ## How the build cache works
 
 `commit` is resolved to a full SHA (`git rev-parse`). The binary is cached at
