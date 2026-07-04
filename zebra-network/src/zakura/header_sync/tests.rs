@@ -4542,6 +4542,99 @@ async fn reanchor_dispatches_history_tree_rebuild_and_resumes_forward() {
     panic!("after the rebuild, header sync did not resume a forward range from the verified tip");
 }
 
+/// The verified body tip can outrun the header-sync frontier when this node is ahead of its Zakura
+/// overlay peers (they are behind) and legacy body sync keeps committing. A lead within
+/// `HEADER_SYNC_FOLLOW_VERIFIED_TIP_GAP` is left alone, but once it exceeds the gap header sync
+/// follows the verified tip: it re-anchors up to it and rebuilds the frontier tree there, rather
+/// than sitting behind the local verified state.
+#[tokio::test(flavor = "current_thread")]
+async fn verified_tip_beyond_gap_reanchors_header_sync_to_follow_it() {
+    let network = regtest_network();
+    let verified = (block::Height(0), network.genesis_hash());
+    let stranded_tip = (block::Height(3), block::Hash([3; 32]));
+    let mut startup = HeaderSyncStartup::new(
+        network.clone(),
+        verified,
+        HeaderSyncFrontiers {
+            finalized_height: verified.0,
+            verified_block_tip: verified.0,
+            verified_block_hash: verified.1,
+        },
+        Some(stranded_tip),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+
+    // A verified lead exactly at the gap boundary must not move the frontier (strictly-greater gate).
+    let at_gap = block::Height(stranded_tip.0 .0 + HEADER_SYNC_FOLLOW_VERIFIED_TIP_GAP);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::StateFrontiersChanged(
+            HeaderSyncFrontiers {
+                finalized_height: verified.0,
+                verified_block_tip: at_gap,
+                verified_block_hash: block::Hash([7; 32]),
+            },
+        ))
+        .await
+        .unwrap();
+
+    // A verified lead one block beyond the gap re-anchors the frontier up to the verified tip.
+    let far_tip = (
+        block::Height(stranded_tip.0 .0 + HEADER_SYNC_FOLLOW_VERIFIED_TIP_GAP + 1),
+        block::Hash([9; 32]),
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::StateFrontiersChanged(
+            HeaderSyncFrontiers {
+                finalized_height: verified.0,
+                verified_block_tip: far_tip.0,
+                verified_block_hash: far_tip.1,
+            },
+        ))
+        .await
+        .unwrap();
+
+    // The first frontier-tree rebuild must be for `far_tip`, not the at-gap lead — proving the
+    // at-gap lead did not re-anchor, and the beyond-gap one did.
+    let mut saw_rebuild = false;
+    for _ in 0..24 {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            fixture.actions.recv(),
+        )
+        .await
+        {
+            Ok(Some(HeaderSyncAction::QueryBestHeaderHistoryTree {
+                verified_block_tip,
+                best_header_tip,
+            })) => {
+                assert_eq!(
+                    verified_block_tip, far_tip.0,
+                    "the at-gap lead must not have re-anchored"
+                );
+                assert_eq!(best_header_tip, far_tip.0);
+                saw_rebuild = true;
+                break;
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(
+        saw_rebuild,
+        "a verified tip beyond the gap must re-anchor header sync and rebuild the tree there",
+    );
+    assert_eq!(
+        fixture.handle.best_header_tip(),
+        far_tip,
+        "header sync follows the verified tip past the gap",
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn single_peer_forward_link_failures_do_not_reanchor_globally() {
     let network = regtest_network();
