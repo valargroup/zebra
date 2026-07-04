@@ -1101,6 +1101,116 @@ async fn best_header_history_tree_read_request_returns_reconstructed_frontier() 
     );
 }
 
+/// A block-level reorg below the header frontier: when a full block commits a header that conflicts
+/// with the provisional header-sync chain, the conflicting provisional headers *and* their roots are
+/// dropped, so no stale peer-supplied root survives to be folded by history-tree reconstruction.
+#[test]
+fn block_reorg_drops_conflicting_provisional_roots_before_reconstruction() {
+    let _init_guard = zebra_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let block2 = mainnet_block(2);
+    let block3 = mainnet_block(3);
+
+    // Header sync races ahead on chain A: provisional headers 1..=3 with the confirmed root prefix
+    // (heights 1..=2; the tip's root is never persisted).
+    commit_header_range_with_roots(
+        &state,
+        genesis.hash(),
+        &[
+            block1.header.clone(),
+            block2.header.clone(),
+            block3.header.clone(),
+        ],
+        &[root_at(Height(1)), root_at(Height(2))],
+    );
+    assert_eq!(
+        state
+            .zakura_header_commitment_roots_by_height_range(Height(1)..=Height(2))
+            .len(),
+        2,
+        "chain A provisional roots are persisted before the reorg",
+    );
+
+    // A full block commits at height 1 with a header that conflicts with chain A (a reorg). The body
+    // commit path must drop chain A's provisional descendants and their roots — nothing carries a
+    // committed body yet, so the whole provisional suffix is reconciled away.
+    let mut conflicting_header = *block1.header;
+    conflicting_header.previous_block_hash = block::Hash([0x5a; 32]);
+    let conflicting_block = Arc::new(Block {
+        header: Arc::new(conflicting_header),
+        transactions: block1.transactions.clone(),
+    });
+    assert_ne!(conflicting_block.header, block1.header);
+
+    state
+        .seed_zakura_header_from_committed_block(Height(1), &conflicting_block)
+        .expect("conflicting body commit reconciles the provisional header store");
+
+    // Chain A's provisional roots at every height are gone: nothing stale survives to be folded.
+    assert!(
+        state
+            .zakura_header_commitment_roots_by_height_range(Height(1)..=Height(3))
+            .is_empty(),
+        "a conflicting commit must drop all chain A provisional roots",
+    );
+
+    // Reconstruction over the reorged state folds nothing stale and returns the verified base.
+    let (tree, frontier) = best_header_history_tree(
+        None::<Arc<Chain>>,
+        &state,
+        &Network::Mainnet,
+        Height(0),
+        Height(1),
+    )
+    .expect("reconstruction succeeds after the reorg");
+    assert_eq!(frontier, (Height(0), genesis.hash()));
+    assert_eq!(tree.as_ref(), &HistoryTree::default());
+}
+
+/// The tightened state invariant is enforced through the real request path: a `CommitHeaderRange`
+/// carrying a full-length roots vector (one per header, *including* the unconfirmed tip) is rejected,
+/// so a future or refactored caller cannot persist the unconfirmed tip root by mistake.
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_header_range_rejects_full_length_roots_through_the_service() {
+    let _init_guard = zebra_test::init();
+    let network = Network::Mainnet;
+    let (mut state_service, _read_state, _, _) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0).await;
+    let genesis = mainnet_block(0);
+    let block1 = mainnet_block(1);
+    let block2 = mainnet_block(2);
+
+    state_service
+        .ready()
+        .await
+        .expect("state service is ready")
+        .call(Request::CommitCheckpointVerifiedBlock(
+            CheckpointVerifiedBlock::from(genesis.clone()),
+        ))
+        .await
+        .expect("genesis block commits");
+
+    // Full-length roots: one per header, including the range tip (height 2). Only the confirmed
+    // prefix (height 1) may be persisted, so the boundary must reject this shape outright.
+    let error = state_service
+        .ready()
+        .await
+        .expect("state service is ready")
+        .call(Request::CommitHeaderRange {
+            anchor: genesis.hash(),
+            headers: vec![block1.header.clone(), block2.header.clone()],
+            body_sizes: vec![0, 0],
+            tree_aux_roots: roots_from_height(Height(1), 2),
+        })
+        .await
+        .expect_err("a full-length roots vector must be rejected by the tightened boundary");
+
+    assert!(
+        error.to_string().contains("does not match header count"),
+        "unexpected error: {error}",
+    );
+}
+
 #[test]
 fn state_behaves_when_blocks_are_committed_in_order() -> Result<()> {
     let _init_guard = zebra_test::init();

@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use zebra_chain::{
     block::{self, Block, CountedHeader},
     history_tree::HistoryTree,
-    parameters::Network,
+    parameters::{Network, NetworkKind},
     serialization::{CompactSizeMessage, ZcashDeserialize, MAX_HEADERS_PER_MESSAGE},
     transaction::Transaction,
 };

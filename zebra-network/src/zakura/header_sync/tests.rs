@@ -4398,6 +4398,107 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
     panic!("after re-anchor, header sync did not emit the reanchor action and request forward from the verified tip");
 }
 
+/// A re-anchor resets the header tip to the verified body tip, which makes the in-memory frontier
+/// tree stale. It must dispatch a `QueryBestHeaderHistoryTree { verified, verified }` rebuild (a
+/// single tip read), and after the reload lands, forward sync resumes from the verified tip. This
+/// pins the rebuild dispatch, which `next_non_query_action` otherwise filters out.
+#[tokio::test(flavor = "current_thread")]
+async fn reanchor_dispatches_history_tree_rebuild_and_resumes_forward() {
+    let network = regtest_network();
+    let verified = (block::Height(0), network.genesis_hash());
+    let stranded_tip = (block::Height(3), block::Hash([3; 32]));
+    let mut startup = HeaderSyncStartup::new(
+        network.clone(),
+        verified,
+        HeaderSyncFrontiers {
+            finalized_height: verified.0,
+            verified_block_tip: verified.0,
+            verified_block_hash: verified.1,
+        },
+        Some(stranded_tip),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+    let peers = [peer(64), peer(65)];
+
+    for peer_id in peers.iter().cloned() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(&fixture, peer_id, verified.0, block::Height(4), DEFAULT_HS_RANGE, 1).await;
+    }
+
+    // Drive the forward-link failures that trip the re-anchor.
+    for _ in 0..3 {
+        let (served_peer, start_height, _count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireMessage {
+                peer: served_peer,
+                msg: headers_message_from(start_height, vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)]),
+            })
+            .await
+            .unwrap();
+    }
+
+    // The re-anchor must dispatch a rebuild of the frontier tree at the verified tip.
+    let mut saw_rebuild = false;
+    for _ in 0..24 {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            fixture.actions.recv(),
+        )
+        .await
+        {
+            Ok(Some(HeaderSyncAction::QueryBestHeaderHistoryTree {
+                verified_block_tip,
+                best_header_tip,
+            })) => {
+                assert_eq!(verified_block_tip, verified.0);
+                assert_eq!(best_header_tip, verified.0);
+                saw_rebuild = true;
+                break;
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(
+        saw_rebuild,
+        "re-anchor must dispatch a QueryBestHeaderHistoryTree rebuild at the verified tip",
+    );
+
+    // The stubbed reload is accepted (tip unchanged), and forward sync resumes from the verified tip.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
+            best_header_tip: verified.0,
+            history_tree: Arc::new(HistoryTree::default()),
+        })
+        .await
+        .unwrap();
+
+    let expected_start = verified.0.next().expect("genesis has a successor");
+    for _ in 0..8 {
+        if let HeaderSyncAction::SendMessage {
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    want_tree_aux_roots: true,
+                    ..
+                },
+            ..
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            if start_height == expected_start {
+                return;
+            }
+        }
+    }
+    panic!("after the rebuild, header sync did not resume a forward range from the verified tip");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn single_peer_forward_link_failures_do_not_reanchor_globally() {
     let network = regtest_network();

@@ -2109,7 +2109,7 @@ mod zakura_header_sync_driver_tests {
 
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::mpsc;
-    use tower::{service_fn, util::BoxService, ServiceExt};
+    use tower::{service_fn, util::BoxService, Service, ServiceExt};
     use zebra_chain::serialization::ZcashDeserializeInto;
     use zebra_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
     use zebra_network::zakura::testkit::{TraceCapture, TraceValue};
@@ -2660,6 +2660,74 @@ mod zakura_header_sync_driver_tests {
         .expect("reactor emits a needed-block query reflecting the new header tip");
 
         reactor_task.abort();
+    }
+
+    /// End-to-end restart-resume: with a persisted header lead (bodies still at genesis),
+    /// `zakura_header_sync_driver_startup` reconstructs the history tree at the confirmed frontier
+    /// (`header_tip - 1`), seeds `best_header_parent_hash` with the frontier hash, and resumes header
+    /// sync from `frontier + 1` so the first forward range overlaps and re-validates the still-
+    /// unconfirmed tip root — the exact posture the running reactor keeps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn header_sync_driver_startup_resumes_at_reconstructed_frontier() {
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let (mut state_service, read_state, _, _) = zebra_state::init_test_services(&network).await;
+
+        let genesis = mainnet_block(&BLOCK_MAINNET_GENESIS_BYTES);
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+
+        state_service
+            .ready()
+            .await
+            .expect("state service is ready")
+            .call(zebra_state::Request::CommitCheckpointVerifiedBlock(
+                zebra_state::CheckpointVerifiedBlock::from(genesis.clone()),
+            ))
+            .await
+            .expect("genesis block commits");
+
+        // Persist a header lead: headers 1..=2 with the confirmed prefix (height 1 only; the tip's
+        // root is never persisted). Durable header tip is 2, so the confirmed frontier is 1.
+        state_service
+            .ready()
+            .await
+            .expect("state service is ready")
+            .call(zebra_state::Request::CommitHeaderRange {
+                anchor: genesis.hash(),
+                headers: vec![block1.header.clone(), block2.header.clone()],
+                body_sizes: vec![0, 0],
+                tree_aux_roots: vec![root_at(block::Height(1))],
+            })
+            .await
+            .expect("header range commits");
+
+        let startup = super::zakura::zakura_header_sync_driver_startup(read_state, &network)
+            .await
+            .expect("driver startup reconstructs from durable state");
+
+        // Bodies are still at genesis; the header lead advanced to height 2.
+        assert_eq!(startup.frontiers.verified_block_tip, block::Height(0));
+
+        // Resume at frontier + 1 == 2 (the durable header tip), anchored at the frontier hash
+        // (height 1) so the first forward range overlaps and re-validates the tip's root.
+        assert_eq!(
+            startup.best_header_tip,
+            Some((block::Height(2), block2.hash())),
+            "resume height is frontier + 1, anchored at the durable tip",
+        );
+        assert_eq!(
+            startup.best_header_parent_hash,
+            Some(block1.hash()),
+            "overlap anchor is the confirmed frontier hash (height 1)",
+        );
+
+        // The reconstructed tree sits one block behind the header tip, at the frontier. These are
+        // pre-Heartwood mainnet blocks, so that frontier tree is the empty tree.
+        assert_eq!(
+            startup.best_header_history_tree.as_ref(),
+            &zebra_chain::history_tree::HistoryTree::default(),
+            "reconstructed frontier tree is the pre-Heartwood empty tree",
+        );
     }
 
     #[tokio::test]

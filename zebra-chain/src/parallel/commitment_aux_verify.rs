@@ -669,6 +669,78 @@ mod tests {
         );
     }
 
+    /// Startup/re-anchor reconstruction resumes the fold from the *non-empty* durable tree at a
+    /// post-Heartwood verified tip, not from an empty tree. This mirrors that: fold one confirmed
+    /// height onto a base tree already positioned at Heartwood activation and assert the result is
+    /// the block-driven tree — the non-empty-base case the state reconstruction relies on.
+    #[test]
+    fn append_confirmed_roots_resumes_from_a_non_empty_base_tree() {
+        let activation = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0;
+
+        let act_block = mainnet_block_at(activation);
+        let next_block = mainnet_block_at(activation + 1);
+        let act_root = mainnet_sapling_root_at(activation);
+        let next_root = mainnet_sapling_root_at(activation + 1);
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+        let next_roots = roots_from_block(&next_block, next_root, empty_orchard_root);
+
+        // Base: the non-empty durable tree positioned at the Heartwood-activation verified tip.
+        let base = HistoryTree::from_block(
+            &Mainnet,
+            act_block.clone(),
+            &act_root,
+            &empty_orchard_root,
+            &empty_ironwood_root(),
+        )
+        .expect("activation block builds a non-empty history tree");
+        assert!(
+            base.as_ref().is_some(),
+            "the base tree must be non-empty at Heartwood activation",
+        );
+
+        // Reconstruction folds only the next confirmed height onto that non-empty base.
+        let tree = append_confirmed_roots(
+            &Mainnet,
+            base,
+            std::iter::once((next_block.header.as_ref(), &next_roots)),
+        )
+        .expect("folding onto a non-empty base succeeds");
+
+        assert_eq!(
+            tree.as_ref()
+                .expect("post-Heartwood tree is non-empty")
+                .current_height(),
+            Height(activation + 1),
+            "the fold advances the non-empty base to the last supplied height",
+        );
+
+        let mut expected = HistoryTree::from_block(
+            &Mainnet,
+            act_block,
+            &act_root,
+            &empty_orchard_root,
+            &empty_ironwood_root(),
+        )
+        .expect("activation block builds a history tree");
+        expected
+            .push(
+                &Mainnet,
+                next_block,
+                &next_root,
+                &empty_orchard_root,
+                &empty_ironwood_root(),
+            )
+            .expect("successor block extends the history tree");
+        assert_eq!(
+            tree.hash(),
+            expected.hash(),
+            "resuming the fold from a non-empty base reproduces the block-driven tree",
+        );
+    }
+
     #[test]
     fn rejects_wrong_root_at_successor_height() {
         let activation = NetworkUpgrade::Heartwood
