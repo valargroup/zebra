@@ -303,6 +303,28 @@ async fn batch_flushes_on_explicit_flush() -> Result<(), Report> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn batch_flush_on_empty_batch_is_noop() -> Result<(), Report> {
+    use tokio::time::timeout;
+    let _init_guard = zebra_test::init();
+
+    // Flushing with no pending items must not fail the worker or disturb later
+    // batches: items queued after the empty flush are still verified by the
+    // next explicit flush.
+    let verifier = Batch::new(Verifier::default(), 100, 10, Duration::from_secs(1000));
+    verifier.flush().map_err(|e| eyre!(e))?;
+
+    timeout(
+        Duration::from_secs(1),
+        sign_and_verify_after_explicit_flush(verifier, 10),
+    )
+    .await
+    .map_err(|e| eyre!(e))?
+    .map_err(|e| eyre!(e))?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fallback_verification() -> Result<(), Report> {
     let _init_guard = zebra_test::init();
 

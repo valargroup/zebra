@@ -276,6 +276,10 @@ where
 
             let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
                 Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
+            // This guard must be declared after `known_outpoint_hashes`: the flush
+            // registry is keyed by the `Arc` allocation address, so the guard must be
+            // dropped first, removing the registry entry while the address is still
+            // pinned by this `Arc` and cannot be reused by another block's key.
             let _block_batch_flush = primitives::register_block_verifier_batch_flush(
                 &known_outpoint_hashes,
                 block.transactions.len(),

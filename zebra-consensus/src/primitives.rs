@@ -222,4 +222,22 @@ mod tests {
 
         assert!(!block_verifier_batch_flush_ready(key));
     }
+
+    #[test]
+    fn block_flush_registration_starts_fresh_after_guard_drop() {
+        let shared_block_context = Arc::new(());
+        let key = block_verifier_batch_flush_key(&shared_block_context);
+
+        {
+            let _guard = register_block_verifier_batch_flush(&shared_block_context, 2);
+            assert!(!block_verifier_batch_flush_ready(key));
+        }
+
+        // Re-registering the same key starts a fresh transaction count, so a
+        // partially counted earlier registration for a reused `Arc` address
+        // can't make a later block's flush fire early.
+        let _guard = register_block_verifier_batch_flush(&shared_block_context, 2);
+        assert!(!block_verifier_batch_flush_ready(key));
+        assert!(block_verifier_batch_flush_ready(key));
+    }
 }
