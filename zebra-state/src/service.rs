@@ -1547,7 +1547,7 @@ where
             .finalized_tip_height()
             .is_some_and(|finalized_tip| height <= finalized_tip)
         {
-            db.finalized_commitment_roots_by_height_range(height..=height)
+            finalized_state::serve_block_roots(db, height..=height)
                 .into_iter()
                 .next()
         } else if let Some(chain) = chain
@@ -1558,8 +1558,9 @@ where
             match (
                 chain.sapling_tree(height.into()),
                 chain.orchard_tree(height.into()),
+                chain.ironwood_tree(height.into()),
             ) {
-                (Some(sapling), Some(orchard)) => {
+                (Some(sapling), Some(orchard), Some(ironwood)) => {
                     let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = chain
                         .block(height.into())
                         .map(|block| {
@@ -1581,8 +1582,7 @@ where
                         height,
                         sapling_root: sapling.root(),
                         orchard_root: orchard.root(),
-                        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default()
-                            .root(),
+                        ironwood_root: ironwood.root(),
                         sapling_tx,
                         orchard_tx,
                         ironwood_tx,

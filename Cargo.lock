@@ -5478,9 +5478,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
-version = "0.39.2"
+version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
+checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
 dependencies = [
  "memchr",
 ]
@@ -9226,6 +9226,7 @@ dependencies = [
  "spandoc",
  "thiserror 2.0.18",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
  "tower 0.4.13",
  "tower-batch-control",
  "tower-fallback",
@@ -9357,6 +9358,7 @@ dependencies = [
  "serde_with",
  "strum",
  "strum_macros",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

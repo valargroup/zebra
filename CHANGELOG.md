@@ -7,8 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Zebra now tags the coinbase input of every block it mines with a `🌸`. The
+  `mining.extra_coinbase_data` option is now limited to 86 bytes (was 94);
+  Zebra refuses to start if it is exceeded.
+
+### Changed
+
+- Verified-commitment-trees fast sync is now enabled by default when checkpoint
+  sync is enabled. Operators can keep checkpoint sync but opt out of the new
+  path by setting `consensus.vct_fast_sync = false`.
+- Refreshed the default Testnet Zakura bootstrap peer identities
+  (`DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS`) after the Testnet fleet's iroh node
+  keys were rotated. The previous hardcoded node IDs were stale, so a fresh node
+  using the default config could not discover the Testnet fleet over Zakura. The
+  peer IP addresses and Mainnet bootstrap peers are unchanged.
+
+### Removed
+
+- Removed two Zakura block-sync config fields that never needed operator
+  tuning: `max_reorder_lookahead_blocks` (the defense-in-depth block-count cap
+  is now a fixed internal constant; the resident-memory budget remains the
+  primary bound) and `fanout` (a legacy reservation multiplier with no effect
+  on scheduling). Configs that still set either key will fail to parse and
+  should drop the lines.
+
+### Fixed
+
+- Fixed a restarted or resyncing Zakura peer being locked out of block sync for
+  up to ~150s (occasionally longer) when it redialed the fleet from its stable
+  IP. The receiving node kept the peer's previous, now-dead connection as the
+  incumbent and rejected every redial as a duplicate until the incumbent aged
+  past the 300s eviction gate or was reaped by the QUIC idle timeout. A same-IP
+  duplicate (a restarted peer reclaiming its own slot) now evicts the stale
+  incumbent on a short gate so the redial reconnects within seconds, while a
+  just-registered incumbent is still kept so simultaneous-open races do not flap.
+- Fixed Zakura header-sync and block-sync peers getting stuck unable to serve
+  requests when an initial `Status` advertisement was dropped by a full outbound
+  queue. Status send bookkeeping now only records queued frames, header sync
+  retries unsent status advertisements, and block sync replies to the first
+  inbound status so peers converge after dropped connect-time advertisements.
+- Raised the default Zakura per-IP admission cap from 1 to 16 so NATed or
+  co-hosted v2 peers are not rejected while the legacy TCP per-IP default
+  remains 1.
+- Fixed a block-sync busy-spin under sustained byte-budget backpressure. The
+  sequencer re-published its progress view (waking the reactor and every per-peer
+  routine) even when no schedulable field had changed, which combined with the
+  per-attempt floor-funding request to spin a routine's refill loop with no timer
+  while the budget was pinned. The sequencer now wakes watchers only when a
+  scheduling-relevant field actually changes.
+- Fixed a transient `getinfo` RPC panic while Zebra is committing early synced
+  blocks and concurrently calculating display-only chain-tip difficulty.
+- Fixed an out-of-memory crash during Zakura block sync when the header chain
+  runs far ahead of the commit tip. The block-sync applying buffer holds decoded
+  block bodies ahead of the in-order committer; its look-ahead budget counted
+  wire bytes (not the ~4× larger decoded footprint) and the floor-rescue path
+  bypassed the budget entirely and advanced with the _download_ floor, so the
+  buffer grew unbounded (~569k blocks, ~26 GiB RSS) until the kernel killed the
+  node. The budget now bounds estimated resident memory (retained and in-flight
+  wire bytes at the decoded multiple) and gates the floor lane, exempting one
+  checkpoint range above the verified tip (the commit window) so a pinned
+  checkpoint range can always assemble and the committer can always drain the
+  pipeline (no deadlock). Resident memory now plateaus near the configured budget
+  plus at most one worst-case commit window (~3.2 GB), with only bounded transient
+  overshoot from floor-rescue requests.
+
 ### Performance
 
+- Reduce Zakura block-sync CPU overhead in the BBR-lite fill loop and trace path.
+  The byte-mode cold-start check now tests for fresh BDP samples without scanning
+  the BBR windows, and per-view trace rows skip expensive peer/work-queue
+  diagnostics while still reporting commit pipeline progress.
 - Improve Zakura block-sync download scheduling for checkpoint sync. A
   byte-denominated BBR-lite congestion controller (`block_sync/bbr.rs`) and
   per-peer admission control (`block_sync/admission.rs`) replace the previous
@@ -90,16 +160,25 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Use network-specific default Zakura bootstrap peers: Mainnet keeps the existing
+  native-P2P bootstrap list, while Testnet defaults to the Zakura testnet fleet.
 - Increased Zakura's default connection, handshake, stream-open, and QUIC
   window limits, and configured default native Zakura bootstrap peers. The
   larger defaults are intended for the production native-P2P sync path rather
   than the earlier conservative test-network envelope.
+- Bound Zakura block-sync requests to non-responsive peers with a probe-first
+  no-progress policy: peers receive only `initial_block_probe_requests` before
+  their first accepted block body, then `max_requests_without_block_progress`
+  becomes the hard cap before liveness disconnects them.
 - Extended finalized-state value-pool disk serialization with an Ironwood slot
   after the deferred pool, keeping older value-pool records readable.
 - Use V3 chain-history entries from NU6.3 onward, including Ironwood note
   commitment roots and transaction counts.
 - Reject transactions that add net value to the Orchard pool after NU6.3
   activation.
+- V6 transactions with supported NU6.3-or-later consensus branch IDs now
+  serialize and deserialize successfully, while unsupported later placeholders
+  are rejected.
 - Route post-NU6.3 coinbase rewards for Orchard receivers in unified miner
   addresses to the Ironwood pool instead of rejecting them or falling back to a
   lower-priority receiver.
@@ -206,8 +285,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
+  and Regtest, matching Zebra's advertised current protocol version.
 - Avoid panics in the block write task when RPC users invalidate a non-finalized
   root block or reconsider the same invalidated block twice.
+- Compare RPC authentication cookies in constant time after checking their
+  length.
+- Make the Zakura body-sync stall watchdog use verified-tip progress only,
+  ignoring the best-header gap so fast header sync cannot trigger a false
+  fallback while block verification is still advancing.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
   When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
   body downloader but left the Zakura block- and header-sync drivers running, so

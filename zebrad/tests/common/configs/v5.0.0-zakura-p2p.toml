@@ -93,12 +93,12 @@ bootstrap_peers = [
 ]
 listen_addr = "0.0.0.0:8234"
 max_connections = 256
+max_connections_per_ip = 16
 max_pending_handshakes = 32
 message_rate_per_second = 2048
 stream_open_rate_per_second = 32
 
 [network.zakura.block_sync]
-fanout = 1
 max_blocks_per_response = 1
 max_inflight_block_bytes = 2147483648
 max_inflight_requests = 2048

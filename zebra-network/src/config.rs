@@ -251,10 +251,12 @@ pub struct Config {
     #[serde(with = "humantime_serde")]
     pub crawl_new_peer_interval: Duration,
 
-    /// The maximum number of peer connections Zebra will keep for a given IP address
-    /// before it drops any additional peer connections with that IP.
+    /// The maximum number of legacy TCP peer connections Zebra will keep for a given IP address
+    /// before it drops any additional legacy peer connections with that IP.
     ///
     /// The default and minimum value are 1.
+    ///
+    /// Zakura uses [`ZakuraConfig::max_connections_per_ip`] for native v2 admission.
     ///
     /// # Security
     ///
@@ -1054,7 +1056,33 @@ impl<'de> Deserialize<'de> for Config {
         // warning) rather than rejecting too-small configs, so older configs keep
         // starting while checkpoint sync stays deadlock-free.
         let mut zakura = zakura;
+        zakura.apply_network_defaults(&network);
+        let default_zakura_bootstrap_peers =
+            ZakuraConfig::default_bootstrap_peers_for_network(&network);
+        if zakura.bootstrap_peers != default_zakura_bootstrap_peers {
+            warn!(
+                ?network,
+                configured_zakura_bootstrap_peers = ?zakura.bootstrap_peers,
+                ?default_zakura_bootstrap_peers,
+                "configured Zakura bootstrap peers differ from the default peers for this network"
+            );
+        }
+        if zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&zakura) {
+            warn!(
+                ?network,
+                listen_addr = ?zakura.listen_addr,
+                bootstrap_peers = ?zakura.bootstrap_peers,
+                "configured Zakura listen_addr is loopback-only, but bootstrap peers use \
+                 non-loopback addresses; native Zakura dials may fail with \
+                 `Can't assign requested address`. Use 0.0.0.0:<port> or another routable \
+                 interface address for public Zakura peers"
+            );
+        }
         zakura.block_sync.clamp_inflight_block_bytes_to_floor();
+        // Likewise clamp the resident look-ahead budget (and its block cap) up to one
+        // checkpoint range, so the resident-memory admission gate cannot deadlock checkpoint
+        // sync when verified_tip is pinned to the previous checkpoint.
+        zakura.block_sync.clamp_reorder_lookahead_to_floor();
         zakura.block_sync.validate().map_err(|error| {
             de::Error::custom(format!("invalid zakura.block_sync config: {error}"))
         })?;
@@ -1075,6 +1103,20 @@ impl<'de> Deserialize<'de> for Config {
             max_connections_per_ip,
         })
     }
+}
+
+fn zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(zakura: &ZakuraConfig) -> bool {
+    let Some(listen_addr) = zakura.listen_addr else {
+        return false;
+    };
+
+    listen_addr.ip().is_loopback()
+        && zakura
+            .bootstrap_peers
+            .iter()
+            .filter_map(|peer| peer.rsplit_once('@'))
+            .filter_map(|(_node_id, addr)| addr.parse::<SocketAddr>().ok())
+            .any(|addr| !addr.ip().is_loopback())
 }
 
 /// Accepts an [`IndexSet`] of initial peers,

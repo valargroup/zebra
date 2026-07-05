@@ -5,12 +5,13 @@ use proptest::{prop_assert, prop_assert_eq};
 use super::*;
 use super::{
     config::{
-        BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES, DEFAULT_BS_FANOUT,
-        DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS, DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES,
-        DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
-        DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN, DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS,
-        MAX_BS_RESPONSE_BYTES,
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR, BS_PER_BLOCK_WORST_CASE_BYTES,
+        DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT, DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN,
+        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS, DEFAULT_BS_MAX_INFLIGHT_BLOCK_BYTES,
+        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES, DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
+        DEFAULT_BS_MAX_RESPONSE_BYTES, DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN,
+        DEFAULT_BS_REQUEST_TIMEOUT, MAX_BS_INFLIGHT_REQUESTS, MAX_BS_RESPONSE_BYTES,
+        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     },
     reactor::node_id_from_block_peer_id,
     reorder::*,
@@ -165,6 +166,18 @@ fn immediate_body_download_config() -> ZakuraBlockSyncConfig {
     ZakuraBlockSyncConfig {
         max_blocks_per_response: MAX_BS_BLOCKS_PER_REQUEST,
         ..ZakuraBlockSyncConfig::default()
+    }
+}
+
+/// Config for tests that exercise fill-loop, budget-rotation and retry mechanics on
+/// freshly-connected peers, where the one-probe cold start (`initial_block_probe_requests`)
+/// is orthogonal noise: it would throttle a fresh peer to a single request before it has
+/// delivered a body. Opening the probe cap to the proven budget lets these tests drive a
+/// peer's full advertised window immediately. Probe-first behaviour has dedicated coverage.
+fn fill_loop_mechanics_config() -> ZakuraBlockSyncConfig {
+    ZakuraBlockSyncConfig {
+        initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
+        ..immediate_body_download_config()
     }
 }
 
@@ -503,8 +516,13 @@ fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
     );
 }
 
+/// The defensive `Disarm` arm in `check_liveness`: a block-liveness deadline that exists
+/// with no recorded request (`last_request_at == None`) was never armed by `arm_liveness`,
+/// so it is disarmed rather than treated as a disconnect. This state is unreachable in
+/// production — every deadline setter runs after a request is sent — so the test sets the
+/// deadline directly to exercise the arm.
 #[test]
-fn block_liveness_never_disconnects_idle_peer() {
+fn block_liveness_disarms_a_deadline_set_without_a_request() {
     let now = Instant::now();
     let mut window = download_window();
 
@@ -512,9 +530,40 @@ fn block_liveness_never_disconnects_idle_peer() {
 
     window.block_liveness_deadline = Some(now);
     assert_eq!(window.check_liveness(now), LivenessOutcome::Disarm);
-    window.disarm_liveness_if_idle();
+    window.clear_liveness_if_idle();
     assert_eq!(window.block_liveness_deadline, None);
     assert_eq!(window.check_liveness(now), LivenessOutcome::Ok);
+}
+
+/// The reliability EWMA is a per-request goodput fraction: a completed request credits one
+/// success and a timed-out request charges one failure. A short response
+/// (`BlocksDone`/`RangeUnavailable`) that leaves many heights unreceived must likewise be
+/// ONE failure for the request — not one per missing height, which (once
+/// `max_blocks_per_response > 1`) would near-seal a peer for a single protocol-legal short
+/// answer. This asserts the charge is independent of the missing-height count.
+#[test]
+fn short_response_charges_one_reliability_failure_per_request_not_per_height() {
+    let fresh = download_window().reliability_factor();
+
+    let one_missing = {
+        let mut window = download_window();
+        window.penalize_short_response(1);
+        window.reliability_factor()
+    };
+    let many_missing = {
+        let mut window = download_window();
+        window.penalize_short_response(64);
+        window.reliability_factor()
+    };
+
+    assert!(
+        one_missing < fresh,
+        "a short response must lower reliability (one goodput failure)"
+    );
+    assert_eq!(
+        one_missing, many_missing,
+        "a short response is one failure per request, independent of the missing-height count"
+    );
 }
 
 #[test]
@@ -534,7 +583,7 @@ fn block_liveness_progress_before_deadline_keeps_peer_alive() {
 }
 
 #[test]
-fn block_liveness_disarms_when_outstanding_drains() {
+fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
@@ -542,10 +591,55 @@ fn block_liveness_disarms_when_outstanding_drains() {
     window.arm_liveness(now, timeout);
 
     window.outstanding.clear();
-    window.disarm_liveness_if_idle();
+    window.disarm_liveness_after_progress_if_idle();
+
+    assert_eq!(window.block_liveness_deadline, Some(now + timeout));
+    assert_eq!(
+        window.check_liveness(now + timeout),
+        LivenessOutcome::Disconnect
+    );
+}
+
+#[test]
+fn block_liveness_disarms_when_satisfied_request_drains() {
+    let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = download_window();
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    window.note_block_progress(now + Duration::from_millis(1), timeout);
+    window.outstanding.clear();
+    window.disarm_liveness_after_progress_if_idle();
 
     assert_eq!(window.block_liveness_deadline, None);
     assert_eq!(window.check_liveness(now + timeout), LivenessOutcome::Ok);
+}
+
+#[test]
+fn block_liveness_uses_probe_cap_until_first_accepted_body() {
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 1,
+        max_requests_without_block_progress: 8,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    assert!(!window.has_block_progress());
+    assert_eq!(window.no_progress_request_cap(), 1);
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+
+    assert_eq!(window.requests_without_block_progress, 1);
+    assert_eq!(window.no_progress_request_cap(), 1);
+
+    window.note_block_progress(now + Duration::from_millis(1), timeout);
+
+    assert!(window.has_block_progress());
+    assert_eq!(window.requests_without_block_progress, 0);
+    assert_eq!(window.no_progress_request_cap(), 8);
 }
 
 #[test]
@@ -555,8 +649,9 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     let mut window = download_window();
     window.outstanding.push(window_request(1));
     window.arm_liveness(now, timeout);
+    window.note_block_progress(now + Duration::from_millis(1), timeout);
     window.outstanding.clear();
-    window.disarm_liveness_if_idle();
+    window.disarm_liveness_after_progress_if_idle();
 
     let resumed = now + Duration::from_secs(60);
     window.outstanding.push(window_request(2));
@@ -586,6 +681,113 @@ fn block_liveness_multi_block_range_progress_resets_each_body() {
     assert_eq!(window.check_liveness(third), LivenessOutcome::Ok);
     window.note_block_progress(third, timeout);
     assert_eq!(window.block_liveness_deadline, Some(third + timeout));
+}
+
+#[test]
+fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
+    // Regression for the destructive-reset zombie: an unproven peer whose single
+    // probe is in flight when a destructive view reset pulls its outstanding must
+    // not stay pinned at the one-probe cap forever. Before the fix, `on_view_changed`
+    // cleared the liveness deadline but left `requests_without_block_progress` at the
+    // cap, so the peer could neither issue another request (want-work gated at
+    // `streak >= cap`) nor ever be disconnected (deadline cleared) — a permanent
+    // zombie holding a live connection.
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 1,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    assert_eq!(window.requests_without_block_progress, 1);
+    assert_eq!(window.no_progress_request_cap(), 1);
+
+    // A destructive reset returns the peer's outstanding to the queue on our
+    // initiative, then runs the reset hook.
+    window.outstanding.clear();
+    window.note_view_reset();
+
+    // The peer can probe again (streak below the cap) and is not left as a zombie
+    // (liveness cleared, so `check_liveness` is `Ok`, and proof state is untouched).
+    assert_eq!(window.requests_without_block_progress, 0);
+    assert!(window.requests_without_block_progress < window.no_progress_request_cap());
+    assert!(!window.has_block_progress());
+    assert_eq!(
+        window.check_liveness(now + timeout),
+        LivenessOutcome::Ok,
+        "a reset peer must not carry a phantom liveness deadline",
+    );
+}
+
+#[test]
+fn view_reset_preserves_proof_but_reclears_streak() {
+    // A *proven* peer that is reset keeps its proof (cap stays at the proven value)
+    // but its no-progress streak restarts, since the reset cancelled its in-flight
+    // work on our side.
+    let config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 1,
+        max_requests_without_block_progress: 8,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = DownloadWindow::new(&config);
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    window.note_block_progress(now + Duration::from_millis(1), timeout);
+    // Prove, then issue further requests that go unanswered before the reset.
+    window.outstanding.push(window_request(2));
+    window.arm_liveness(now + Duration::from_millis(2), timeout);
+    assert!(window.has_block_progress());
+    assert_eq!(window.no_progress_request_cap(), 8);
+
+    window.outstanding.clear();
+    window.note_view_reset();
+
+    assert_eq!(window.requests_without_block_progress, 0);
+    assert!(
+        window.has_block_progress(),
+        "reset must not un-prove a peer"
+    );
+    assert_eq!(window.no_progress_request_cap(), 8);
+}
+
+#[test]
+fn backpressure_extends_liveness_instead_of_disconnecting() {
+    // Regression for the outbound-backpressure false disconnect: when the routine's
+    // outbound queue is full it stops draining inbound, so a would-be liveness
+    // disconnect is attributable to our own write-side congestion, not the peer.
+    // The routine extends the deadline via `extend_liveness_deadline` in that case;
+    // this pins the window mechanism that makes the extension turn a `Disconnect`
+    // back into `Ok`, while still enforcing the cap once the congestion clears.
+    let config = ZakuraBlockSyncConfig::default();
+    let timeout = config.effective_liveness_timeout();
+    let now = Instant::now();
+    let mut window = download_window();
+
+    window.outstanding.push(window_request(1));
+    window.arm_liveness(now, timeout);
+    assert_eq!(
+        window.check_liveness(now + timeout),
+        LivenessOutcome::Disconnect,
+        "the deadline has expired: without backpressure this disconnects",
+    );
+
+    // Under local backpressure the routine extends instead of disconnecting.
+    let extended_at = now + timeout;
+    window.extend_liveness_deadline(extended_at, timeout);
+    assert_eq!(window.check_liveness(extended_at), LivenessOutcome::Ok);
+
+    // The extension is bounded: once it too expires (congestion did not clear and no
+    // body arrived), the peer is still disconnected.
+    assert_eq!(
+        window.check_liveness(extended_at + timeout),
+        LivenessOutcome::Disconnect,
+    );
 }
 
 // The old `BlockRangeScheduler` single-pass timeout-retry bias
@@ -716,16 +918,24 @@ fn block_sync_config_defaults_and_round_trips() {
         DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BYTES
     );
     assert_eq!(
-        default.max_reorder_lookahead_blocks,
-        DEFAULT_BS_MAX_REORDER_LOOKAHEAD_BLOCKS
-    );
-    assert_eq!(
         default.floor_peer_avoid_cooldown,
         DEFAULT_BS_FLOOR_PEER_AVOID_COOLDOWN
     );
     assert_eq!(
         default.no_progress_peer_cooldown,
         DEFAULT_BS_NO_PROGRESS_PEER_COOLDOWN
+    );
+    assert_eq!(
+        default.initial_block_probe_requests,
+        DEFAULT_BS_INITIAL_BLOCK_PROBE_REQUESTS,
+    );
+    assert_eq!(
+        default.max_requests_without_block_progress,
+        DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
+    );
+    assert_eq!(
+        default.bbr_reliability_weight_percent,
+        DEFAULT_BS_BBR_RELIABILITY_WEIGHT_PERCENT,
     );
     assert_eq!(
         default.effective_max_reorder_lookahead_bytes(),
@@ -746,14 +956,13 @@ fn block_sync_config_defaults_and_round_trips() {
     assert!(default.validate().is_ok());
     assert_eq!(
         default.max_submitted_block_applies,
-        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
+        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES
     );
     assert_eq!(
         default.submitted_apply_limit(),
-        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES
+        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES
     );
     assert_eq!(default.request_timeout, DEFAULT_BS_REQUEST_TIMEOUT);
-    assert_eq!(default.fanout, DEFAULT_BS_FANOUT);
 
     let encoded = toml::to_string(&default).expect("block-sync config serializes");
     let decoded: ZakuraBlockSyncConfig =
@@ -770,7 +979,7 @@ fn block_sync_config_defaults_and_round_trips() {
     assert_eq!(config.zakura.block_sync.max_submitted_block_applies, 9);
     assert_eq!(
         config.zakura.block_sync.submitted_apply_limit(),
-        DEFAULT_BS_MAX_SUBMITTED_BLOCK_APPLIES,
+        MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
     );
 }
 
@@ -784,12 +993,6 @@ fn config_validate_rejects_degenerate_values() {
 
     config = ZakuraBlockSyncConfig {
         max_reorder_lookahead_bytes: 0,
-        ..ZakuraBlockSyncConfig::default()
-    };
-    assert!(config.validate().is_err());
-
-    config = ZakuraBlockSyncConfig {
-        max_reorder_lookahead_blocks: 0,
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_err());
@@ -813,6 +1016,24 @@ fn config_validate_rejects_degenerate_values() {
 
     config = ZakuraBlockSyncConfig {
         request_timeout: Duration::ZERO,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
+
+    config = ZakuraBlockSyncConfig {
+        initial_block_probe_requests: 0,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
+
+    config = ZakuraBlockSyncConfig {
+        max_requests_without_block_progress: 0,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    assert!(config.validate().is_err());
+
+    config = ZakuraBlockSyncConfig {
+        bbr_reliability_weight_percent: 101,
         ..ZakuraBlockSyncConfig::default()
     };
     assert!(config.validate().is_err());
@@ -1292,16 +1513,31 @@ fn work_queue_budgeted_take_preserves_estimates_through_take_and_return() {
     assert_eq!(retaken[0].1.estimated_bytes, 12_345);
 }
 
+/// Test shorthand: the grant for an admitted take, or `None` on any refusal.
+fn admit_grant(
+    config: &ZakuraBlockSyncConfig,
+    snapshot: super::admission::AdmissionSnapshot,
+    start: block::Height,
+    servable_high: block::Height,
+    response_byte_cap: u64,
+) -> Option<super::admission::AdmissionGrant> {
+    match super::admission::admit(config, snapshot, start, servable_high, response_byte_cap) {
+        super::admission::AdmissionOutcome::Admit(grant) => Some(grant),
+        super::admission::AdmissionOutcome::LookaheadAtCap
+        | super::admission::AdmissionOutcome::InflightBudgetEmpty => None,
+    }
+}
+
 #[test]
 fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 40_000_000,
         max_reorder_lookahead_bytes: 500,
-        max_reorder_lookahead_blocks: 4,
         ..ZakuraBlockSyncConfig::default()
     };
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 500,
         reorder_buffered_blocks: 1,
         applying_buffered_bytes: 0,
@@ -1312,13 +1548,26 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         budget_available: 40_000_000,
     };
 
-    let floor = super::admission::admission_decision(&config, snapshot, block::Height(11), 1_000)
-        .expect("floor rescue remains admitted at the look-ahead cap");
+    let floor = admit_grant(
+        &config,
+        snapshot,
+        block::Height(11),
+        block::Height(11),
+        1_000,
+    )
+    .expect("floor rescue remains admitted at the look-ahead cap");
     assert_eq!(floor.priority, super::admission::RequestPriority::Floor);
     assert_eq!(floor.max_request_bytes, 1_000);
 
+    // Height 412 is the first height above the commit window (verified_tip 10 + 401).
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(12), 1_000),
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
         None,
         "above-floor work stops at the look-ahead cap"
     );
@@ -1328,14 +1577,20 @@ fn admission_blocks_above_floor_at_cap_but_keeps_floor_fundable() {
         budget_available: 40_000_000,
         ..snapshot
     };
-    let above =
-        super::admission::admission_decision(&config, under_cap, block::Height(12), u64::MAX)
-            .expect("above-floor work is admitted below the cap");
+    let above = admit_grant(
+        &config,
+        under_cap,
+        block::Height(412),
+        block::Height(412),
+        u64::MAX,
+    )
+    .expect("above-floor work is admitted below the cap");
     assert_eq!(
         above.priority,
         super::admission::RequestPriority::AboveFloor
     );
-    assert_eq!(above.max_request_bytes, 400);
+    // Remaining headroom is measured in resident memory: (500 - 100*4) / 4 = 25 wire bytes.
+    assert_eq!(above.max_request_bytes, 25);
 }
 
 #[test]
@@ -1343,11 +1598,11 @@ fn admission_counts_inflight_to_sequencer_bytes() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
-        max_reorder_lookahead_blocks: 10,
         ..ZakuraBlockSyncConfig::default()
     };
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 200,
         reorder_buffered_blocks: 1,
         applying_buffered_bytes: 200,
@@ -1358,8 +1613,15 @@ fn admission_counts_inflight_to_sequencer_bytes() {
         budget_available: 64_000_000,
     };
 
+    // Probe above the commit window (verified_tip 10 + 401) so the gate applies.
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(12), 1_000),
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
         None,
         "above-floor admission includes bytes already queued to the sequencer"
     );
@@ -1370,11 +1632,11 @@ fn total_resident_plateaus_under_commit_stall() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
-        max_reorder_lookahead_blocks: 10,
         ..ZakuraBlockSyncConfig::default()
     };
     let snapshot = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 300,
         reorder_buffered_blocks: 1,
         applying_buffered_bytes: 700,
@@ -1385,8 +1647,15 @@ fn total_resident_plateaus_under_commit_stall() {
         budget_available: 64_000_000,
     };
 
+    // Probe above the commit window (verified_tip 10 + 401) so the gate applies.
     assert_eq!(
-        super::admission::admission_decision(&config, snapshot, block::Height(12), 1_000),
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
         None,
         "above-floor admission includes applying bytes held during a commit stall"
     );
@@ -1397,11 +1666,11 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
     let config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: 64_000_000,
         max_reorder_lookahead_bytes: 1_000,
-        max_reorder_lookahead_blocks: 10,
         ..ZakuraBlockSyncConfig::default()
     };
     let capped = super::admission::AdmissionSnapshot {
         download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
         reorder_buffered_bytes: 1_000,
         reorder_buffered_blocks: 1,
         applying_buffered_bytes: 0,
@@ -1412,17 +1681,313 @@ fn floor_priority_request_does_not_buffer_above_floor_past_cap() {
         budget_available: 64_000_000,
     };
 
+    // Probe above the commit window (verified_tip 10 + 401): the speculative tail of a
+    // floor-starting request is refused at the cap once it leaves the window.
     assert_eq!(
-        super::admission::admission_decision(&config, capped, block::Height(12), 1_000),
+        admit_grant(
+            &config,
+            capped,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
         None,
         "the above-floor tail of a floor-starting request is refused at the cap"
     );
+    let floor = admit_grant(
+        &config,
+        capped,
+        block::Height(11),
+        block::Height(10_000),
+        1_000,
+    )
+    .expect("floor height remains fundable");
+    assert_eq!(floor.priority, super::admission::RequestPriority::Floor);
+    // The exempt grant is clamped at the commit-window top: the take cannot carry
+    // above-window heights past the full gate.
+    assert_eq!(floor.take_high, block::Height(411));
+}
+
+#[test]
+fn outstanding_reservations_are_charged_at_the_resident_multiple() {
+    // Regression for the reserved-0× hole: outstanding above-floor reservations land and
+    // decode like every other pool, so they must be pre-charged at the resident multiple.
+    // Charging them nothing makes in-flight volume invisible to the byte gate until it is
+    // already resident — in a commit stall the pipeline could fill the whole in-flight wire
+    // budget and then decode ×factor past the plateau.
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 64_000_000,
+        max_reorder_lookahead_bytes: 1_000,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let snapshot = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(600),
+        verified_block_tip: block::Height(10),
+        reorder_buffered_bytes: 0,
+        reorder_buffered_blocks: 0,
+        applying_buffered_bytes: 0,
+        applying_buffered_blocks: 0,
+        sequencer_input_queued_bytes: 0,
+        reserved_above_floor_bytes: 700,
+        reserved_above_floor_blocks: 1,
+        budget_available: 64_000_000,
+    };
+    // Reservations alone fill the budget: 700 * 4 = 2_800 >= 1_000, so both the speculative
+    // lane and an escalated floor block above the commit window are refused.
     assert_eq!(
-        super::admission::admission_decision(&config, capped, block::Height(11), 1_000)
-            .expect("floor height remains fundable")
-            .priority,
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(602),
+            block::Height(602),
+            u64::MAX
+        ),
+        None,
+        "outstanding reservations must count against the resident budget",
+    );
+    assert!(
+        matches!(
+            super::admission::admit(
+                &config,
+                snapshot,
+                block::Height(601),
+                block::Height(601),
+                u64::MAX
+            ),
+            super::admission::AdmissionOutcome::LookaheadAtCap
+        ),
+        "an escalated floor take above the commit window is refused on reserved bytes alone",
+    );
+    // The commit window stays exempt so the committer can always drain.
+    let window = admit_grant(
+        &config,
+        snapshot,
+        block::Height(411),
+        block::Height(411),
+        1_000,
+    )
+    .expect("the commit window is exempt from the reservation charge");
+    assert_eq!(window.max_request_bytes, 1_000);
+}
+
+#[test]
+fn floor_backpressures_when_download_floor_escalates_past_commit() {
+    // Regression for the OOM. The download floor advances on every download, so a
+    // floor exemption tied to it lets the applying queue escalate unboundedly ahead of
+    // commit. With the exemption anchored to the *commit window* (one checkpoint range above
+    // the verified tip), a floor-priority request far above the commit tip is backpressured
+    // once the resident-memory look-ahead budget is full, while the commit window stays
+    // fundable so a pinned checkpoint range can assemble and commit can drain.
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 64_000_000,
+        max_reorder_lookahead_bytes: 1_000,
+        // Large enough that the byte (memory) cap, not the block cap, is what bites here.
+        ..ZakuraBlockSyncConfig::default()
+    };
+    // Commit stalled far below the download floor; applying holds a full budget of bodies:
+    // 300 serialized * DESERIALIZED_MEM_FACTOR (4) = 1_200 resident >= 1_000 budget.
+    let snapshot = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(1_000),
+        verified_block_tip: block::Height(10),
+        reorder_buffered_bytes: 0,
+        reorder_buffered_blocks: 0,
+        applying_buffered_bytes: 300,
+        applying_buffered_blocks: 990,
+        sequencer_input_queued_bytes: 0,
+        reserved_above_floor_bytes: 0,
+        reserved_above_floor_blocks: 0,
+        budget_available: 64_000_000,
+    };
+
+    // The download-frontier request (floor+1) is still classified floor-priority, but is now
+    // refused: it is above the commit window, so it no longer bypasses the memory cap.
+    assert_eq!(
+        super::admission::request_priority(snapshot.download_floor, block::Height(1_001)),
+        super::admission::RequestPriority::Floor,
+    );
+    assert_eq!(
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(1_001),
+            block::Height(1_001),
+            1_000
+        ),
+        None,
+        "a floor request far ahead of commit is backpressured when the memory budget is full",
+    );
+
+    // The commit window (verified_tip + 1 ..= verified_tip + 401) stays fundable, so the
+    // committer can advance and drain the pipeline — no deadlock. The boundary is exact:
+    // 411 is the last exempt height, 412 the first gated one.
+    let frontier = admit_grant(
+        &config,
+        snapshot,
+        block::Height(11),
+        block::Height(11),
+        1_000,
+    )
+    .expect("the commit-frontier block is always fundable");
+    assert_eq!(frontier.max_request_bytes, 1_000);
+    let window_top = admit_grant(
+        &config,
+        snapshot,
+        block::Height(411),
+        block::Height(411),
+        1_000,
+    )
+    .expect("the top of the commit window is still fundable");
+    assert_eq!(window_top.max_request_bytes, 1_000);
+    assert_eq!(
+        admit_grant(
+            &config,
+            snapshot,
+            block::Height(412),
+            block::Height(412),
+            1_000
+        ),
+        None,
+        "the first height above the commit window is memory-gated",
+    );
+}
+
+#[test]
+fn exempt_take_never_spans_the_commit_window_boundary() {
+    // Pin for the above-window take bypass: with multi-block responses, a take whose
+    // admission-checked start sits inside the commit window must not extend above the
+    // window top — otherwise above-window heights ride the exempt request past the
+    // resident gate, sized only by the in-flight budget. The clamp is structural
+    // (gate-independent), so it holds whether or not the gate is full.
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: 64_000_000,
+        max_reorder_lookahead_bytes: 1_000,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    // Gate full: 300 wire * 4 = 1_200 resident >= 1_000 budget.
+    let full = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(10),
+        verified_block_tip: block::Height(10),
+        reorder_buffered_bytes: 0,
+        reorder_buffered_blocks: 0,
+        applying_buffered_bytes: 300,
+        applying_buffered_blocks: 10,
+        sequencer_input_queued_bytes: 0,
+        reserved_above_floor_bytes: 0,
+        reserved_above_floor_blocks: 0,
+        budget_available: 64_000_000,
+    };
+    let grant = admit_grant(
+        &config,
+        full,
+        block::Height(11),
+        block::Height(10_000),
+        1_000,
+    )
+    .expect("an in-window start stays fundable at a full gate");
+    assert_eq!(
+        grant.take_high,
+        block::Height(411),
+        "the exempt take is clamped at the commit-window top",
+    );
+    assert_eq!(grant.max_request_bytes, 1_000);
+
+    // Same clamp with the gate open: no exempt take ever spans the boundary.
+    let open = super::admission::AdmissionSnapshot {
+        applying_buffered_bytes: 0,
+        applying_buffered_blocks: 0,
+        ..full
+    };
+    let grant = admit_grant(
+        &config,
+        open,
+        block::Height(11),
+        block::Height(10_000),
+        1_000,
+    )
+    .expect("an in-window start is fundable with the gate open");
+    assert_eq!(grant.take_high, block::Height(411));
+
+    // An above-window start with headroom extends to the servable ceiling, sized by the
+    // remaining resident headroom in wire bytes: (1_000 - 0) / 4 = 250.
+    let grant = admit_grant(
+        &config,
+        open,
+        block::Height(412),
+        block::Height(10_000),
+        u64::MAX,
+    )
+    .expect("an above-window start is admitted below the cap");
+    assert_eq!(grant.take_high, block::Height(10_000));
+    assert_eq!(grant.max_request_bytes, 250);
+}
+
+#[test]
+fn commit_window_stays_fundable_at_exact_floor() {
+    // Regression for the exact-fit clamp deadlock: a config clamped to the checkpoint-range
+    // floors used to leave zero margin, so one next-range reorder body or reservation pushed
+    // the gate over budget and the range-completing block was refused — checkpoint sync
+    // wedged. With the whole commit window exempt, the active range assembles regardless of
+    // how full the gate is.
+    use super::config::{
+        BS_CHECKPOINT_RANGE_BYTE_FLOOR, MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES,
+    };
+
+    let mut config = ZakuraBlockSyncConfig {
+        max_inflight_block_bytes: BS_CHECKPOINT_RANGE_BYTE_FLOOR,
+        max_reorder_lookahead_bytes: 1,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.clamp_reorder_lookahead_to_floor();
+    let range_blocks = u32::try_from(MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES)
+        .expect("checkpoint range block count fits in u32");
+
+    // verified_tip pinned at 0; applying holds all but the last worst-case range block, plus
+    // next-range contamination in reorder and outstanding reservations. The byte gate is
+    // full: resident (8 MiB + 800 MB + 4 MB) * 4 >= 3_208_000_000.
+    let snapshot = super::admission::AdmissionSnapshot {
+        download_floor: block::Height(range_blocks - 1),
+        verified_block_tip: block::Height(0),
+        reorder_buffered_bytes: 8_388_608,
+        reorder_buffered_blocks: 4,
+        applying_buffered_bytes: 800_000_000,
+        applying_buffered_blocks: u64::from(range_blocks) - 1,
+        sequencer_input_queued_bytes: 0,
+        reserved_above_floor_bytes: 4_000_000,
+        reserved_above_floor_blocks: 2,
+        budget_available: 2_000_000,
+    };
+
+    // The range-completing block (inside the commit window) stays fundable on both lanes.
+    assert_eq!(
+        super::admission::request_priority(snapshot.download_floor, block::Height(range_blocks)),
+        super::admission::RequestPriority::Floor,
+    );
+    let completing = admit_grant(
+        &config,
+        snapshot,
+        block::Height(range_blocks),
+        block::Height(range_blocks),
+        u64::MAX,
+    )
+    .expect("the range-completing floor take must pass a full gate");
+    assert_eq!(
+        completing.priority,
         super::admission::RequestPriority::Floor
     );
+    assert_eq!(completing.max_request_bytes, 2_000_000);
+
+    // The first height above the window is refused while the gate is full — on both
+    // lanes, since `admit` gates every above-window start regardless of priority.
+    assert!(matches!(
+        super::admission::admit(
+            &config,
+            snapshot,
+            block::Height(range_blocks + 1),
+            block::Height(range_blocks + 1),
+            u64::MAX
+        ),
+        super::admission::AdmissionOutcome::LookaheadAtCap
+    ));
 }
 
 #[test]
@@ -1655,6 +2220,57 @@ fn release_reserved_mixed_reserved_held_conserves_budget() {
 }
 
 #[test]
+fn release_reserved_heights_skips_held_body_owned_by_sequencer() {
+    // The owner's routine GC / stale-trim cleanup (`gc_committed_outstanding`,
+    // `stale_adjusted_disposition`, `finish_detached`) releases via
+    // `release_reserved_heights`. When a competing peer delivered a height late, it
+    // settled to `Held(actual)` in the shared queue; the owner must release only
+    // the still-reserved estimate and leave the held body for the Sequencer — never
+    // double-releasing its bytes. The non-Held-aware `release_heights` would return
+    // the held `actual` here and saturate the budget.
+    let queue = work_queue_with(
+        0,
+        [
+            needed(1, BlockSizeEstimate::Advertised(100)),
+            needed(2, BlockSizeEstimate::Advertised(100)),
+        ],
+    );
+    let mut budget = ByteBudget::new(1_000);
+    let taken = queue.take_in_range(block::Height(1), block::Height(2), 2);
+    assert_eq!(taken.len(), 2);
+    assert!(budget.try_reserve(200));
+    assert_eq!(
+        queue.mark_reserved([block::Height(1), block::Height(2)]),
+        200
+    );
+
+    // A competing peer's late body settles height 1 to Held(80); height 2 stays
+    // reserved (never delivered).
+    let delta = queue
+        .settle_active_reserved_height(block::Height(1), 80)
+        .expect("height 1 is reserved");
+    assert_eq!(delta, -20);
+    budget.release(20);
+    assert_eq!(budget.reserved(), 180);
+
+    // GC both heights: only the still-reserved height 2 releases. The Held height 1
+    // is skipped (owned by the Sequencer) and stays in `in_flight`.
+    let released = queue.release_reserved_heights([block::Height(1), block::Height(2)]);
+    budget.release(released);
+    assert_eq!(
+        released, 100,
+        "release_reserved_heights frees only the still-reserved estimate, never held body bytes"
+    );
+    assert!(queue.in_flight_contains(block::Height(1)));
+    assert_eq!(budget.reserved(), 80);
+
+    // The Sequencer releases the held body on commit; nothing drifts.
+    budget.release(80);
+    assert_eq!(queue.advance_floor(block::Height(2)), 0);
+    assert_eq!(budget.reserved(), 0);
+}
+
+#[test]
 fn work_queue_take_does_not_clamp_high_to_floor() {
     // The download floor is NOT an upper bound on a take: a peer fetches as far
     // above the floor as its servable range allows.
@@ -1745,7 +2361,7 @@ fn work_queue_height_is_in_exactly_one_set() {
 
 #[tokio::test]
 async fn reactor_fill_loop_saturates_multiple_slots_in_one_pass() {
-    let config = immediate_body_download_config();
+    let config = fill_loop_mechanics_config();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -1951,7 +2567,7 @@ async fn reactor_suppresses_needed_block_query_when_work_already_covers_tip() {
 /// peer while the rest sit idle with free slots.
 #[tokio::test]
 async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
-    let config = immediate_body_download_config();
+    let config = fill_loop_mechanics_config();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -2074,7 +2690,7 @@ async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
 /// `reactor_does_not_wedge_honest_peer_under_range_unavailable_spam`.)
 #[tokio::test]
 async fn reactor_budget_constrained_issuance_rotates_across_peers() {
-    let config = immediate_body_download_config();
+    let config = fill_loop_mechanics_config();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -2180,8 +2796,7 @@ async fn reactor_budget_constrained_issuance_rotates_across_peers() {
 /// is in recovery rather than the whole download stalling behind one straggler.
 #[tokio::test]
 async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
-    let mut config = immediate_body_download_config();
-    config.fanout = 1;
+    let mut config = fill_loop_mechanics_config();
     // A request timeout long enough that the opening pass fans both heights out
     // before anything expires, but short enough that the slow peer's unanswered
     // request still times out within the test window.
@@ -2317,7 +2932,6 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
         TraceCapture::for_test("block_liveness_disconnects_silent_peer_and_traces_reason")
             .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
-    config.fanout = 1;
     config.request_timeout = Duration::from_millis(400);
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
 
@@ -2392,13 +3006,207 @@ async fn block_liveness_disconnects_silent_peer_and_traces_reason() {
     capture.flush().await;
     let reader = capture.reader().expect("trace rows load");
     reader.table("block_sync").assert_row(
-        bs_trace::BLOCK_PEER_PROTOCOL_REJECT,
+        bs_trace::BLOCK_GET_BLOCKS_SENT,
         &[
-            (
-                bs_trace::REASON,
-                TraceValue::Str("block_sync_no_block_progress"),
-            ),
-            (bs_trace::OUTSTANDING, TraceValue::U64(1)),
+            ("requests_without_block_progress", TraceValue::U64(1)),
+            ("no_progress_request_cap", TraceValue::U64(1)),
+            ("block_progress_proven", TraceValue::U64(0)),
+        ],
+    );
+    reader.table("block_sync").assert_row(
+        bs_trace::BLOCK_PEER_PROTOCOL_REJECT,
+        &[(
+            bs_trace::REASON,
+            TraceValue::Str("block_sync_no_block_progress"),
+        )],
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn block_liveness_credits_late_unmatched_body_and_keeps_peer() {
+    // Regression: a peer whose probe times out but that then delivers the body late
+    // — after its own outstanding request was already removed, so the body arrives
+    // through the unmatched-queued path — must be credited with block progress and
+    // kept. Before the fix, `accept_unmatched_queued_body` buffered the useful body
+    // without resetting the no-progress streak or proving the peer, so the peer was
+    // disconnected at the liveness deadline despite delivering the block we accepted.
+    let mut config = immediate_body_download_config();
+    // Short request/floor-rescue leash so the probe times out fast; the liveness
+    // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
+    config.request_timeout = Duration::from_millis(300);
+    config.floor_rescue_timeout = Duration::from_millis(120);
+    config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
+
+    let blocks = mainnet_blocks_1_to_3();
+    let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+
+    let peer = peer(0x53);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    let connection_cancel = CancellationToken::new();
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: blocks[0].hash(),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    tip_tx
+        .send((block::Height(1), blocks[0].hash()))
+        .expect("tip watch is live");
+    wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
+
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&blocks[0])]))
+        .await
+        .expect("needed metadata queues");
+
+    // The peer receives exactly one probe (the initial unproven budget), which arms
+    // its liveness deadline.
+    let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    // Let that probe time out on the floor-rescue leash: height 1 returns to the
+    // queue and, being unproven, the peer is now gated at its one-probe cap.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The body arrives late, matching no outstanding request → the unmatched-queued
+    // path buffers and forwards it.
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(blocks[0].clone())
+                .encode_frame()
+                .expect("block frame encodes"),
+        )
+        .await
+        .expect("late block frame queues");
+
+    // Non-vacuous: the late body was accepted (forwarded for submission).
+    let submitted = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match next_action(&mut actions).await {
+                BlockSyncAction::SubmitBlock { block, .. } => break block.coinbase_height(),
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("the late unmatched body is accepted and submitted");
+    assert_eq!(submitted, Some(block::Height(1)));
+
+    // The credited progress must keep the peer alive past the liveness deadline
+    // (1.2s from the probe). Before the fix the peer was disconnected here.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), connection_cancel.cancelled())
+            .await
+            .is_err(),
+        "a peer that delivered an accepted (late) body must not be parked as silent",
+    );
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
+    // The per-peer `block_peer_bbr` heartbeat fires on a fixed cadence even while the
+    // peer is idle (its interval's first tick is immediate), so the controller state is
+    // observable between deliveries. A freshly-connected, unproven, idle peer must emit
+    // at least one heartbeat carrying the BBR fields, with reliability at the optimistic
+    // full value and no proven progress yet.
+    let mut capture = TraceCapture::for_test("peer_emits_periodic_bbr_heartbeat_while_idle")
+        .expect("trace capture initializes");
+    let config = immediate_body_download_config();
+
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let mut startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    startup.trace = ZakuraTrace::new(capture.tracer(), "01");
+    let (_handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, _handle.clone());
+
+    let peer = peer(0x5b);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+    service.add_peer(Peer::new_with_direction(
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+    inbound_tx
+        .send(
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                tip_hash: block::Hash([1; 32]),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            })
+            .encode_frame()
+            .expect("status encodes"),
+        )
+        .await
+        .expect("status frame queues");
+
+    // Let the routine reach its idle select loop and fire the immediate heartbeat tick.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    capture.flush().await;
+    let reader = capture.reader().expect("trace rows load");
+    reader.table("block_sync").assert_row(
+        bs_trace::BLOCK_PEER_BBR,
+        &[
+            ("bbr_reliability_permille", TraceValue::U64(1000)),
+            ("block_progress_proven", TraceValue::U64(0)),
+            ("bbr_phase", TraceValue::U64(0)),
         ],
     );
 
@@ -3453,23 +4261,30 @@ proptest::proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(256))]
 
     #[test]
-    fn admission_decision_respects_lookahead_bounds(
+    fn admit_respects_lookahead_bounds(
         reorder_bytes in 0u64..2_000,
         applying_bytes in 0u64..2_000,
         input_bytes in 0u64..2_000,
         reserved_bytes in 0u64..2_000,
-        reorder_blocks in 0u64..20,
+        // Occasionally saturate the hard block cap so the count-gate arm below
+        // stays non-vacuous (ordinary counts never approach 262,144).
+        reorder_blocks in proptest::prop_oneof![
+            0u64..20,
+            proptest::strategy::Just(super::admission::LOOKAHEAD_BLOCK_HARD_CAP),
+        ],
         applying_blocks in 0u64..20,
         reserved_blocks in 0u64..20,
     ) {
         let config = ZakuraBlockSyncConfig {
             max_inflight_block_bytes: 64_000_000,
             max_reorder_lookahead_bytes: 1_000,
-            max_reorder_lookahead_blocks: 10,
             ..ZakuraBlockSyncConfig::default()
         };
+        // The download floor sits far above the commit window (verified_tip 10 + 401 = 411),
+        // so the gated probe below is genuinely memory-gated, not window-exempt.
         let snapshot = super::admission::AdmissionSnapshot {
-            download_floor: block::Height(10),
+            download_floor: block::Height(600),
+            verified_block_tip: block::Height(10),
             reorder_buffered_bytes: reorder_bytes,
             reorder_buffered_blocks: reorder_blocks,
             applying_buffered_bytes: applying_bytes,
@@ -3479,37 +4294,73 @@ proptest::proptest! {
             reserved_above_floor_blocks: reserved_blocks,
             budget_available: 64_000_000,
         };
-        let held_bytes = reorder_bytes
+        // The resident estimate charges every pool — including the wire-retained reorder
+        // backlog and outstanding reservations — at its eventual decoded cost; mirrors
+        // admission::estimated_resident_pipeline_bytes.
+        let factor = super::admission::DESERIALIZED_MEM_FACTOR;
+        let estimated_resident = reorder_bytes
             .saturating_add(applying_bytes)
             .saturating_add(input_bytes)
-            .saturating_add(reserved_bytes);
+            .saturating_add(reserved_bytes)
+            .saturating_mul(factor);
         let held_blocks = reorder_blocks
             .saturating_add(applying_blocks)
             .saturating_add(reserved_blocks);
-        let above = super::admission::admission_decision(
+        let effective = config.effective_max_reorder_lookahead_bytes();
+        let above = super::admission::admit(
             &config,
             snapshot,
-            block::Height(12),
+            block::Height(602),
+            block::Height(100_000),
             1_000,
         );
-        if held_bytes >= config.effective_max_reorder_lookahead_bytes()
-            || held_blocks >= u64::from(config.max_reorder_lookahead_blocks)
+        if estimated_resident >= effective
+            || held_blocks >= super::admission::LOOKAHEAD_BLOCK_HARD_CAP
+            || (effective - estimated_resident) / factor == 0
         {
-            prop_assert_eq!(above, None);
+            prop_assert_eq!(above, super::admission::AdmissionOutcome::LookaheadAtCap);
         } else {
-            prop_assert!(above.is_some());
+            // A gated request funds min(budget, remaining_wire, response_cap); the next
+            // body is sized as decoded, so remaining_wire = (effective - resident) / factor.
+            let remaining_wire = (effective - estimated_resident) / factor;
+            let expected = snapshot.budget_available.min(remaining_wire).min(1_000);
+            match above {
+                super::admission::AdmissionOutcome::Admit(grant) => {
+                    prop_assert_eq!(grant.max_request_bytes, expected);
+                    // Gated grants pass the servable ceiling through unchanged.
+                    prop_assert_eq!(grant.take_high, block::Height(100_000));
+                    // Single-admission no-breach invariant: whatever the gate admits
+                    // cannot push the resident estimate past the budget once it lands
+                    // and decodes.
+                    prop_assert!(
+                        estimated_resident
+                            .saturating_add(grant.max_request_bytes.saturating_mul(factor))
+                            <= effective
+                    );
+                }
+                other => prop_assert!(false, "expected a gated grant, got {:?}", other),
+            }
         }
 
-        let floor = super::admission::admission_decision(
+        // The commit window (heights <= 411) stays fundable regardless of pool fill,
+        // and the exempt grant never spans the window boundary.
+        match super::admission::admit(
             &config,
             snapshot,
             block::Height(11),
+            block::Height(100_000),
             1_000,
-        );
-        prop_assert_eq!(
-            floor.expect("floor remains admitted while budget is available").priority,
-            super::admission::RequestPriority::Floor
-        );
+        ) {
+            super::admission::AdmissionOutcome::Admit(grant) => {
+                prop_assert_eq!(grant.max_request_bytes, 1_000);
+                prop_assert_eq!(grant.take_high, block::Height(411));
+            }
+            other => prop_assert!(
+                false,
+                "the commit window remains admitted while budget is available, got {:?}",
+                other
+            ),
+        }
     }
 }
 
@@ -3872,7 +4723,7 @@ async fn add_peer_emits_events_and_round_trips_status_over_framed_path() {
         .await
         .expect("inbound status queues");
 
-    service.remove_peer(&peer);
+    service.remove_peer(&peer, 0);
     assert_eq!(service.peer_count(), 0);
     assert!(session.cancel_token().is_cancelled());
 }
@@ -3881,10 +4732,13 @@ async fn add_peer_emits_events_and_round_trips_status_over_framed_path() {
 async fn stale_block_sync_teardown_keeps_replacement_session() {
     let (service, mut events) = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
     let peer = peer(92);
+    let old_conn_id = 1;
+    let new_conn_id = 2;
 
     let (old_inbound_tx, old_inbound_rx) = framed_channel(4);
     let (old_outbound_tx, _old_outbound_rx) = framed_channel(4);
-    service.add_peer(Peer::new_with_direction(
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        old_conn_id,
         peer.clone(),
         None,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -3899,7 +4753,8 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
 
     let (new_inbound_tx, new_inbound_rx) = framed_channel(4);
     let (new_outbound_tx, _new_outbound_rx) = framed_channel(4);
-    service.add_peer(Peer::new_with_direction(
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        new_conn_id,
         peer.clone(),
         None,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -3911,6 +4766,29 @@ async fn stale_block_sync_teardown_keeps_replacement_session() {
         next_event(&mut events).await,
         BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
     ));
+    assert_eq!(service.peer_count(), 1);
+
+    let (_stale_inbound_tx, stale_inbound_rx) = framed_channel(4);
+    let (stale_outbound_tx, _stale_outbound_rx) = framed_channel(4);
+    service.add_peer(Peer::new_with_conn_id_and_direction(
+        old_conn_id,
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(
+            ZAKURA_STREAM_BLOCK_SYNC,
+            (stale_inbound_rx, stale_outbound_tx),
+        )]),
+        CancellationToken::new(),
+    ));
+    assert_eq!(
+        service.peer_count(),
+        1,
+        "stale add must not overwrite the replacement block-sync session",
+    );
+
+    service.remove_peer(&peer, old_conn_id);
     assert_eq!(service.peer_count(), 1);
 
     drop(old_inbound_tx);
@@ -3983,7 +4861,7 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         BlockSyncEvent::PeerConnected(session) if session.peer_id() == &peer
     ));
 
-    service.remove_peer(&peer);
+    service.remove_peer(&peer, 0);
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
             .await
@@ -5654,7 +6532,12 @@ async fn reactor_keeps_issuing_far_above_floor_with_no_near_tip_pause() {
     // here the needed heights sit far below a high header tip, but the point is
     // that issuance proceeds regardless of how close to (or far from) the tip we
     // are — only budget + slots gate it.
-    let config = ZakuraBlockSyncConfig::default();
+    let config = ZakuraBlockSyncConfig {
+        // Open the one-probe cold start; this test exercises sustained issuance, not
+        // the probe gate (which has dedicated coverage).
+        initial_block_probe_requests: DEFAULT_BS_MAX_REQUESTS_WITHOUT_BLOCK_PROGRESS,
+        ..ZakuraBlockSyncConfig::default()
+    };
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -5887,7 +6770,7 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
 
     // Disconnect peer A mid-fetch (it never answers). Its routine's `Drop` guard
     // must return height 1 to `pending` and release its reservation.
-    service.remove_peer(&peer_a);
+    service.remove_peer(&peer_a, 0);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if service.peer_count() == 0 {
@@ -6176,7 +7059,7 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
     // synced node can still be the server a fresh peer needs for historical
     // bodies, so closing the stream after every local catch-up would starve fresh
     // Zakura-only nodes between checkpoint windows.
-    let mut config = immediate_body_download_config();
+    let mut config = fill_loop_mechanics_config();
     config.peer_limits.max_outbound_peers = 1;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(4), block::Hash([4; 32])));
     let startup = BlockSyncStartup::new(
@@ -6891,7 +7774,6 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         .collect();
 
     let mut config = immediate_body_download_config();
-    config.fanout = 1;
     config.max_inflight_block_bytes = u64::MAX;
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
@@ -7035,7 +7917,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         "the initial in-flight requests must cover the missing checkpoint hole"
     );
 
-    service.remove_peer(&old_peer);
+    service.remove_peer(&old_peer, 0);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if handle.peer_snapshot().outbound_peers == 0 && service.peer_count() == 0 {
@@ -8159,7 +9041,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
     for (case, old_before_reset, old_before_new_needed, after_new_needed) in cases {
         let mut config = ZakuraBlockSyncConfig {
             max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 3,
-            ..immediate_body_download_config()
+            ..fill_loop_mechanics_config()
         };
         config.peer_limits.outbound_queue_depth = 16;
         let old_blocks = mainnet_blocks_1_to_3();
@@ -8519,7 +9401,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
 async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
     let mut config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES,
-        ..immediate_body_download_config()
+        ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
@@ -9366,7 +10248,6 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
     // heights from the needed set so the gap gets scheduled.
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
-    config.fanout = 3;
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(3), blocks[2].hash()));
     let startup = BlockSyncStartup::new(
@@ -9492,8 +10373,9 @@ async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
         MAX_BS_RESPONSE_BYTES,
     )
     .await;
-    // `connect_peer_with_status` already read (and asserted) the connect-time
-    // `Status` off this peer's real outbound.
+    // `connect_peer_with_status` already read the connect-time `Status`; the
+    // peer's first inbound `Status` now gets a reply as well.
+    wait_for_outbound_status(&mut outbound_rx).await;
 
     handle
         .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
@@ -9600,7 +10482,70 @@ async fn reactor_retries_status_to_peer_without_status_when_local_status_unchang
 }
 
 #[tokio::test]
-async fn reactor_replies_to_status_after_status_send_allowance_reopens() {
+async fn reactor_replies_to_first_status_when_connect_status_queue_was_full() {
+    let mut config = ZakuraBlockSyncConfig {
+        status_refresh_interval: Duration::from_millis(50),
+        ..immediate_body_download_config()
+    };
+    config.peer_limits.outbound_queue_depth = 1;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let peer = peer(64);
+    let (inbound_tx, inbound_rx) = framed_channel(8);
+    let (outbound_tx, mut outbound_rx) = framed_channel(1);
+    outbound_tx
+        .try_send(
+            BlockSyncMessage::Status(status())
+                .encode_frame()
+                .expect("filler status frame encodes"),
+        )
+        .expect("outbound queue starts full");
+    let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+
+    service.add_peer(Peer::new_with_direction(
+        peer,
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        streams,
+        CancellationToken::new(),
+    ));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if handle.peer_snapshot().outbound_peers == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer is admitted while outbound queue is full");
+
+    let _ = outbound_rx.recv().await.expect("filler frame drains");
+    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+
+    assert!(matches!(
+        next_outbound_message(&mut outbound_rx).await,
+        BlockSyncMessage::Status(_)
+    ));
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn reactor_does_not_ping_pong_rapid_repeated_status() {
     let mut config = ZakuraBlockSyncConfig {
         status_refresh_interval: Duration::from_millis(50),
         ..immediate_body_download_config()
@@ -9619,9 +10564,9 @@ async fn reactor_replies_to_status_after_status_send_allowance_reopens() {
     );
     let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle);
-    let peer = peer(64);
+    let peer = peer(65);
     let (inbound_tx, inbound_rx) = framed_channel(8);
-    let (outbound_tx, mut outbound_rx) = framed_channel(8);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
     let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
 
     service.add_peer(Peer::new_with_direction(
@@ -9633,33 +10578,17 @@ async fn reactor_replies_to_status_after_status_send_allowance_reopens() {
         CancellationToken::new(),
     ));
 
-    assert!(matches!(
-        next_outbound_message(&mut outbound_rx).await,
-        BlockSyncMessage::Status(_)
-    ));
-    inbound_tx
-        .send(
-            BlockSyncMessage::Status(status())
-                .encode_frame()
-                .expect("inbound status frame encodes"),
-        )
-        .await
-        .expect("inbound status queues");
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    inbound_tx
-        .send(
-            BlockSyncMessage::Status(status())
-                .encode_frame()
-                .expect("inbound status frame encodes"),
-        )
-        .await
-        .expect("second inbound status queues");
+    wait_for_outbound_status(&mut outbound_rx).await;
+    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+    wait_for_outbound_status(&mut outbound_rx).await;
 
-    assert!(matches!(
-        next_outbound_message(&mut outbound_rx).await,
-        BlockSyncMessage::Status(_)
-    ));
+    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), outbound_rx.recv())
+            .await
+            .is_err(),
+        "a rapid second inbound Status must not trigger another Status reply"
+    );
 
     reactor_task.abort();
 }
@@ -10262,7 +11191,7 @@ async fn reactor_ignores_stale_non_reset_frontier_updates() {
 #[tokio::test]
 async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
     let blocks = mainnet_blocks_1_to_3();
-    let mut config = immediate_body_download_config();
+    let mut config = fill_loop_mechanics_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
@@ -10381,7 +11310,6 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
 async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
-    config.fanout = 2;
     // A long request timeout ensures the timeout-driven retry self-heal cannot mask
     // the wedge within the test window.
     config.request_timeout = Duration::from_secs(300);
@@ -10486,7 +11414,7 @@ async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
 #[tokio::test]
 async fn reactor_range_unavailable_retries_only_unverified_suffix() {
     let blocks = mainnet_blocks_1_to_3();
-    let mut config = immediate_body_download_config();
+    let mut config = fill_loop_mechanics_config();
     config.peer_limits.outbound_queue_depth = 16;
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
     let startup = BlockSyncStartup::new(
@@ -11141,7 +12069,7 @@ async fn reactor_known_peer_unsolicited_blocks_done_is_reported_as_misbehavior()
 }
 
 #[tokio::test]
-async fn reactor_ignores_unmatched_response_for_height_active_on_another_request() {
+async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
     let config = immediate_body_download_config();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
@@ -11204,14 +12132,36 @@ async fn reactor_ignores_unmatched_response_for_height_active_on_another_request
         .expect("empty needed metadata queues");
 
     // The peer that did NOT get the request sends the body+terminator as real
-    // inbound frames; its routine must drop them (another peer holds the active
-    // request) without scoring misbehavior.
+    // inbound frames. First valid completion wins: the body is accepted even
+    // though another peer currently owns the request slot, and the later
+    // duplicate from the original owner will be dropped by the sequencer.
     let (late_peer, late_inbound) = if requested_peer == peer1 {
         (peer2, inbound2)
     } else {
         (peer1, inbound1)
     };
     send_inbound(&late_inbound, BlockSyncMessage::Block(blocks[1].clone())).await;
+    let submitted = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match next_action(&mut actions).await {
+                BlockSyncAction::SubmitBlock { block, .. } => return block.hash(),
+                BlockSyncAction::QueryNeededBlocks { .. } => {}
+                BlockSyncAction::Misbehavior { peer, reason } => {
+                    assert_ne!(
+                        peer, late_peer,
+                        "late active body was reported as {reason:?}"
+                    );
+                }
+                action => {
+                    panic!("unexpected action while waiting for late body submit: {action:?}")
+                }
+            }
+        }
+    })
+    .await
+    .expect("late active body is accepted and submitted");
+    assert_eq!(submitted, blocks[1].hash());
+
     send_inbound(
         &late_inbound,
         BlockSyncMessage::BlocksDone {

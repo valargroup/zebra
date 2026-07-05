@@ -1,3 +1,6 @@
+use super::super::trace::{
+    ordered_send_error_label, queue_send_trace as qs_trace, QUEUE_SEND_TABLE,
+};
 use super::{
     config::*, events::*, peer_registry::*, sequencer::*, sequencer_task::*, state::*, wire::*, *,
 };
@@ -265,7 +268,7 @@ impl BlockSyncReactor {
         self.query_needed_blocks().await;
         self.publish_metrics();
         self.refresh_throughput();
-        self.trace_sync_state();
+        self.trace_sync_state(true);
         loop {
             // Arm the floor watchdog to the earliest outstanding floor-claim
             // deadline (event-driven, like the per-peer routine's own-timeout
@@ -333,7 +336,7 @@ impl BlockSyncReactor {
                             // last `commit_state` row lags the live metric, and the
                             // e2e oracle reads a stale `applying > 0` "leak" after the
                             // node has actually settled (the live metric reads 0).
-                            self.trace_sync_state();
+                            self.trace_sync_state(false);
                         }
                         Err(_) => break,
                     }
@@ -352,7 +355,7 @@ impl BlockSyncReactor {
                 _ = metrics_ticks.tick() => {
                     self.publish_metrics();
                     self.refresh_throughput();
-                    self.trace_sync_state();
+                    self.trace_sync_state(true);
                 }
                 _ = status_ticks.tick() => self.flush_status_refresh().await,
                 _ = &mut floor_watchdog => {
@@ -557,17 +560,13 @@ impl BlockSyncReactor {
         // primitives and its registry generation. The reactor keeps only a thin
         // serving handle (session + serving meters) — it neither spawns the
         // routine nor holds a per-peer inbound channel.
-        let mut peer_state = PeerBlockState::new(session, &self.startup.config);
-        // Consume the status-advertisement refresh allowance: the connect Status
-        // below counts as this peer's first advertisement, so the next periodic
-        // refresh must wait a full interval before re-sending.
-        peer_state.refresh_meter.mark_taken(Instant::now());
+        let peer_state = PeerBlockState::new(session, &self.startup.config);
         self.state.peers.insert(peer.clone(), peer_state);
 
         self.trace_peer_connected(&peer, direction);
         self.publish_peer_snapshot();
         self.publish_candidate_state();
-        self.send_status(&peer, "peer_connected");
+        self.send_status_and_mark_refresh(&peer, "peer_connected", Instant::now());
         // The routine fills its own slots; it begins want-work as soon as it has
         // a status and work.
     }
@@ -914,7 +913,7 @@ impl BlockSyncReactor {
     async fn handle_routine_message(&mut self, message: RoutineToReactor) {
         match message {
             RoutineToReactor::StatusReceived { peer, send_reply } => {
-                self.handle_status_received(peer, send_reply).await;
+                self.handle_status_received(peer, send_reply);
             }
             RoutineToReactor::ServeGetBlocks {
                 peer,
@@ -939,7 +938,7 @@ impl BlockSyncReactor {
     /// registry by the routine, generation-gated). The reactor advertises our
     /// `Status` reply if the routine's rate meter allowed it and republishes the
     /// candidate set.
-    async fn handle_status_received(&mut self, peer: ZakuraPeerId, send_reply: bool) {
+    fn handle_status_received(&mut self, peer: ZakuraPeerId, send_reply: bool) {
         if !self.state.peers.contains_key(&peer) {
             return;
         }
@@ -1253,9 +1252,9 @@ impl BlockSyncReactor {
             .max(max_blocks_per_response)
     }
 
-    fn send_status(&self, peer: &ZakuraPeerId, reason: &'static str) {
+    fn send_status(&self, peer: &ZakuraPeerId, reason: &'static str) -> bool {
         let Some(peer_state) = self.state.peers.get(peer) else {
-            return;
+            return false;
         };
         let status = self.local_status();
         let msg = BlockSyncMessage::Status(status);
@@ -1265,18 +1264,56 @@ impl BlockSyncReactor {
             Ok(()) => {
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, status);
+                true
             }
             Err(OrderedSendError::Full) => {
                 tracing::debug!(?peer, "Zakura block-sync Status queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &OrderedSendError::Full,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    Some(reason),
+                );
+                false
             }
             Err(error) => {
                 tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Status");
                 self.trace_status_send_failed(peer, reason);
                 self.trace_message_sent(peer, &msg, "error", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &error,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    Some(reason),
+                );
                 session.cancel_token().cancel();
+                false
             }
         }
+    }
+
+    fn send_status_and_mark_refresh(
+        &mut self,
+        peer: &ZakuraPeerId,
+        reason: &'static str,
+        now: Instant,
+    ) -> bool {
+        if !self.send_status(peer, reason) {
+            return false;
+        }
+
+        // Consume the status-advertisement refresh allowance only after the
+        // Status enters the peer's outbound queue.
+        if let Some(peer_state) = self.state.peers.get_mut(peer) {
+            peer_state.refresh_meter.mark_taken(now);
+        }
+
+        true
     }
 
     fn send_block(&self, peer: &ZakuraPeerId, block: Arc<block::Block>) -> bool {
@@ -1300,11 +1337,27 @@ impl BlockSyncReactor {
                 metrics::counter!("sync.block.body.serve_queue_full").increment(1);
                 tracing::debug!(?peer, "Zakura block-sync Block queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &OrderedSendError::Full,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    None,
+                );
                 false
             }
             Err(error) => {
                 tracing::debug!(?peer, ?error, "failed to queue Zakura block-sync Block");
                 self.trace_message_sent(peer, &msg, "error", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &error,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    None,
+                );
                 session.cancel_token().cancel();
                 false
             }
@@ -1334,6 +1387,14 @@ impl BlockSyncReactor {
                 metrics::counter!("sync.block.done.serve_queue_full").increment(1);
                 tracing::debug!(?peer, "Zakura block-sync BlocksDone queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &OrderedSendError::Full,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    None,
+                );
             }
             Err(error) => {
                 tracing::debug!(
@@ -1342,6 +1403,14 @@ impl BlockSyncReactor {
                     "failed to queue Zakura block-sync BlocksDone"
                 );
                 self.trace_message_sent(peer, &msg, "error", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &error,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    None,
+                );
                 session.cancel_token().cancel();
             }
         }
@@ -1366,6 +1435,14 @@ impl BlockSyncReactor {
                 metrics::counter!("sync.block.unavailable.serve_queue_full").increment(1);
                 tracing::debug!(?peer, "Zakura block-sync RangeUnavailable queue is full");
                 self.trace_message_sent(peer, &msg, "full", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &OrderedSendError::Full,
+                    peer_state.session.outbound_capacity(),
+                    peer_state.session.outbound_max_capacity(),
+                    None,
+                );
             }
             Err(error) => {
                 tracing::debug!(
@@ -1374,6 +1451,14 @@ impl BlockSyncReactor {
                     "failed to queue Zakura block-sync RangeUnavailable"
                 );
                 self.trace_message_sent(peer, &msg, "error", started.elapsed());
+                self.trace_queue_send_failed(
+                    peer,
+                    &msg,
+                    &error,
+                    peer_state.session.outbound_capacity(),
+                    peer_state.session.outbound_max_capacity(),
+                    None,
+                );
                 peer_state.session.cancel_token().cancel();
             }
         }
@@ -1416,19 +1501,20 @@ impl BlockSyncReactor {
         let peer_ids: Vec<_> = self
             .state
             .peers
-            .iter_mut()
+            .iter()
             .filter_map(|(peer_id, peer)| {
                 // On a real change, advertise to every peer immediately; the
                 // global meter above already debounced the change, so the
                 // per-peer `unsolicited` meter must not also suppress it. We
-                // still consume the per-peer allowance so a same-window retry to
-                // this peer stays spaced. Otherwise the only reason to send is a
-                // retry to a peer that has not acknowledged our Status, which
-                // stays gated solely by that peer's `unsolicited` meter.
-                if status_changed {
-                    peer.refresh_meter.mark_taken(now);
-                    Some(peer_id.clone())
-                } else if unready.contains(peer_id) && peer.refresh_meter.try_take(now) {
+                // still consume the per-peer allowance after the frame queues so
+                // a same-window retry to this peer stays spaced. Otherwise the
+                // only reason to send is a retry to a peer that has not
+                // acknowledged our Status, which stays gated solely by that
+                // peer's `unsolicited` meter.
+                let should_send_status = status_changed
+                    || (unready.contains(peer_id) && peer.refresh_meter.is_ready(now));
+
+                if should_send_status {
                     Some(peer_id.clone())
                 } else {
                     None
@@ -1437,7 +1523,7 @@ impl BlockSyncReactor {
             .collect();
 
         for peer in peer_ids {
-            self.send_status(&peer, "refresh");
+            self.send_status_and_mark_refresh(&peer, "refresh", now);
         }
     }
 
@@ -1482,26 +1568,20 @@ impl BlockSyncReactor {
         }
     }
 
-    fn trace_sync_state(&self) {
+    fn trace_sync_state(&self, include_diagnostics: bool) {
         if !self.startup.trace.is_enabled() {
             return;
         }
-        let floor_gap = self.floor_gap_diagnostics(Instant::now());
+        let floor_gap = include_diagnostics
+            .then(|| self.floor_gap_diagnostics(Instant::now()))
+            .flatten();
         // The per-peer download window now lives in the routines, mirrored into the
-        // registry slot diagnostics; the periodic row sums them. `outstanding` here
-        // is the registry's outstanding-request count across peers.
-        let slots = self.registry.slot_summary();
-        let outstanding = slots.outstanding_requests;
-        let slot_capacity = slots.capacity;
-        let slot_effective_window = slots.effective_window;
-        let slot_available = slots.available;
-        let slot_saturated_peers = slots.saturated_peers;
-        let counts = self.registry.direction_status_counts();
-        let inbound_peers = counts.inbound;
-        let outbound_peers = counts.outbound;
-        let inbound_peers_with_status = counts.inbound_with_status;
-        let outbound_peers_with_status = counts.outbound_with_status;
-        let peers_with_status = self.registry.peers_with_status();
+        // registry slot diagnostics; the periodic row sums them. Skip these registry
+        // walks on per-commit view changes, where the row is only needed to keep commit
+        // pipeline counters fresh.
+        let slots = include_diagnostics.then(|| self.registry.slot_summary());
+        let counts = include_diagnostics.then(|| self.registry.direction_status_counts());
+        let peers_with_status = include_diagnostics.then(|| self.registry.peers_with_status());
         // The commit-pipeline counters now live on the Sequencer task; read them
         // from the latest published view snapshot.
         let view = self.last_view;
@@ -1521,7 +1601,13 @@ impl BlockSyncReactor {
             bs_insert_u64(row, bs_trace::APPLYING, view.applying_len);
             bs_insert_u64(row, bs_trace::SUBMITTED_APPLIES, submitted_applies);
             bs_insert_u64(row, bs_trace::REORDER, view.reorder_len);
-            bs_insert_u64(row, bs_trace::OUTSTANDING, outstanding as u64);
+            if let Some(slots) = slots {
+                bs_insert_u64(
+                    row,
+                    bs_trace::OUTSTANDING,
+                    slots.outstanding_requests as u64,
+                );
+            }
             if let Some(floor_gap) = floor_gap {
                 bs_insert_height(row, bs_trace::FLOOR_GAP_HEIGHT, floor_gap.height);
                 bs_insert_str(row, bs_trace::FLOOR_GAP_STATE, floor_gap.state);
@@ -1595,32 +1681,39 @@ impl BlockSyncReactor {
             bs_insert_u64(
                 row,
                 "retained_pipeline_wire_bytes",
-                sequencer_input_queued_bytes
-                    .saturating_add(view.reorder_buffered_bytes)
-                    .saturating_add(view.applying_buffered_bytes),
+                super::admission::RetainedPipelineBytes {
+                    reorder_buffered_bytes: view.reorder_buffered_bytes,
+                    applying_buffered_bytes: view.applying_buffered_bytes,
+                    sequencer_input_queued_bytes,
+                }
+                .wire_bytes(),
             );
             bs_insert_u64(row, bs_trace::PEERS, self.state.peers.len() as u64);
-            bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);
+            if let Some(peers_with_status) = peers_with_status {
+                bs_insert_u64(row, bs_trace::PEERS_WITH_STATUS, peers_with_status as u64);
+            }
             // Peers that could be issued work but have no free slots are
             // saturated; the remainder want slots. If those exist and the budget
             // can't fund another worst-case block, the download path is
             // budget-limited (not peer- or work-limited) — the key throughput
             // signal toward the 1–2 Gbps target.
-            let peers_wanting_slots = peers_with_status.saturating_sub(slot_saturated_peers);
-            let download_blocked_on_budget = u64::from(
-                peers_wanting_slots > 0
-                    && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::PEERS_WANTING_SLOTS,
-                peers_wanting_slots as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::DOWNLOAD_BLOCKED_ON_BUDGET,
-                download_blocked_on_budget,
-            );
+            if let (Some(slots), Some(peers_with_status)) = (slots, peers_with_status) {
+                let peers_wanting_slots = peers_with_status.saturating_sub(slots.saturated_peers);
+                let download_blocked_on_budget = u64::from(
+                    peers_wanting_slots > 0
+                        && self.state.budget.available() < BS_PER_BLOCK_WORST_CASE_BYTES,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::PEERS_WANTING_SLOTS,
+                    peers_wanting_slots as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::DOWNLOAD_BLOCKED_ON_BUDGET,
+                    download_blocked_on_budget,
+                );
+            }
             bs_insert_u64(
                 row,
                 bs_trace::RECEIVED_BYTES_PER_SEC,
@@ -1641,71 +1734,77 @@ impl BlockSyncReactor {
                 bs_trace::COMMITTED_BLOCKS_PER_SEC,
                 view.committed_blocks_per_sec,
             );
-            bs_insert_u64(row, "inbound_peers", inbound_peers as u64);
-            bs_insert_u64(row, "outbound_peers", outbound_peers as u64);
-            bs_insert_u64(
-                row,
-                "inbound_peers_with_status",
-                inbound_peers_with_status as u64,
-            );
-            bs_insert_u64(
-                row,
-                "outbound_peers_with_status",
-                outbound_peers_with_status as u64,
-            );
-            bs_insert_u64(row, "request_slot_capacity", slot_capacity as u64);
-            bs_insert_u64(
-                row,
-                "request_slot_effective_window",
-                slot_effective_window as u64,
-            );
-            bs_insert_u64(row, "request_slot_available", slot_available as u64);
-            bs_insert_u64(
-                row,
-                "request_slot_saturated_peers",
-                slot_saturated_peers as u64,
-            );
-            // Scheduling visibility: distinguishes "gap not in `needed`"
-            // (state/filter) from "gap in `needed` but never queued" (`ensure`
-            // rejected it) from "queued but never requested" (starvation).
-            if let Some(min) = self.state.needed_heights.first() {
-                bs_insert_height(row, bs_trace::NEEDED_MIN, *min);
+            if let Some(counts) = counts {
+                bs_insert_u64(row, "inbound_peers", counts.inbound as u64);
+                bs_insert_u64(row, "outbound_peers", counts.outbound as u64);
+                bs_insert_u64(
+                    row,
+                    "inbound_peers_with_status",
+                    counts.inbound_with_status as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    "outbound_peers_with_status",
+                    counts.outbound_with_status as u64,
+                );
             }
-            bs_insert_u64(
-                row,
-                bs_trace::NEEDED_COUNT,
-                self.state.needed_heights.len() as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::QUEUE_LEN,
-                self.state.work_queue.pending_run_count() as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::QUEUE_BLOCKS,
-                self.state.work_queue.pending_len() as u64,
-            );
-            if let Some(start) = self.state.work_queue.min_pending() {
-                bs_insert_height(row, bs_trace::QUEUE_MIN_START, start);
+            if let Some(slots) = slots {
+                bs_insert_u64(row, "request_slot_capacity", slots.capacity as u64);
+                bs_insert_u64(
+                    row,
+                    "request_slot_effective_window",
+                    slots.effective_window as u64,
+                );
+                bs_insert_u64(row, "request_slot_available", slots.available as u64);
+                bs_insert_u64(
+                    row,
+                    "request_slot_saturated_peers",
+                    slots.saturated_peers as u64,
+                );
             }
-            bs_insert_u64(
-                row,
-                bs_trace::ASSIGNED_LEN,
-                self.state.work_queue.in_flight_len() as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::LOCAL_BODY_WORK,
-                self.local_body_work_blocks() as u64,
-            );
-            bs_insert_u64(
-                row,
-                bs_trace::REFILL_LOW_WATER,
-                self.refill_low_water_blocks() as u64,
-            );
-            if let Some(end) = self.state.work_queue.max_in_flight() {
-                bs_insert_height(row, bs_trace::COVERED_MAX_END, end);
+            if include_diagnostics {
+                // Scheduling visibility: distinguishes "gap not in `needed`"
+                // (state/filter) from "gap in `needed` but never queued" (`ensure`
+                // rejected it) from "queued but never requested" (starvation).
+                if let Some(min) = self.state.needed_heights.first() {
+                    bs_insert_height(row, bs_trace::NEEDED_MIN, *min);
+                }
+                bs_insert_u64(
+                    row,
+                    bs_trace::NEEDED_COUNT,
+                    self.state.needed_heights.len() as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::QUEUE_LEN,
+                    self.state.work_queue.pending_run_count() as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::QUEUE_BLOCKS,
+                    self.state.work_queue.pending_len() as u64,
+                );
+                if let Some(start) = self.state.work_queue.min_pending() {
+                    bs_insert_height(row, bs_trace::QUEUE_MIN_START, start);
+                }
+                bs_insert_u64(
+                    row,
+                    bs_trace::ASSIGNED_LEN,
+                    self.state.work_queue.in_flight_len() as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::LOCAL_BODY_WORK,
+                    self.local_body_work_blocks() as u64,
+                );
+                bs_insert_u64(
+                    row,
+                    bs_trace::REFILL_LOW_WATER,
+                    self.refill_low_water_blocks() as u64,
+                );
+                if let Some(end) = self.state.work_queue.max_in_flight() {
+                    bs_insert_height(row, bs_trace::COVERED_MAX_END, end);
+                }
             }
         });
     }
@@ -1728,6 +1827,38 @@ impl BlockSyncReactor {
         self.emit_trace(bs_trace::BLOCK_STATUS_SEND_FAILED, |row| {
             bs_insert_peer(row, bs_trace::PEER, peer);
             bs_insert_str(row, bs_trace::REASON, reason);
+        });
+    }
+
+    fn trace_queue_send_failed(
+        &self,
+        peer: &ZakuraPeerId,
+        msg: &BlockSyncMessage,
+        error: &OrderedSendError,
+        queue_capacity: usize,
+        queue_max_capacity: usize,
+        reason: Option<&'static str>,
+    ) {
+        self.startup.trace.emit_with(QUEUE_SEND_TABLE, |row| {
+            bs_insert_str(row, qs_trace::EVENT, qs_trace::QUEUE_SEND_FAILED);
+            bs_insert_str(row, qs_trace::SERVICE, "block_sync");
+            bs_insert_str(row, qs_trace::MESSAGE, block_sync_message_label(msg));
+            bs_insert_peer(row, qs_trace::PEER, peer);
+            bs_insert_str(row, qs_trace::ERROR, ordered_send_error_label(error));
+            if let Some(reason) = reason {
+                bs_insert_str(row, qs_trace::REASON, reason);
+            }
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_CAPACITY,
+                u64::try_from(queue_capacity).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_MAX_CAPACITY,
+                u64::try_from(queue_max_capacity).unwrap_or(u64::MAX),
+            );
+            trace_block_sync_message_fields(row, msg);
         });
     }
 

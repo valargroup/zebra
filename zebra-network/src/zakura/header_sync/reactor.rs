@@ -1,7 +1,11 @@
+use super::super::trace::{
+    ordered_send_error_label, queue_send_trace as qs_trace, QUEUE_SEND_TABLE,
+};
 use super::{config::*, error::*, events::*, scheduler::*, state::*, validation::*, wire::*, *};
 use crate::zakura::{
-    FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, ServiceAdmissionDecision,
-    ServicePeerDirection, ServicePeerSnapshot, ZakuraHeaderSyncCandidateState,
+    FrontierChange, FrontierUpdate, HeaderSyncServiceSummary, OrderedSendError,
+    ServiceAdmissionDecision, ServicePeerDirection, ServicePeerSnapshot,
+    ZakuraHeaderSyncCandidateState,
 };
 
 /// Spawn a header-sync reactor and return its handle plus action stream.
@@ -112,6 +116,7 @@ impl HeaderSyncReactor {
                 }
                 _ = ticks.tick() => {
                     self.handle_timeouts().await;
+                    self.retry_unsent_statuses();
                 }
             }
         }
@@ -476,6 +481,19 @@ impl HeaderSyncReactor {
                     ?error,
                     "failed to queue Zakura header-sync NewBlock"
                 );
+                self.trace_queue_send_failed(
+                    &destination,
+                    "new_block",
+                    &error,
+                    destination_peer.session.outbound_capacity(),
+                    destination_peer.session.outbound_max_capacity(),
+                    |row| {
+                        insert_peer(row, qs_trace::SOURCE_PEER, &peer);
+                        insert_peer(row, qs_trace::DESTINATION_PEER, &destination);
+                        insert_height(row, qs_trace::HEIGHT, height);
+                        insert_hash(row, qs_trace::HASH, hash);
+                    },
+                );
                 continue;
             }
             metrics::counter!("sync.header.tip.new_block.forwarded").increment(1);
@@ -674,6 +692,8 @@ impl HeaderSyncReactor {
             body_sizes,
             tree_aux_roots,
         );
+        let queue_capacity = peer_state.session.outbound_capacity();
+        let queue_max_capacity = peer_state.session.outbound_max_capacity();
         peer_state.finish_serving_headers();
 
         match send_result {
@@ -692,6 +712,18 @@ impl HeaderSyncReactor {
                     ?requested_count,
                     ?error,
                     "failed to queue Zakura header-sync Headers response"
+                );
+                self.trace_queue_send_failed(
+                    &peer,
+                    "headers",
+                    &error,
+                    queue_capacity,
+                    queue_max_capacity,
+                    |row| {
+                        insert_height(row, qs_trace::RANGE_START, start_height);
+                        insert_u64(row, qs_trace::RANGE_COUNT, u64::from(requested_count));
+                        insert_u64(row, qs_trace::RETURNED, u64::from(returned_count));
+                    },
                 );
             }
         }
@@ -1272,6 +1304,17 @@ impl HeaderSyncReactor {
                     ?error,
                     "failed to queue Zakura header-sync GetHeaders"
                 );
+                self.trace_queue_send_failed(
+                    &peer_id,
+                    "get_headers",
+                    &error,
+                    peer.session.outbound_capacity(),
+                    peer.session.outbound_max_capacity(),
+                    |row| {
+                        insert_height(row, qs_trace::RANGE_START, range.start_height);
+                        insert_u64(row, qs_trace::RANGE_COUNT, u64::from(count));
+                    },
+                );
                 self.state.schedule.retry(range);
                 continue;
             }
@@ -1305,33 +1348,61 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn send_status(&mut self, peer: &ZakuraPeerId) {
+    fn send_status(&mut self, peer: &ZakuraPeerId) -> bool {
         let status = self.local_status();
         // Suppress a status identical to the last one we sent this peer over its
         // current session: it advances nothing and the peer's inbound status
         // rate limiter would treat the redundant message as spam.
-        match self.state.peers.get_mut(peer) {
+        let session = match self.state.peers.get(peer) {
             Some(peer_state) if peer_state.status_differs_from_last_sent(status) => {
-                peer_state.record_sent_status(status);
+                peer_state.session.clone()
             }
             Some(_) => {
                 metrics::counter!("sync.header.peer.status.suppressed_redundant").increment(1);
-                return;
+                return false;
             }
-            None => return,
-        }
-        metrics::counter!("sync.header.peer.status.sent").increment(1);
-        self.trace_status_sent(peer, status);
-        if let Some(peer_state) = self.state.peers.get(peer) {
-            if let Err(error) = peer_state.session.try_send_status(status) {
+            None => return false,
+        };
+        match session.try_send_status(status) {
+            Ok(()) => {
+                if let Some(peer_state) = self.state.peers.get_mut(peer) {
+                    peer_state.record_sent_status(status);
+                }
+                metrics::counter!("sync.header.peer.status.sent").increment(1);
+                self.trace_status_sent(peer, status);
+                #[cfg(test)]
+                let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
+                    peer: peer.clone(),
+                    msg: HeaderSyncMessage::Status(status),
+                });
+                true
+            }
+            Err(error) => {
+                metrics::counter!("sync.header.peer.status.send_failed").increment(1);
                 tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
+                self.trace_queue_send_failed(
+                    peer,
+                    "status",
+                    &error,
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
+                    |_| {},
+                );
+                false
             }
         }
-        #[cfg(test)]
-        let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
-            peer: peer.clone(),
-            msg: HeaderSyncMessage::Status(status),
-        });
+    }
+
+    fn send_status_and_mark_unsolicited(&mut self, peer: &ZakuraPeerId, now: Instant) -> bool {
+        if !self.send_status(peer) {
+            return false;
+        }
+
+        if let Some(peer_state) = self.state.peers.get_mut(peer) {
+            peer_state.meters.unsolicited.mark_taken(now);
+        }
+
+        true
     }
 
     async fn publish_best_tip(&mut self, height: block::Height, hash: block::Hash) {
@@ -1370,13 +1441,31 @@ impl HeaderSyncReactor {
         }
     }
 
+    fn retry_unsent_statuses(&mut self) {
+        let now = Instant::now();
+        let status = self.local_status();
+        let peer_ids: Vec<_> = self
+            .state
+            .peers
+            .iter()
+            .filter(|(_peer_id, peer)| {
+                peer.status_differs_from_last_sent(status) && peer.meters.unsolicited.is_ready(now)
+            })
+            .map(|(peer_id, _peer)| peer_id.clone())
+            .collect();
+
+        for peer in peer_ids {
+            self.send_status_and_mark_unsolicited(&peer, now);
+        }
+    }
+
     async fn broadcast_status_refresh(&mut self) {
         let now = Instant::now();
         let status = self.local_status();
         let peer_ids: Vec<_> = self
             .state
             .peers
-            .iter_mut()
+            .iter()
             .filter_map(|(peer_id, peer)| {
                 // Never re-send a peer a status identical to its last one: the
                 // peer's inbound rate limiter would treat it as spam. A redundant
@@ -1385,26 +1474,15 @@ impl HeaderSyncReactor {
                     metrics::counter!("sync.header.peer.status.suppressed_redundant").increment(1);
                     return None;
                 }
-                if !peer.meters.unsolicited.try_take(now) {
+                if !peer.meters.unsolicited.is_ready(now) {
                     return None;
                 }
-                peer.record_sent_status(status);
                 Some(peer_id.clone())
             })
             .collect();
 
         for peer in peer_ids {
-            let Some(peer_state) = self.state.peers.get(&peer) else {
-                continue;
-            };
-            if let Err(error) = peer_state.session.try_send_status(status) {
-                tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
-            }
-            #[cfg(test)]
-            let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
-                peer,
-                msg: HeaderSyncMessage::Status(status),
-            });
+            self.send_status_and_mark_unsolicited(&peer, now);
         }
     }
 
@@ -1924,6 +2002,38 @@ impl HeaderSyncReactor {
                 hs_trace::RANGE_COUNT,
                 u64::from(count_between(from, to)),
             );
+        });
+    }
+
+    fn trace_queue_send_failed(
+        &self,
+        peer: &ZakuraPeerId,
+        message: &'static str,
+        error: &OrderedSendError,
+        queue_capacity: usize,
+        queue_max_capacity: usize,
+        build: impl FnOnce(&mut serde_json::Map<String, Value>),
+    ) {
+        self.startup.trace.emit_with(QUEUE_SEND_TABLE, |row| {
+            row.insert(
+                qs_trace::EVENT.to_string(),
+                Value::String(qs_trace::QUEUE_SEND_FAILED.to_string()),
+            );
+            insert_optional_str(row, qs_trace::SERVICE, Some("header_sync"));
+            insert_optional_str(row, qs_trace::MESSAGE, Some(message));
+            insert_peer(row, qs_trace::PEER, peer);
+            insert_optional_str(row, qs_trace::ERROR, Some(ordered_send_error_label(error)));
+            insert_u64(
+                row,
+                qs_trace::QUEUE_CAPACITY,
+                u64::try_from(queue_capacity).unwrap_or(u64::MAX),
+            );
+            insert_u64(
+                row,
+                qs_trace::QUEUE_MAX_CAPACITY,
+                u64::try_from(queue_max_capacity).unwrap_or(u64::MAX),
+            );
+            build(row);
         });
     }
 

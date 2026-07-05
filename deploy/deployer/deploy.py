@@ -46,7 +46,9 @@ DEFAULTS = {
     "state_cache_dir": "/var/lib/zebrad",
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
+    "network_cache_dir": "",
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
+    "rpc_enable_cookie_auth": None,
     "port": None,           # ssh port; None -> ssh default
     # Match zebrad's own defaults so existing fleets render unchanged.
     "storage_mode": "archive",
@@ -54,6 +56,9 @@ DEFAULTS = {
     "legacy_p2p": True,
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
     "tracing_filter": "",    # e.g. "info,zebra_network::zakura=debug"; "" uses zebrad default
+    "checkpoint_sync": True,
+    # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
+    "vct_fast_sync": True,
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
@@ -76,12 +81,16 @@ class Node:
     state_cache_dir: str
     network: str
     listen_addr: str
+    network_cache_dir: str
     rpc_listen_addr: str
+    rpc_enable_cookie_auth: object
     storage_mode: str
     v2_p2p: bool
     legacy_p2p: bool
     metrics_endpoint: str
     tracing_filter: str
+    checkpoint_sync: bool
+    vct_fast_sync: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
     port: object = None
     # resolved at runtime
@@ -149,12 +158,16 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             state_cache_dir=merged["state_cache_dir"],
             network=merged["network"],
             listen_addr=merged["listen_addr"],
+            network_cache_dir=merged["network_cache_dir"],
             rpc_listen_addr=merged["rpc_listen_addr"],
+            rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
             storage_mode=merged["storage_mode"],
             v2_p2p=merged["v2_p2p"],
             legacy_p2p=merged["legacy_p2p"],
             metrics_endpoint=merged["metrics_endpoint"],
             tracing_filter=merged["tracing_filter"],
+            checkpoint_sync=merged["checkpoint_sync"],
+            vct_fast_sync=merged["vct_fast_sync"],
             zakura=merged.get("zakura"),
             port=merged["port"],
         ))
@@ -323,14 +336,23 @@ def render_zakura_block(zakura: object) -> str:
 def render_node_config(node: Node) -> str:
     rpc_block = ""
     if node.rpc_listen_addr:
-        rpc_block = f'listen_addr = "{node.rpc_listen_addr}"'
+        rpc_lines = [f'listen_addr = "{node.rpc_listen_addr}"']
+        if node.rpc_enable_cookie_auth is not None:
+            rpc_lines.append(
+                f"enable_cookie_auth = {'true' if node.rpc_enable_cookie_auth else 'false'}"
+            )
+        rpc_block = "\n".join(rpc_lines)
     else:
         rpc_block = "# listen_addr disabled"
     metrics_block = f'[metrics]\nendpoint_addr = "{node.metrics_endpoint}"\n' if node.metrics_endpoint else ""
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zebrad default)"
+    network_cache_line = (
+        f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zebrad default)"
+    )
     return render_template("zebrad.toml", {
         "NETWORK": node.network,
         "LISTEN_ADDR": node.listen_addr,
+        "NETWORK_CACHE_DIR": network_cache_line,
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
         "V2_P2P": "true" if node.v2_p2p else "false",
@@ -340,6 +362,8 @@ def render_node_config(node: Node) -> str:
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,
+        "CHECKPOINT_SYNC": "true" if node.checkpoint_sync else "false",
+        "VCT_FAST_SYNC": "true" if node.vct_fast_sync else "false",
     })
 
 
@@ -388,11 +412,31 @@ if [ "$NO_RESTART" = "1" ]; then
     exit 0
 fi
 
-if ! systemctl restart "$SERVICE"; then
-    echo "restart failed; rolling back to ${{BIN_PATH}}.bak" >&2
+start_service() {{
+    systemctl stop "$SERVICE" || true
+
+    # Some long-running testnet nodes can survive a plain systemctl restart long
+    # enough for the deploy to report success while the old process keeps the
+    # state DB open. Bound that window, then kill only processes running this
+    # deployed binary before starting the updated unit.
+    for _ in 1 2 3 4 5; do
+        if ! pgrep -f "^${{BIN_PATH}}( |$)" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    pkill -TERM -f "^${{BIN_PATH}}( |$)" >/dev/null 2>&1 || true
+    sleep 1
+    pkill -KILL -f "^${{BIN_PATH}}( |$)" >/dev/null 2>&1 || true
+
+    systemctl start "$SERVICE"
+}}
+
+if ! start_service; then
+    echo "start failed; rolling back to ${{BIN_PATH}}.bak" >&2
     if [ -x "${{BIN_PATH}}.bak" ]; then
         install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
-        systemctl restart "$SERVICE" || true
+        start_service || true
     fi
     exit 1
 fi

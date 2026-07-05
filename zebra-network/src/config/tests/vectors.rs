@@ -1,6 +1,6 @@
 //! Fixed test vectors for zebra-network configuration.
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use static_assertions::const_assert;
 use zebra_chain::{
@@ -12,16 +12,25 @@ use zebra_chain::{
 };
 
 use crate::{
+    config::zakura_listens_on_loopback_with_non_loopback_bootstrap_peers,
     constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
     zakura::{
-        DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_LISTEN_ADDR,
+        DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config,
 };
 
 fn default_zakura_bootstrap_peers() -> Vec<String> {
     DEFAULT_ZAKURA_BOOTSTRAP_PEERS
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn default_testnet_zakura_bootstrap_peers() -> Vec<String> {
+    DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS
         .iter()
         .map(ToString::to_string)
         .collect()
@@ -79,7 +88,7 @@ fn ensure_peer_connection_limits_consistent() {
 fn testnet_params_serialization_roundtrip() {
     let _init_guard = zebra_test::init();
 
-    let config = Config {
+    let mut config = Config {
         network: testnet::Parameters::build()
             .with_disable_pow(true)
             .to_network()
@@ -87,6 +96,7 @@ fn testnet_params_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -150,6 +160,109 @@ fn p2p_protocol_flags_default_on_and_roundtrip() {
 }
 
 #[test]
+fn zakura_bootstrap_peers_default_to_selected_network() {
+    let _init_guard = zebra_test::init();
+
+    let mainnet_config: Config = toml::from_str("network = 'Mainnet'").unwrap();
+    assert_eq!(
+        mainnet_config.zakura.bootstrap_peers,
+        default_zakura_bootstrap_peers()
+    );
+
+    let testnet_config: Config = toml::from_str("network = 'Testnet'").unwrap();
+    assert_eq!(
+        testnet_config.zakura.bootstrap_peers,
+        default_testnet_zakura_bootstrap_peers()
+    );
+}
+
+#[test]
+fn explicit_zakura_bootstrap_peers_override_network_defaults() {
+    let _init_guard = zebra_test::init();
+
+    let empty_config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        bootstrap_peers = []
+        "#,
+    )
+    .unwrap();
+    assert!(empty_config.zakura.bootstrap_peers.is_empty());
+
+    let custom_config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        custom_config.zakura.bootstrap_peers,
+        vec!["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
+    );
+}
+
+#[test]
+fn zakura_warns_on_loopback_listener_with_public_bootstrap_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        listen_addr = "127.0.0.1:18234"
+        "#,
+    )
+    .unwrap();
+
+    assert!(zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&config.zakura));
+}
+
+#[test]
+fn zakura_loopback_listener_allows_loopback_bootstrap_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        listen_addr = "127.0.0.1:18234"
+        bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8234"]
+        "#,
+    )
+    .unwrap();
+
+    assert!(!zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&config.zakura));
+}
+
+#[test]
+fn zakura_public_listener_allows_public_bootstrap_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        listen_addr = "0.0.0.0:18234"
+        "#,
+    )
+    .unwrap();
+
+    assert!(!zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&config.zakura));
+    assert_eq!(
+        config.zakura.listen_addr,
+        Some("0.0.0.0:18234".parse::<SocketAddr>().unwrap())
+    );
+}
+
+#[test]
 fn zakura_dev_network_defaults_off_and_roundtrips() {
     let _init_guard = zebra_test::init();
 
@@ -203,6 +316,10 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         default_zakura_bootstrap_peers()
     );
     assert!(config.zakura.max_connections > 0);
+    assert_eq!(
+        config.zakura.max_connections_per_ip,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+    );
     assert!(config.zakura.max_pending_handshakes > 0);
     assert_eq!(
         config.zakura.header_sync.max_headers_per_response,
@@ -280,6 +397,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
         max_connections = 7
+        max_connections_per_ip = 5
         max_pending_handshakes = 3
         stream_open_rate_per_second = 11
         message_rate_per_second = 13
@@ -304,6 +422,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
     assert!(serialized.contains("max_connections = 7"));
+    assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
     assert!(serialized.contains("[zakura.header_sync]"));
     assert!(serialized.contains("max_headers_per_response = 333"));
@@ -396,6 +515,10 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert!(config.legacy_p2p);
     assert_eq!(config.zakura.bootstrap_peers.len(), 1);
     assert_eq!(config.zakura.max_connections, 4);
+    assert_eq!(
+        config.zakura.max_connections_per_ip,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+    );
     assert_eq!(config.zakura.max_pending_handshakes, 2);
     assert_eq!(config.zakura.stream_open_rate_per_second, 3);
     assert_eq!(config.zakura.message_rate_per_second, 5);
@@ -409,6 +532,10 @@ fn default_config_uses_ipv6() {
     assert_eq!(config.listen_addr.to_string(), "[::]:8233");
     assert!(config.listen_addr.is_ipv6());
     assert_eq!(config.zakura.listen_addr, Some(DEFAULT_ZAKURA_LISTEN_ADDR));
+    assert_eq!(
+        config.zakura.max_connections_per_ip,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+    );
 }
 
 #[test]
@@ -421,7 +548,7 @@ fn funding_streams_serialization_roundtrip() {
         .map(ConfiguredFundingStreams::from)
         .collect();
 
-    let config = Config {
+    let mut config = Config {
         network: testnet::Parameters::build()
             .with_funding_streams(fs)
             .to_network()
@@ -429,6 +556,7 @@ fn funding_streams_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -444,7 +572,7 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
 
     let soft_fork_height = Height(2_000_000);
 
-    let config = Config {
+    let mut config = Config {
         network: testnet::Parameters::build()
             .with_temporary_orchard_disabling_soft_fork_height(soft_fork_height)
             .to_network()
@@ -452,6 +580,7 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();

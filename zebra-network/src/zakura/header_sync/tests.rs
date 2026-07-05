@@ -1,8 +1,10 @@
 use super::*;
 use super::{config::*, error::*, events::*, reactor::*, validation::*, wire::*};
 use crate::zakura::{
+    framed_channel,
     testkit::{TraceCapture, TraceValue},
-    HeaderSyncServiceSummary, ServicePeerDirection, ServicePeerLimits,
+    FramedSend, HeaderSyncServiceSummary, Peer, Service, ServicePeerDirection, ServicePeerLimits,
+    ServicePeerSnapshot, ZakuraConnId, ZakuraHeaderSyncCandidateState, ZAKURA_CAP_HEADER_SYNC,
 };
 use chrono::Duration;
 use metrics::{
@@ -10,7 +12,7 @@ use metrics::{
 };
 use rand::rngs::OsRng;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{Mutex, OnceLock},
 };
 use zebra_chain::{
@@ -853,6 +855,90 @@ async fn connect_peer_with_direction(
         .await
         .unwrap();
     cancel
+}
+
+fn test_header_sync_handle() -> (HeaderSyncHandle, mpsc::UnboundedReceiver<HeaderSyncEvent>) {
+    let (events, _events_rx) = mpsc::channel(16);
+    let (lifecycle, lifecycle_rx) = mpsc::unbounded_channel();
+    let (_tip_tx, tip) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::default());
+    let (_candidates_tx, candidates) = watch::channel(ZakuraHeaderSyncCandidateState::default());
+    (
+        HeaderSyncHandle {
+            events,
+            lifecycle,
+            tip,
+            peers,
+            candidates,
+        },
+        lifecycle_rx,
+    )
+}
+
+fn header_sync_peer_with_conn(
+    peer_id: ZakuraPeerId,
+    conn_id: ZakuraConnId,
+    cancel_token: CancellationToken,
+) -> (Peer, FramedSend) {
+    let (peer_send, service_recv) = framed_channel(8);
+    let (service_send, _peer_recv) = framed_channel(8);
+    (
+        Peer::new_with_conn_id_and_direction(
+            conn_id,
+            peer_id,
+            None,
+            ZAKURA_CAP_HEADER_SYNC,
+            ServicePeerDirection::Outbound,
+            HashMap::from([(ZAKURA_STREAM_HEADER_SYNC, (service_recv, service_send))]),
+            cancel_token,
+        ),
+        peer_send,
+    )
+}
+
+#[tokio::test]
+async fn stale_header_sync_teardown_keeps_replacement_session() {
+    let (handle, mut lifecycle) = test_header_sync_handle();
+    let service = HeaderSyncService::new(handle);
+    let peer_id = peer(94);
+    let old_conn_id = 1;
+    let new_conn_id = 2;
+    let old_cancel = CancellationToken::new();
+    let new_cancel = CancellationToken::new();
+    let (old_peer, _old_peer_send) =
+        header_sync_peer_with_conn(peer_id.clone(), old_conn_id, old_cancel.clone());
+
+    service.add_peer(old_peer);
+    let _old_session = match lifecycle.recv().await {
+        Some(HeaderSyncEvent::PeerConnected(session)) if session.peer_id() == &peer_id => session,
+        event => panic!("expected old header-sync peer connection, got {event:?}"),
+    };
+
+    let (new_peer, _new_peer_send) =
+        header_sync_peer_with_conn(peer_id.clone(), new_conn_id, new_cancel.clone());
+    service.add_peer(new_peer);
+    let _new_session = match lifecycle.recv().await {
+        Some(HeaderSyncEvent::PeerConnected(session)) if session.peer_id() == &peer_id => session,
+        event => panic!("expected replacement header-sync peer connection, got {event:?}"),
+    };
+
+    let (stale_peer, _stale_peer_send) =
+        header_sync_peer_with_conn(peer_id.clone(), old_conn_id, CancellationToken::new());
+    service.add_peer(stale_peer);
+
+    service.remove_peer(&peer_id, old_conn_id);
+    match tokio::time::timeout(std::time::Duration::from_millis(50), lifecycle.recv()).await {
+        Err(_) => {}
+        Ok(event) => {
+            panic!("stale cleanup must not emit a header-sync lifecycle event: {event:?}");
+        }
+    }
+
+    service.remove_peer(&peer_id, new_conn_id);
+    assert!(matches!(
+        lifecycle.recv().await,
+        Some(HeaderSyncEvent::PeerDisconnected(disconnected)) if disconnected == peer_id
+    ));
 }
 
 async fn advertise_tip(
@@ -2492,6 +2578,67 @@ async fn reconnect_resends_initial_status_after_session_reset() {
             ..
         }
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retries_initial_status_after_full_outbound_queue() {
+    let send_failed_before = metric_value("sync.header.peer.status.send_failed");
+    let network = regtest_network();
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    );
+    startup.range_state_actions_enabled = false;
+    startup.request_timeout = std::time::Duration::from_millis(10);
+    startup.status_refresh_interval = std::time::Duration::from_millis(10);
+    let fixture = spawn_test_reactor(startup);
+    let peer_id = peer(74);
+    let (send, mut recv) = crate::zakura::framed_channel(1);
+    send.try_send(
+        HeaderSyncMessage::Status(HeaderSyncStatus::default())
+            .encode_frame()
+            .expect("filler status frame encodes"),
+    )
+    .expect("outbound queue starts full");
+    let cancel = CancellationToken::new();
+    let session = HeaderSyncPeerSession::from_parts_with_direction(
+        peer_id,
+        ServicePeerDirection::Inbound,
+        send,
+        cancel,
+    );
+    fixture
+        .handle
+        .send(HeaderSyncEvent::PeerConnected(session))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if fixture.handle.peer_snapshot().inbound_peers == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("peer is admitted while outbound queue is full");
+
+    let _ = recv.recv().await.expect("filler frame drains");
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(1), recv.recv())
+        .await
+        .expect("status retry arrives")
+        .expect("outbound channel remains open");
+    assert!(matches!(
+        HeaderSyncMessage::decode_frame(frame, HeaderSyncDecodeContext::control())
+            .expect("retry status decodes"),
+        HeaderSyncMessage::Status(_)
+    ));
+    assert!(
+        metric_value("sync.header.peer.status.send_failed") > send_failed_before,
+        "a full outbound queue must increment the header-sync Status send-failure counter"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
