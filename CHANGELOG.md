@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Moved the auto-generated Zakura iroh node identity key out of Zebra's cache
+  tree and into `network.identity_dir` (defaulting to
+  `~/.zakura/<network>.zakura-iroh-secret-key`), so cache or state snapshots do
+  not clone a node's long-term P2P identity.
 - Fixed a restarted or resyncing Zakura peer being locked out of block sync for
   up to ~150s (occasionally longer) when it redialed the fleet from its stable
   IP. The receiving node kept the peer's previous, now-dead connection as the
