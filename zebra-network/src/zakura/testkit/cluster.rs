@@ -202,6 +202,19 @@ mod tests {
         }
     }
 
+    /// A `Headers` message carrying no tree-aux roots — the correct shape of a response to an
+    /// above-checkpoint (plain) range. Used by hostile-peer tests whose victims are past the VCT
+    /// handoff boundary, so a root-carrying response would be rejected as malformed before the
+    /// intended violation (out-of-range, too-long, bad-PoW, …) is even checked.
+    fn rootless_headers_message(headers: Vec<Arc<block::Header>>) -> HeaderSyncMessage {
+        let body_sizes = vec![0; headers.len()];
+        HeaderSyncMessage::Headers {
+            headers,
+            body_sizes,
+            tree_aux_roots: Vec::new(),
+        }
+    }
+
     fn root_at(height: block::Height) -> BlockCommitmentRoots {
         BlockCommitmentRoots {
             height,
@@ -907,7 +920,10 @@ mod tests {
                     }
                 }
                 HeaderSyncAction::QueryHeadersByHeightRange {
-                    peer, start, count, ..
+                    peer,
+                    start,
+                    count,
+                    want_tree_aux_roots,
                 } => {
                     let headers = local
                         .store
@@ -916,11 +932,22 @@ mod tests {
                         .headers_by_range(start, count);
                     let returned_count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                     if let Some(target) = peer_to_index.get(&peer) {
+                        // Respect the request: an above-checkpoint (plain) range must be served
+                        // without roots, or the requester rejects the response as malformed.
+                        let msg = if want_tree_aux_roots {
+                            headers_message(headers)
+                        } else {
+                            HeaderSyncMessage::Headers {
+                                body_sizes: vec![0; headers.len()],
+                                headers,
+                                tree_aux_roots: Vec::new(),
+                            }
+                        };
                         let _ = nodes[*target]
                             .handle
                             .send(HeaderSyncEvent::WireMessage {
                                 peer: local.peer_id.clone(),
-                                msg: headers_message(headers),
+                                msg,
                             })
                             .await;
                         let _ = local
@@ -961,6 +988,7 @@ mod tests {
                                     start_height,
                                     tip_height,
                                     tip_hash,
+                                    tip_parent_hash: None,
                                 })
                                 .await;
                             let _ = local
@@ -981,18 +1009,18 @@ mod tests {
                         }
                     }
                 }
-                HeaderSyncAction::QueryBestHeaderTip => {
-                    let (tip_height, tip_hash) = local
-                        .store
-                        .lock()
-                        .expect("test store mutex is not poisoned")
-                        .best_header_tip();
+                HeaderSyncAction::QueryBestHeaderHistoryTree {
+                    best_header_tip, ..
+                } => {
+                    // The e2e header store uses pre-Heartwood vectors, so the empty tree is the
+                    // correct reconstruction; a post-Heartwood tree would be rejected on height.
                     let _ = local
                         .handle
-                        .send(HeaderSyncEvent::HeaderRangeCommitted {
-                            start_height: tip_height,
-                            tip_height,
-                            tip_hash,
+                        .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
+                            best_header_tip,
+                            history_tree: Some(Arc::new(
+                                zebra_chain::history_tree::HistoryTree::default(),
+                            )),
                         })
                         .await;
                 }
@@ -1345,7 +1373,7 @@ mod tests {
                             .send(HeaderSyncEvent::NewBlockDuplicate { peer, height, hash })
                             .await;
                     }
-                    HeaderSyncAction::QueryBestHeaderTip
+                    HeaderSyncAction::QueryBestHeaderHistoryTree { .. }
                     | HeaderSyncAction::QueryMissingBlockBodies { .. }
                     | HeaderSyncAction::BodyGaps { .. }
                     | HeaderSyncAction::HeaderAdvanced { .. }
@@ -3028,7 +3056,9 @@ mod tests {
             .inject(
                 victim,
                 unsolicited,
-                headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone()]),
+                rootless_headers_message(vec![mainnet_block(&BLOCK_MAINNET_1_BYTES)
+                    .header
+                    .clone()]),
             )
             .await;
         await_until(
@@ -3064,7 +3094,9 @@ mod tests {
             .inject(
                 victim,
                 out_of_range,
-                headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()]),
+                rootless_headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES)
+                    .header
+                    .clone()]),
             )
             .await;
         cluster
@@ -3107,7 +3139,7 @@ mod tests {
             .inject(
                 victim,
                 response_too_long,
-                headers_message(vec![
+                rootless_headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
                 ]),
@@ -3145,7 +3177,7 @@ mod tests {
             .inject(
                 bad_continuity_victim,
                 bad_continuity,
-                headers_message(vec![
+                rootless_headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     Arc::new(non_contiguous),
                 ]),
@@ -3177,7 +3209,7 @@ mod tests {
             .inject(
                 bad_pow_victim,
                 bad_pow,
-                headers_message(vec![Arc::new(bad_pow_header)]),
+                rootless_headers_message(vec![Arc::new(bad_pow_header)]),
             )
             .await;
         cluster
@@ -3210,7 +3242,7 @@ mod tests {
             .inject(
                 bad_daa_victim,
                 bad_daa,
-                headers_message(vec![
+                rootless_headers_message(vec![
                     mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
                     mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
