@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed Regtest Zakura defaults so they no longer inherit Mainnet bootstrap
+  peers. Regtest nodes now start with an empty Zakura bootstrap peer list and
+  log a separate warning when no Zakura bootstrap peers are configured.
 - Fixed Zakura header-sync and block-sync peers getting stuck unable to serve
   requests when an initial `Status` advertisement was dropped by a full outbound
   queue. Status send bookkeeping now only records queued frames, header sync
