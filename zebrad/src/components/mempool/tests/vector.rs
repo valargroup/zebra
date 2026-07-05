@@ -329,7 +329,8 @@ async fn mempool_queue_single() -> Result<(), Report> {
 }
 
 #[tokio::test]
-async fn mempool_service_disabled() -> Result<(), Report> {
+async fn mempool_service_stays_enabled_when_legacy_sync_status_falls_behind() -> Result<(), Report>
+{
     // Using the mainnet for now
     let network = Network::Mainnet;
 
@@ -394,13 +395,16 @@ async fn mempool_service_disabled() -> Result<(), Report> {
     assert!(queued_responses[0].is_ok());
     assert_eq!(service.tx_downloads().in_flight(), 1);
 
-    // Disable the mempool
-    service.disable(&mut recent_syncs).await;
+    // Pretend legacy sync discovery is far from tip. Once active, the mempool
+    // should not shut down based on that heuristic alone.
+    service.sync_far_from_tip(&mut recent_syncs).await;
 
-    // Test if mempool is disabled again
-    assert!(!service.is_enabled());
+    // Test if mempool stays enabled.
+    assert!(service.is_enabled());
+    assert_eq!(service.tx_downloads().in_flight(), 1);
 
-    // Test if the mempool returns no transactions when disabled
+    // Test if the mempool keeps returning its transactions when legacy sync
+    // status falls behind.
     let response = service
         .ready()
         .await
@@ -412,37 +416,15 @@ async fn mempool_service_disabled() -> Result<(), Report> {
         Response::TransactionIds(ids) => {
             assert_eq!(
                 ids.len(),
-                0,
-                "mempool should return no transactions when disabled"
+                1,
+                "mempool should keep transactions when legacy sync status falls behind"
             )
         }
         _ => unreachable!("will never happen in this test"),
     };
 
-    // Test if the mempool returns to Queue requests correctly when disabled
-    let response = service
-        .ready()
-        .await
-        .unwrap()
-        .call(Request::Queue(vec![txid.into()]))
-        .await
-        .unwrap();
-    let queued_responses = match response {
-        Response::Queued(queue_responses) => queue_responses,
-        _ => unreachable!("will never happen in this test"),
-    };
-
-    assert_eq!(queued_responses.len(), 1);
-    assert_eq!(
-        queued_responses
-            .into_iter()
-            .next()
-            .unwrap()
-            .unbox_mempool_error(),
-        MempoolError::Disabled
-    );
-
-    // Test if mempool returns to QueueStats request correctly when disabled
+    // Test if mempool returns QueueStats correctly when legacy sync status
+    // falls behind.
     let response = service
         .ready()
         .await
@@ -461,12 +443,15 @@ async fn mempool_service_disabled() -> Result<(), Report> {
         _ => unreachable!("expected QueueStats response"),
     };
 
-    assert_eq!(size, 0, "size should be zero when mempool is disabled");
-    assert_eq!(bytes, 0, "bytes should be zero when mempool is disabled");
-    assert_eq!(usage, 0, "usage should be zero when mempool is disabled");
+    assert_eq!(
+        size, 1,
+        "size should not be cleared when legacy sync status falls behind"
+    );
+    assert!(bytes > 0, "bytes should not be cleared");
+    assert!(usage > 0, "usage should not be cleared");
     assert_eq!(
         fully_notified, None,
-        "fully_notified should be None when mempool is disabled"
+        "fully_notified is not implemented for active mempool stats yet"
     );
 
     Ok(())

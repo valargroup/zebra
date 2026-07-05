@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Kept an already-active mempool and `getblocktemplate` mining RPCs running
+  when the legacy sync status temporarily reports Zebra is far from the tip.
+  Initial mempool activation still waits until Zebra is within 100 blocks of
+  the tip.
 - Fixed a restarted or resyncing Zakura peer being locked out of block sync for
   up to ~150s (occasionally longer) when it redialed the fleet from its stable
   IP. The receiving node kept the peer's previous, now-dead connection as the
