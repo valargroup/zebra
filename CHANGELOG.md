@@ -39,6 +39,24 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   when the legacy sync status temporarily reports Zebra is far from the tip.
   Initial mempool activation still waits until Zebra is within 100 blocks of
   the tip.
+- Fixed healthy but quiet Zakura connections being closed by the application
+  idle reaper every idle window. The reaper only counts inbound application
+  messages and the periodic header-sync status refresh suppressed unchanged
+  statuses, so two peers idle at the same tip went mutually silent and reaped
+  their connection each idle timeout, then redialed — constant connection
+  churn between synced peers. Header sync now sends a redundant status as an
+  application keepalive on a spam-safe budget, so healthy connections stay
+  fresh while unused connections are still reaped. Service park decisions
+  (admission rejections and no-demand ordered streams) are now logged at info
+  and counted in metrics, since a parked peer is indistinguishable from a
+  wedged remote from the other side.
+- Moved the auto-generated Zakura iroh node identity key out of Zebra's cache
+  tree and into `network.identity_dir` (defaulting to
+  `~/.zakura/<network>.zakura-iroh-secret-key`), so cache or state snapshots do
+  not clone a node's long-term P2P identity.
+- Fixed Regtest Zakura defaults so they no longer inherit Mainnet bootstrap
+  peers. Regtest nodes now start with an empty Zakura bootstrap peer list and
+  log a separate warning when no Zakura bootstrap peers are configured.
 - Fixed a restarted or resyncing Zakura peer being locked out of block sync for
   up to ~150s (occasionally longer) when it redialed the fleet from its stable
   IP. The receiving node kept the peer's previous, now-dead connection as the

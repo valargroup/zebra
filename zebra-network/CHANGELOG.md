@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Added `network.identity_dir` for auto-generated Zakura iroh identity keys,
+  defaulting to `~/.zakura`. This path is independent of the peer cache
+  directory, so cache or state snapshots do not clone a node's long-term P2P
+  identity.
 - Added `network.zakura.max_connections_per_ip`, defaulting to 16, so native
   Zakura admission can allow NATed or co-hosted peers without changing the
   legacy peer-set per-IP default.
@@ -143,6 +147,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Zakura header sync now sends a redundant `Status` as an application-level
+  keepalive on a spam-safe budget (at least twice the inbound status minimum
+  interval), so healthy connections between peers idle at the same tip are no
+  longer closed by the application idle reaper every idle window. Unsent or
+  changed statuses still retry on the fast unsolicited budget. Service park
+  decisions (admission rejections and no-demand ordered streams) are now
+  logged at info and counted in the new `sync.header.peer.parked`,
+  `sync.block.peer.parked`, `zakura.discovery.peer.parked`, and
+  `zakura.p2p.stream.parked.no_demand` metrics.
 - Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
   and Regtest, matching Zebra's advertised current protocol version.
 - A peer upgraded from legacy TCP to Zakura is no longer re-dialed over legacy.
