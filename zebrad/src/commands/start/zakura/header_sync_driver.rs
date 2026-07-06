@@ -789,14 +789,29 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
                             },
                         );
-                        debug!(
-                            ?peer,
-                            ?start_height,
-                            ?count,
-                            ?kind,
-                            ?error,
-                            "Zakura header range commit failed"
-                        );
+                        // InvalidPeerRange scores the peer, so the exact state
+                        // error variant must be visible at default log levels:
+                        // a stranded-context wedge (every peer's response
+                        // rejected identically for hours) is otherwise
+                        // indistinguishable from real peer misbehavior.
+                        if kind == HeaderSyncCommitFailureKind::InvalidPeerRange {
+                            warn!(
+                                ?peer,
+                                ?start_height,
+                                ?count,
+                                ?error,
+                                "Zakura header range commit failed"
+                            );
+                        } else {
+                            debug!(
+                                ?peer,
+                                ?start_height,
+                                ?count,
+                                ?kind,
+                                ?error,
+                                "Zakura header range commit failed"
+                            );
+                        }
                         trace_header_reactor_event(
                             &trace,
                             "header_range_commit_failed",
