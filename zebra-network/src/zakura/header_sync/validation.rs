@@ -101,6 +101,7 @@ pub(super) fn misbehavior_reason_label(reason: HeaderSyncMisbehavior) -> &'stati
 pub(super) fn commit_failure_reason_label(kind: HeaderSyncCommitFailureKind) -> &'static str {
     match kind {
         HeaderSyncCommitFailureKind::InvalidPeerRange => "invalid_peer_range",
+        HeaderSyncCommitFailureKind::ContextMismatch => "context_mismatch",
         HeaderSyncCommitFailureKind::Local => "local",
     }
 }

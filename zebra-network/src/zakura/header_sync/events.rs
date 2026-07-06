@@ -456,6 +456,12 @@ pub enum HeaderSyncMisbehavior {
 pub enum HeaderSyncCommitFailureKind {
     /// The supplied headers failed contextual validation or checkpoint consistency.
     InvalidPeerRange,
+    /// The range failed contextual validation (difficulty, median-time) against
+    /// this node's stored header context. When independent peers fail
+    /// identically, the stored context itself is suspect (a reorg left stale
+    /// rows in the validation window), so this must never score the peer and
+    /// instead feeds fork-recovery walk-back evidence.
+    ContextMismatch,
     /// Local storage/channel/resource failure; do not score the peer.
     Local,
 }

@@ -2093,6 +2093,62 @@ async fn invalid_async_header_commit_failure_reports_peer_disconnect() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn context_mismatch_commit_failures_walk_back_without_scoring_peers() {
+    let network = regtest_network();
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_a = peer(63);
+    let peer_b = peer(64);
+
+    connect_peer(&fixture, peer_a.clone()).await;
+    connect_peer(&fixture, peer_b.clone()).await;
+
+    // Three contextual rejections from two independent peers: the stored
+    // validation window is suspect, so the reactor must begin a walk-back
+    // (QueryReanchorTarget) and must NOT score either peer — they are honest;
+    // the stale rows are ours.
+    for peer_id in [&peer_a, &peer_b, &peer_a] {
+        fixture
+            .handle
+            .send(HeaderSyncEvent::HeaderRangeCommitFailed {
+                peer: peer_id.clone(),
+                start_height: block::Height(1),
+                count: 1,
+                kind: HeaderSyncCommitFailureKind::ContextMismatch,
+            })
+            .await
+            .unwrap();
+    }
+
+    let mut saw_reanchor_query = false;
+    for _ in 0..12 {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            fixture.actions.recv(),
+        )
+        .await
+        {
+            Ok(Some(HeaderSyncAction::Misbehavior { peer, reason })) => {
+                panic!("honest peer {peer:?} scored for a local context mismatch: {reason:?}")
+            }
+            Ok(Some(HeaderSyncAction::QueryReanchorTarget { .. })) => {
+                saw_reanchor_query = true;
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(
+        saw_reanchor_query,
+        "repeated context mismatches from independent peers must start a walk-back"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn peer_disconnect_removes_outstanding_requests_for_that_peer() {
     let network = Network::Mainnet;
     let first_checkpoint = network

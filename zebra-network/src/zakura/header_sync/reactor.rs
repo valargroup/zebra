@@ -687,6 +687,27 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
                 .await;
         }
+        if kind == HeaderSyncCommitFailureKind::ContextMismatch {
+            // The range failed contextual validation against OUR stored header
+            // context. One peer failing could be a bad range; independent peers
+            // failing identically means the stored validation window itself is
+            // stale (a reorg left old-branch rows in it) — every extension is
+            // rejected forever and no link failure ever fires, so this is the
+            // only signal that can trigger recovery. Reuse the stale-anchor
+            // quorum and walk the anchor back; each deepening re-commits a
+            // longer range, rewriting the poisoned window (observed live:
+            // InvalidDifficultyThreshold at 4148005 from every peer, surviving
+            // restarts, with honest peers disconnected one by one).
+            self.state.stale_anchor.record(peer.clone());
+            metrics::counter!("sync.header.stale_anchor.context_mismatch").increment(1);
+            if self.state.stale_anchor.should_reanchor() {
+                if self.state.best_header_tip > self.state.verified_block_tip {
+                    self.reanchor_to_verified_block_tip().await;
+                } else {
+                    self.begin_fork_recovery_walk_back();
+                }
+            }
+        }
         let key = PendingCommitKey {
             peer,
             start_height,

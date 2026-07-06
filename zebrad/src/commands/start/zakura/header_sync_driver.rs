@@ -794,7 +794,11 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         // a stranded-context wedge (every peer's response
                         // rejected identically for hours) is otherwise
                         // indistinguishable from real peer misbehavior.
-                        if kind == HeaderSyncCommitFailureKind::InvalidPeerRange {
+                        if matches!(
+                            kind,
+                            HeaderSyncCommitFailureKind::InvalidPeerRange
+                                | HeaderSyncCommitFailureKind::ContextMismatch
+                        ) {
                             warn!(
                                 ?peer,
                                 ?start_height,
@@ -1493,9 +1497,17 @@ pub(crate) fn header_range_commit_failure_kind(
         | zebra_state::CommitHeaderRangeError::ImmutableConflict { .. }
         | zebra_state::CommitHeaderRangeError::ReorgTooDeep { .. }
         | zebra_state::CommitHeaderRangeError::CheckpointConflict { .. }
-        | zebra_state::CommitHeaderRangeError::ConflictingFullBlockHeader { .. }
-        | zebra_state::CommitHeaderRangeError::ValidateContextError(_) => {
+        | zebra_state::CommitHeaderRangeError::ConflictingFullBlockHeader { .. } => {
             HeaderSyncCommitFailureKind::InvalidPeerRange
+        }
+        // Contextual failures (difficulty, median-time) validate the range
+        // against OUR stored header context; when the context holds stale
+        // reorg rows every honest peer fails identically (observed live:
+        // InvalidDifficultyThreshold at 4148005 from all peers, for hours).
+        // Never score the peer for these — the reactor treats them as
+        // stale-anchor evidence and walks back instead.
+        zebra_state::CommitHeaderRangeError::ValidateContextError(_) => {
+            HeaderSyncCommitFailureKind::ContextMismatch
         }
         _ => HeaderSyncCommitFailureKind::Local,
     }
@@ -1951,6 +1963,7 @@ fn trace_state_read_error(
 fn commit_failure_result_label(kind: HeaderSyncCommitFailureKind) -> &'static str {
     match kind {
         HeaderSyncCommitFailureKind::InvalidPeerRange => "invalid_peer_range",
+        HeaderSyncCommitFailureKind::ContextMismatch => "context_mismatch",
         HeaderSyncCommitFailureKind::Local => "local_error",
     }
 }

@@ -44,6 +44,16 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.
+- Fixed a permanent header-sync wedge where a fork-recovery re-commit left
+  stale rows in the stored difficulty-validation window: every extension
+  range was then rejected with `InvalidDifficultyThreshold`, each rejection
+  scored and disconnected the (honest) serving peer, and the wedge survived
+  restarts because the stale rows are on disk (observed live at height
+  4148005 for hours). Contextual validation failures are now classified as
+  `ContextMismatch`: they no longer score peers, and repeated identical
+  failures from independent peers feed the fork-recovery walk-back — each
+  deepening re-commits a longer range, rewriting the poisoned window until
+  the chain extends again.
 - Zakura block-sync liveness disconnects are now deferred while the local
   apply pipeline holds unfinished bodies: "no accepted block progress" cannot
   be blamed on a peer while the node's own commits are not landing. During a
