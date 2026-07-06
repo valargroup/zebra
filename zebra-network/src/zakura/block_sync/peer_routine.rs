@@ -2766,7 +2766,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         });
         view.applying_len = 60;
-        let (view_tx, view_rx) = watch::channel(view.clone());
+        let (view_tx, view_rx) = watch::channel(view);
 
         let mut routine = PeerRoutine::new(
             peer,
