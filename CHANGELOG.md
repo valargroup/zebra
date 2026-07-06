@@ -44,6 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.
+- The dual-stack Zakura stall watchdog no longer shuts down the Zakura header-
+  and block-sync reactors when it falls back to legacy `ChainSync`. Killing
+  them turned every fallback into a fleet-wide Zakura outage: the fallback
+  node — often the only peer with working block ingest — stopped advertising
+  statuses, serving headers and bodies, and forwarding `NewBlock`s, which
+  pinned every Zakura peer's frontier and starved zakura-only nodes until a
+  manual restart. Legacy `ChainSync` now resumes as the body-sync driver while
+  the Zakura reactors stay alive, follow local commits through the chain-tip
+  mirror, and keep serving the Zakura network as a bridge. Fallback engagement
+  is counted in `sync.zakura.legacy_fallback.engaged`. Inbound block-gossip
+  ingest failures and queue drops — previously silent at default log levels,
+  which made tip-ingest freezes unattributable — are now logged at info and
+  counted (`gossip.ingest.failed.count`, `gossip.ingest.duplicate.count`).
 - Fixed Zakura nodes gossiping and following side-chain blocks. An inbound
   `NewBlock` that committed as a side chain (for example a testnet
   min-difficulty branch) still advanced the node's Zakura header and verified

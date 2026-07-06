@@ -214,7 +214,26 @@ where
             let (result, hash) =
                 match join_result.expect("block download and verify tasks must not panic") {
                     Ok(hash) => (Ok(hash), hash),
-                    Err((e, hash, advertiser_addr)) => (Err((e, advertiser_addr)), hash),
+                    Err((e, hash, advertiser_addr)) => {
+                        // A failed gossip ingest is the only way a node whose
+                        // syncer is parked (Zakura mode) falls behind the
+                        // network, so every non-duplicate failure must be
+                        // visible at default log levels: silent failures here
+                        // previously made fleet-wide tip-ingest freezes
+                        // unattributable after the fact.
+                        if crate::commands::start::zakura::block_verify_error_is_duplicate(&e) {
+                            debug!(?hash, "gossiped block was already known");
+                            metrics::counter!("gossip.ingest.duplicate.count").increment(1);
+                        } else {
+                            info!(
+                                ?hash,
+                                error = ?e,
+                                "gossiped block download or verify failed"
+                            );
+                            metrics::counter!("gossip.ingest.failed.count").increment(1);
+                        }
+                        (Err((e, advertiser_addr)), hash)
+                    }
                 };
             if let Some((_, Some(source))) = this.cancel_handles.remove(&hash) {
                 let source_count = this
@@ -310,7 +329,7 @@ where
         }
 
         if self.queue_len() >= self.full_verify_concurrency_limit {
-            debug!(
+            info!(
                 ?hash,
                 queue_len = self.queue_len(),
                 concurrency_limit = self.full_verify_concurrency_limit,
@@ -328,7 +347,7 @@ where
             let source_count = self.source_counts.get(source).copied().unwrap_or_default();
             let source_limit = source.max_in_flight(self.full_verify_concurrency_limit);
             if source_count >= source_limit {
-                debug!(
+                info!(
                     ?hash,
                     ?source,
                     source_count,
@@ -499,7 +518,7 @@ where
             let block_height = block
                 .coinbase_height()
                 .ok_or_else(|| {
-                    debug!(
+                    info!(
                         ?hash,
                         "gossiped block with no height: dropped downloaded block"
                     );
@@ -510,7 +529,7 @@ where
                 .map_err(|e| (e, None))?;
 
             if block_height > max_lookahead_height {
-                debug!(
+                info!(
                     ?hash,
                     ?block_height,
                     ?tip_height,
@@ -522,7 +541,7 @@ where
 
                 Err("gossiped block height too far ahead").map_err(|e| (e.into(), None))?;
             } else if block_height < min_accepted_height {
-                debug!(
+                info!(
                     ?hash,
                     ?block_height,
                     ?tip_height,

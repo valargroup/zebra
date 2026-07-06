@@ -73,7 +73,7 @@
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
-mod zakura;
+pub(crate) mod zakura;
 
 use std::{net::SocketAddr, path::Path, sync::Arc};
 
@@ -980,20 +980,13 @@ impl StartCmd {
         let syncer_task_handle = if use_zakura_block_sync(&config.network) {
             info!("Zakura block sync is replacing the legacy ChainSync body downloader");
             // Only dual-stack nodes (Zakura + legacy peers) fall back to legacy ChainSync on a
-            // Zakura stall; a Zakura-only node has no legacy peers to drive body sync. When the
-            // fallback fires it first cancels the Zakura endpoint shutdown token (stopping the
-            // header- and block-sync drivers) so the two commit pipelines never run at once.
+            // Zakura stall; a Zakura-only node has no legacy peers to drive body sync. The
+            // fallback resumes legacy ChainSync as the body-sync driver while the Zakura
+            // reactors stay alive as a serving/advertising bridge for zakura-only peers.
             let legacy_fallback = config.network.v2_p2p && config.network.legacy_p2p;
             tokio::spawn(
                 syncer
-                    .bootstrap_genesis_then_pause(
-                        read_only_state_service.clone(),
-                        legacy_fallback,
-                        zakura_endpoint.clone(),
-                        zakura_endpoint
-                            .as_ref()
-                            .and_then(|endpoint| endpoint.header_sync_shutdown()),
-                    )
+                    .bootstrap_genesis_then_pause(read_only_state_service.clone(), legacy_fallback)
                     .in_current_span(),
             )
         } else {
