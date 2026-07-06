@@ -32,7 +32,7 @@ write instead.
 | --- | --- |
 | `fabricate.rs` | Pure header/branch fabrication. Every threshold is computed with the store's own `AdjustedDifficulty` logic, so all fabricated chains pass real contextual validation. Work divergence between branches comes from block spacing (`Fast` = target/16, `Slow` = 4×target); branches are tens of headers long because the difficulty adjustment drifts only ~2%/block. Builds a fixed `Universe`: a 60-header trunk, a fork at height 50, and branches **A** (26 fast headers, high work), **B** (30 slow headers — longer than A but lower total work, so height order and work order disagree), **B_ext** (B's first 4 headers plus a fast continuation that out-works A), and **C** (5 headers off A's second header). |
 | `audit.rs` | The invariant audit: A1 (bijection, both directions), A2 (linkage walk upward from the finalized tip over the merged header view), A3 (tip integrity, gaps, frontier overlay, aux-row backing), and A4 (the on-disk chain equals the model's expected canonical chain). Also `dump_store`, a comparable snapshot of all five column families used to assert that rejected commits are side-effect free and that reopens preserve the store byte-for-byte. |
-| `oracle.rs` | An in-memory model of the store's *specified* behavior: a single linked canonical chain, best-cumulative-work selection with strict improvement, total suffix replacement above the first conflicting height, and a sequential body tip. It predicts whether each op must be accepted or rejected. |
+| `oracle.rs` | An in-memory model of the store's _specified_ behavior: a single linked canonical chain, best-cumulative-work selection with strict improvement, total suffix replacement above the first conflicting height, and a sequential body tip. It predicts whether each op must be accepted or rejected. |
 | `ops.rs` | The op alphabet, each op mapped to one real production write-batch shape: `CommitHeaderRange` → `prepare_header_range_batch_with_roots`; `CommitBody` / `Finalize` → `prepare_block_header_and_transaction_data_batch` plus the finalization roots delete (which runs the release path internally); `Seed` → `seed_zakura_header_from_committed_block` (the non-finalized best-chain commit hook); `Reopen` → shutdown and reopen of the persistent store. The `Harness` executes ops, cross-checks the oracle's prediction against the store's response, and audits after every mutation; failures come back as a transcribable `FailureReport` (the executed op prefix plus every violation found). |
 | `scenarios.rs` | Scripted production event shapes (s01–s10): simple reorgs, lower-work rejections and their later reversal, split-range and walk-back deliveries, body commits racing header reorgs, reorgs to a lower height, double reorgs at one fork point, activity across the difficulty-adjustment window edge, restarts at every boundary, and seed/range interplay. Also holds the `corruption_repro_*` tests below. |
 | `prop.rs` | Discovery proptests: random op sequences over the fixed universe, shrunk to minimal counterexamples on any audit failure. Both are `#[ignore]`d because the store has known bugs today; see "Running". |
@@ -54,7 +54,7 @@ the twin gets un-ignored as the permanent regression test.
    response.
 2. **Re-delivery over committed bodies**
    (`corruption_repro_redelivery_over_bodies`). The range insert loop gates
-   only its *roots* write on `contains_body_at_height`; the
+   only its _roots_ write on `contains_body_at_height`; the
    header/hash/height/body-size writes are unconditional. A header range
    re-delivered over heights whose bodies were committed in the meantime
    re-inserts zakura rows below the body tip, and nothing ever trims them
@@ -64,7 +64,7 @@ the twin gets un-ignored as the permanent regression test.
    `corruption_repro_seed_fork_switch`; found by the proptest and shrunk to a
    single op). `prepare_zakura_header_from_committed_block` writes its row
    with no linkage or anchor precondition. Seeds fire only at non-finalized
-   best-*tip* commits, so any best-tip jump (a fork switch between
+   best-_tip_ commits, so any best-tip jump (a fork switch between
    non-finalized chains, or a restart that restores the non-finalized backup)
    seeds a height whose parent row is missing or belongs to another branch:
    a gap or broken link on disk, and a generator of poisoned
