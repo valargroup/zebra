@@ -2037,6 +2037,10 @@ impl Service<ReadRequest> for ReadStateService {
                 read::hash_by_height(state.latest_best_chain(), &state.db, height),
             )),
 
+            ReadRequest::ZakuraHeaderHash(height) => {
+                Ok(ReadResponse::BlockHash(state.db.zakura_header_hash(height)))
+            }
+
             // Used by get_block_template and getblockchaininfo RPCs.
             ReadRequest::ChainInfo => {
                 // # Correctness

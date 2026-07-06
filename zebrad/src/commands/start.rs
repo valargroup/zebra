@@ -2123,11 +2123,11 @@ mod zakura_header_sync_driver_tests {
         coalesce_ready_needed_block_queries, coalesce_stale_needed_block_queries,
         commit_block_sync_body, drive_block_sync_actions, drive_zakura_header_sync_actions,
         header_range_commit_failure_kind, notify_block_sync_header_tip, query_block_sync_frontiers,
-        query_block_sync_needed_blocks, root_covered_query_best_header_tip,
-        tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
-        BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles,
-        ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        query_block_sync_needed_blocks, reconcile_stranded_body_suffix,
+        root_covered_query_best_header_tip, tree_aux_roots_for_served_header_range,
+        verified_block_tip_from_state, BlockApplyClass, BlocksyncThroughputProbe,
+        ZakuraHeaderSyncDriverHandles, ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
+        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
@@ -2901,6 +2901,105 @@ mod zakura_header_sync_driver_tests {
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
         endpoint.shutdown().await;
+    }
+
+    /// `reconcile_stranded_body_suffix` is a no-op when the body chain matches
+    /// the Zakura header store, and invalidates the first stranded body block
+    /// when the committed suffix sits on a branch the header chain reorged away
+    /// from (e.g. after a crash between a durable header reorg and its body
+    /// invalidation, when later commits report no header conflict).
+    #[tokio::test]
+    async fn stranded_body_suffix_is_reconciled_by_invalidation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fork_height = block::Height(99);
+        let tip_height = block::Height(100);
+        let shared_hash = block::Hash([0x99; 32]);
+        let honest_hash_100 = block::Hash([0xAA; 32]);
+        let stranded_hash_100 = block::Hash([0xBB; 32]);
+
+        // Case 1: the header store matches the body tip; no write happens.
+        let agree_read = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::Tip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::Tip(Some((tip_height, honest_hash_100))),
+                ),
+                zebra_state::ReadRequest::ZakuraHeaderHash(height) if height == tip_height => {
+                    Ok(zebra_state::ReadResponse::BlockHash(Some(honest_hash_100)))
+                }
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let no_write = service_fn(|request: zebra_state::Request| async move {
+            panic!("agreeing chains must not trigger state writes: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_state::BoxError>(zebra_state::Response::Committed(block::Hash([0; 32])))
+        });
+        reconcile_stranded_body_suffix(
+            no_write,
+            agree_read,
+            &zebra_network::zakura::ZakuraTrace::noop(),
+        )
+        .await;
+
+        // Case 2: the body tip diverges from the header store at 100 and the
+        // chains agree at 99, so the stranded body block at 100 is invalidated.
+        let stranded_read = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::Tip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::Tip(Some((tip_height, stranded_hash_100))),
+                ),
+                zebra_state::ReadRequest::ZakuraHeaderHash(height) => {
+                    let hash = if height == tip_height {
+                        honest_hash_100
+                    } else if height == fork_height {
+                        shared_hash
+                    } else {
+                        panic!("unexpected header height: {height:?}");
+                    };
+                    Ok(zebra_state::ReadResponse::BlockHash(Some(hash)))
+                }
+                zebra_state::ReadRequest::BestChainBlockHash(height) => {
+                    let hash = if height == fork_height {
+                        shared_hash
+                    } else if height == tip_height {
+                        stranded_hash_100
+                    } else {
+                        panic!("unexpected body height: {height:?}");
+                    };
+                    Ok(zebra_state::ReadResponse::BlockHash(Some(hash)))
+                }
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let invalidated = Arc::new(AtomicBool::new(false));
+        let saw_invalidate = invalidated.clone();
+        let write = service_fn(move |request: zebra_state::Request| {
+            let saw_invalidate = saw_invalidate.clone();
+            async move {
+                match request {
+                    zebra_state::Request::InvalidateBlock(hash) => {
+                        assert_eq!(
+                            hash, stranded_hash_100,
+                            "the stranded body block at the first divergent height is invalidated"
+                        );
+                        saw_invalidate.store(true, Ordering::SeqCst);
+                        Ok::<_, zebra_state::BoxError>(zebra_state::Response::Invalidated(hash))
+                    }
+                    request => panic!("unexpected state request: {request:?}"),
+                }
+            }
+        });
+        reconcile_stranded_body_suffix(
+            write,
+            stranded_read,
+            &zebra_network::zakura::ZakuraTrace::noop(),
+        )
+        .await;
+        assert!(
+            invalidated.load(Ordering::SeqCst),
+            "a stranded body suffix must be invalidated"
+        );
     }
 
     #[tokio::test]

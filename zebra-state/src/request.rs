@@ -1568,6 +1568,16 @@ pub enum ReadRequest {
     /// * [`ReadResponse::BlockHash(None)`](ReadResponse::BlockHash) otherwise.
     BestChainBlockHash(block::Height),
 
+    /// Looks up the hash in the stored Zakura header chain at the given height.
+    ///
+    /// Unlike [`ReadRequest::BestChainBlockHash`], this never falls back to the
+    /// best body chain: it answers what the Zakura header store holds, so the
+    /// two chains can be compared to detect a body suffix stranded off the
+    /// header chain.
+    ///
+    /// Returns [`ReadResponse::BlockHash(Option<block::Hash>)`](crate::ReadResponse::BlockHash).
+    ZakuraHeaderHash(block::Height),
+
     /// Get state information from the best block chain.
     ///
     /// Returns [`ReadResponse::ChainInfo(info)`](ReadResponse::ChainInfo) where `info` is a
@@ -1653,6 +1663,7 @@ impl ReadRequest {
             }
             ReadRequest::BestChainNextMedianTimePast => "best_chain_next_median_time_past",
             ReadRequest::BestChainBlockHash(_) => "best_chain_block_hash",
+            ReadRequest::ZakuraHeaderHash(_) => "zakura_header_hash",
             #[cfg(feature = "indexer")]
             ReadRequest::SpendingTransactionId(_) => "spending_transaction_id",
             ReadRequest::ChainInfo => "chain_info",

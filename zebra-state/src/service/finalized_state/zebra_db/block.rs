@@ -609,7 +609,11 @@ impl ZebraDb {
     }
 
     #[allow(clippy::unwrap_in_result)]
-    fn zakura_header_hash(&self, height: block::Height) -> Option<block::Hash> {
+    /// Returns the hash stored in the Zakura header chain at `height`, if any.
+    ///
+    /// This reads the header store directly, without preferring the best body
+    /// chain like the serving reads do, so callers can compare the two chains.
+    pub fn zakura_header_hash(&self, height: block::Height) -> Option<block::Hash> {
         let hash_by_height = self.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         self.db.zs_get(&hash_by_height, &height)
     }

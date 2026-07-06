@@ -949,6 +949,12 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         .saturating_add(1)
                         .min(DEFAULT_HS_RANGE);
                 log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
+                // A body gap that never closes can mean the committed body
+                // suffix is stranded off the header chain (e.g. the node died
+                // between a durable header reorg and its body invalidation, so
+                // no later commit reports a conflict). Cheap when the chains
+                // agree: two reads.
+                reconcile_stranded_body_suffix(state.clone(), read_state.clone(), &trace).await;
             }
             HeaderSyncAction::HeaderAdvanced { height, hash } => {
                 publish_header_frontier(
@@ -1208,6 +1214,124 @@ where
             false
         }
     }
+}
+
+/// Detects and repairs a body chain stranded off the stored Zakura header chain.
+///
+/// Compares the best body chain against the Zakura header store at the body
+/// tip. When they disagree, the committed body suffix is on a branch the
+/// header chain reorged away from — a state that can outlive the event-based
+/// invalidation in the commit path (for example when the node exits between a
+/// durable header reorg and its body invalidation: later commits find the
+/// header rows already replaced, report no conflict, and nothing else repairs
+/// the bodies). Walks down to the fork point (bounded by the state's reorg
+/// window) and invalidates the first stranded body block, resetting the chain
+/// tip so block sync re-downloads the header chain's branch.
+///
+/// Cheap when the chains agree (the normal case): two state reads.
+pub(crate) async fn reconcile_stranded_body_suffix<State, ReadState>(
+    state: State,
+    read_state: ReadState,
+    trace: &ZakuraTrace,
+) where
+    State: Service<
+            zebra_state::Request,
+            Response = zebra_state::Response,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    State::Future: Send + 'static,
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let header_hash_at = |height: block::Height| {
+        let read_state = read_state.clone();
+        async move {
+            match read_state
+                .oneshot(zebra_state::ReadRequest::ZakuraHeaderHash(height))
+                .await
+            {
+                Ok(zebra_state::ReadResponse::BlockHash(hash)) => hash,
+                _ => None,
+            }
+        }
+    };
+    let body_hash_at = |height: block::Height| {
+        let read_state = read_state.clone();
+        async move {
+            match read_state
+                .oneshot(zebra_state::ReadRequest::BestChainBlockHash(height))
+                .await
+            {
+                Ok(zebra_state::ReadResponse::BlockHash(hash)) => hash,
+                _ => None,
+            }
+        }
+    };
+
+    let body_tip = match read_state
+        .clone()
+        .oneshot(zebra_state::ReadRequest::Tip)
+        .await
+    {
+        Ok(zebra_state::ReadResponse::Tip(tip)) => tip,
+        _ => None,
+    };
+    let Some((body_tip_height, body_tip_hash)) = body_tip else {
+        return;
+    };
+
+    // Fast path: no header row (header sync has not covered this height) or a
+    // matching one means the body suffix is on the header chain.
+    let Some(header_tip_hash) = header_hash_at(body_tip_height).await else {
+        return;
+    };
+    if header_tip_hash == body_tip_hash {
+        return;
+    }
+
+    // The body suffix is stranded. Walk down to the fork point; the state
+    // cannot reorg deeper than its reorg window, so bound the walk.
+    let mut stranded_at = body_tip_height;
+    let mut stranded_header_hash = header_tip_hash;
+    for _ in 0..zebra_state::MAX_BLOCK_REORG_HEIGHT {
+        let Ok(parent) = stranded_at.previous() else {
+            break;
+        };
+        let (Some(body_hash), Some(header_hash)) =
+            (body_hash_at(parent).await, header_hash_at(parent).await)
+        else {
+            break;
+        };
+        if body_hash == header_hash {
+            break;
+        }
+        stranded_at = parent;
+        stranded_header_hash = header_hash;
+    }
+
+    metrics::counter!("sync.header.fork_recovery.body_suffix_reconciled").increment(1);
+    warn!(
+        ?body_tip_height,
+        ?body_tip_hash,
+        ?stranded_at,
+        "committed body suffix is stranded off the header chain; reconciling"
+    );
+    invalidate_reorged_body_suffix(
+        state,
+        read_state,
+        stranded_at,
+        Some(stranded_header_hash),
+        trace,
+    )
+    .await;
 }
 
 /// Drops the committed body suffix stranded by a header-chain reorg.
