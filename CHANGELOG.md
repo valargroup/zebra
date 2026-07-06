@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed legacy peers being disconnected for returning empty `FindBlocks` or
+  `FindHeaders` responses when Zebra is at or near the network tip.
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.
