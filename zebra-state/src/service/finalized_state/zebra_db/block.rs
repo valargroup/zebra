@@ -1834,16 +1834,9 @@ impl DiskWriteBatch {
             return Ok(());
         }
 
-        // Seeds fire at non-finalized best-*tip* commits, so an nf best-tip
-        // jump (a fork switch between nf chains, or a restart restoring the nf
-        // backup) can seed a height whose parent row is missing or belongs to
-        // another branch. Writing that row would break the header store's
-        // linkage invariant on disk and poison difficulty-adjustment windows
-        // (`header_store_coherence` bug 3). Refuse the write instead: the
-        // header store briefly lags the nf chain, and header-range sync
-        // converges it onto the new branch through the linkage-checked range
-        // path. The merged header view (full-block rows first, then zakura
-        // rows) is the same view the chain walk reads.
+        // Seeds can jump to a non-finalized best tip whose parent is not the
+        // stored row below it. Refuse those seeds so the header store stays
+        // linked; header-range sync will later deliver the missing rows.
         let hash_by_height = db.cf_handle("hash_by_height").unwrap();
         let parent_hash: Option<block::Hash> = height.previous().ok().and_then(|parent_height| {
             db.zs_get(&hash_by_height, &parent_height)
