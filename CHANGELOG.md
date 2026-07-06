@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   when the legacy sync status temporarily reports Zebra is far from the tip.
   Initial mempool activation still waits until Zebra is within 100 blocks of
   the tip.
+- Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
+  transaction verifier was converted to `InternalDowncastError` instead of a
+  missing transparent input.
 - Fixed dual-stack nodes (`v2_p2p` and `legacy_p2p` both enabled) permanently
   shutting down their own Zakura header- and block-sync drivers when a legacy
   peer on a foreign fork answered the body-sync stall watchdog's cross-check
