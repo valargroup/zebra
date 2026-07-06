@@ -303,6 +303,7 @@ where
             let mut block_miner_fees = Ok(Amount::zero());
 
             use futures::StreamExt;
+            let tx_checks_started = std::time::Instant::now();
             while let Some(result) = async_checks.next().await {
                 tracing::trace!(?result, remaining = async_checks.len());
                 let response = result
@@ -321,6 +322,18 @@ where
                 if let Some(miner_fee) = response.miner_fee() {
                     block_miner_fees += miner_fee;
                 }
+            }
+
+            // A slow drain here means transaction verification (usually a UTXO
+            // await on an out-of-order parent) held the block; this stage log
+            // attributes driver-side commit timeouts to their pipeline stage.
+            if tx_checks_started.elapsed() > std::time::Duration::from_secs(20) {
+                tracing::warn!(
+                    ?height,
+                    ?hash,
+                    elapsed = ?tx_checks_started.elapsed(),
+                    "slow transaction verification stage while committing block"
+                );
             }
 
             // Check the summed block totals
@@ -378,13 +391,25 @@ where
                 };
             }
 
-            match state_service
+            let state_commit_started = std::time::Instant::now();
+            let state_commit_result = state_service
                 .ready()
                 .await
                 .map_err(|source| VerifyBlockError::StateService { source, hash })?
                 .call(zs::Request::CommitSemanticallyVerifiedBlock(prepared_block))
-                .await
-            {
+                .await;
+            // A slow response here means the block sat in the state's
+            // parent-waiting queue or behind the write task; this stage log
+            // attributes driver-side commit timeouts to their pipeline stage.
+            if state_commit_started.elapsed() > std::time::Duration::from_secs(20) {
+                tracing::warn!(
+                    ?height,
+                    ?hash,
+                    elapsed = ?state_commit_started.elapsed(),
+                    "slow state commit stage while committing block"
+                );
+            }
+            match state_commit_result {
                 Ok(zs::Response::Committed(committed_hash)) => {
                     assert_eq!(committed_hash, hash, "state must commit correct hash");
                     Ok(hash)

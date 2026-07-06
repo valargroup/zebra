@@ -743,14 +743,33 @@ where
 
                     utxo
                 } else {
+                    let lookup_started = std::time::Instant::now();
                     let response = state
                         .clone()
                         .oneshot(zebra_state::Request::AwaitUtxo(*outpoint))
                         .await
                         .map_err(|boxed_error| match boxed_error.downcast::<Elapsed>() {
-                            Ok(_) => TransactionError::TransparentInputNotFound,
+                            Ok(_) => {
+                                // A timed-out lookup held this transaction's whole
+                                // block for UTXO_LOOKUP_TIMEOUT; chains of these
+                                // serialize into multi-minute commit stalls that
+                                // are otherwise unattributable from logs.
+                                tracing::warn!(
+                                    ?outpoint,
+                                    elapsed = ?lookup_started.elapsed(),
+                                    "transparent input UTXO lookup timed out"
+                                );
+                                TransactionError::TransparentInputNotFound
+                            }
                             Err(boxed_error) => TransactionError::from(boxed_error),
                         })?;
+                    if lookup_started.elapsed() > std::time::Duration::from_secs(20) {
+                        tracing::warn!(
+                            ?outpoint,
+                            elapsed = ?lookup_started.elapsed(),
+                            "slow transparent input UTXO lookup delayed transaction verification"
+                        );
+                    }
 
                     if let zebra_state::Response::Utxo(utxo) = response {
                         utxo
