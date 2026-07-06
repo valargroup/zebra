@@ -440,10 +440,11 @@ mod tests {
 
     impl Write for TestLogWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.output
+            let mut output = self
+                .output
                 .lock()
-                .expect("test log buffer should not be poisoned")
-                .extend_from_slice(buf);
+                .map_err(|error| io::Error::other(format!("test log buffer poisoned: {error}")))?;
+            output.extend_from_slice(buf);
             Ok(buf.len())
         }
 
