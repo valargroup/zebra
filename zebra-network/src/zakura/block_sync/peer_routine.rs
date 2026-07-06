@@ -1141,7 +1141,7 @@ impl PeerRoutine {
                     now + self.config.effective_no_progress_peer_cooldown(),
                 );
                 self.trace_protocol_reject_liveness(error);
-                tracing::debug!(
+                tracing::info!(
                     peer = ?self.peer,
                     outstanding = self.window.outstanding.len(),
                     "disconnecting Zakura block-sync peer after no accepted block progress"
@@ -1185,7 +1185,18 @@ impl PeerRoutine {
         }
         if removed {
             self.publish_outstanding();
-            self.window.disarm_liveness_after_progress_if_idle();
+            // Heights the floor passed were satisfied by the network; this peer
+            // no longer owes them, so a liveness deadline armed by those
+            // requests must not survive the drain. The after-progress disarm is
+            // not enough: a peer that delivered earlier and then had a NEWER
+            // request GC'd here has `request_at > block_at`, kept its stale
+            // deadline, and was disconnected at tip with zero outstanding —
+            // serially exiling healthy peers into the no-progress cooldown
+            // until the block-sync peer set collapsed. Dead-session detection
+            // is unaffected: an unanswered request expires through
+            // `expire_due_timeouts`, which deliberately leaves the deadline
+            // armed.
+            self.window.clear_liveness_if_idle();
         }
     }
 
@@ -2324,8 +2335,11 @@ mod tests {
 
     use super::super::peer_registry::PeerRegistry;
     use super::super::request::BlockSizeEstimate;
+    use super::super::request::{BlockRangeRequest, ExpectedBlock};
     use super::super::sequencer_task::{initial_view, SequencerControlInput};
-    use super::super::state::{ByteBudget, ThroughputMeter};
+    use super::super::state::{
+        ByteBudget, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker, ThroughputMeter,
+    };
     use super::super::work_queue::WorkQueue;
     use super::super::{BlockSyncFrontiers, BlockSyncPeerSession, ZakuraBlockSyncConfig};
     use super::PeerRoutine;
@@ -2590,5 +2604,117 @@ mod tests {
             now,
             request_timeout
         ));
+    }
+
+    /// Floor-GC of a request satisfied by other peers must clear the liveness
+    /// deadline: the peer no longer owes those heights. Before the fix, a peer
+    /// that had delivered earlier and then had a NEWER request GC'd below the
+    /// floor kept a stale deadline (`request_at > block_at` fails the
+    /// after-progress disarm) and was disconnected at tip with zero
+    /// outstanding, then parked in the 180 s no-progress cooldown — serially
+    /// exiling healthy peers until the block-sync peer set collapsed
+    /// (reproduced live: 5 → 0 peers after a fleet-wide restart).
+    #[tokio::test]
+    async fn floor_gc_clears_stale_liveness_deadline() {
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![8u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        // The download floor sits above the request below, as if other peers
+        // delivered those heights and the sequencer committed them.
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(100),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+
+        let mut routine = PeerRoutine::new(
+            peer,
+            session,
+            in_recv,
+            config,
+            0,
+            budget,
+            work,
+            Arc::new(PeerRegistry::new()),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            control_tx,
+            actions_tx,
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+
+        let now = Instant::now();
+        let liveness = Duration::from_secs(30);
+
+        // The peer delivered a block for an earlier request...
+        routine
+            .window
+            .arm_liveness(now - Duration::from_secs(120), liveness);
+        routine
+            .window
+            .note_block_progress(now - Duration::from_secs(90), liveness);
+
+        // ...then received a newer request (deadline re-armed) whose heights
+        // the floor later passed.
+        routine
+            .window
+            .arm_liveness(now - Duration::from_secs(60), liveness);
+        routine.window.outstanding.push(OutstandingBlockRange {
+            request: BlockRangeRequest {
+                start_height: block::Height(99),
+                count: 2,
+                anchor_hash: block::Hash([9; 32]),
+                estimated_bytes: 0,
+                expected_blocks: vec![
+                    ExpectedBlock {
+                        height: block::Height(99),
+                        hash: block::Hash([99; 32]),
+                        estimated_bytes: 0,
+                    },
+                    ExpectedBlock {
+                        height: block::Height(100),
+                        hash: block::Hash([100; 32]),
+                        estimated_bytes: 0,
+                    },
+                ],
+            },
+            queued_at: now - Duration::from_secs(60),
+            deadline: now + Duration::from_secs(60),
+            delivery_snapshot: routine
+                .window
+                .delivery_snapshot(now - Duration::from_secs(60)),
+            delivered_bytes: 0,
+            received: ReceivedBlockTracker::default(),
+        });
+
+        routine.gc_committed_outstanding();
+
+        assert!(
+            routine.window.outstanding.is_empty(),
+            "the floor passed the whole request, so GC must remove it"
+        );
+        assert_eq!(
+            routine.window.block_liveness_deadline, None,
+            "a request satisfied below the floor must not leave a stale liveness deadline"
+        );
+        assert!(
+            matches!(routine.window.check_liveness(now), LivenessOutcome::Ok),
+            "the peer owes nothing and must not be disconnected"
+        );
     }
 }

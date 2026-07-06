@@ -44,6 +44,20 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.
+- Fixed Zakura block-sync peers being serially disconnected and parked at the
+  chain tip by a stale liveness deadline. When the download floor passed a
+  request because other peers' deliveries satisfied its heights, the floor GC
+  removed the request but only cleared the liveness deadline for peers whose
+  last delivery was newer than their last request — a healthy peer with an
+  older delivery kept a deadline it could no longer answer, was disconnected
+  for "no accepted block progress" with zero outstanding requests, and parked
+  in the 180-second no-progress cooldown. At tip this exiled peers one by one
+  until the block-sync peer set collapsed (reproduced live: 5 → 0 peers within
+  ~25 minutes of a fleet-wide restart, wedging body sync when the next gap
+  formed). Heights satisfied below the floor now always clear an idle peer's
+  deadline; genuinely unresponsive peers are still caught by request timeouts,
+  which deliberately keep the deadline armed. The liveness disconnect log was
+  also promoted to info.
 - After a legacy fallback, the dual-stack watchdog now re-promotes Zakura to
   the body-sync driver once legacy `ChainSync` is caught up and stable (three
   consecutive exhausted sync rounds with the tip advancing by at most two
