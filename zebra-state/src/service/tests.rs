@@ -35,8 +35,8 @@ use crate::{
         setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
         FakeChainHelper,
     },
-    BoxError, CheckpointVerifiedBlock, Config, ReadRequest, ReadResponse, Request, Response,
-    SemanticallyVerifiedBlock,
+    BoxError, CheckpointVerifiedBlock, Config, HeaderRangeCommitOutcome, ReadRequest, ReadResponse,
+    Request, Response, SemanticallyVerifiedBlock,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
@@ -538,7 +538,10 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
                 tree_aux_roots: roots_from_height(Height(1), 2),
             })
             .await?,
-        Response::Committed(block2_hash),
+        Response::CommittedHeaderRange(HeaderRangeCommitOutcome {
+            tip_hash: block2_hash,
+            reorged_at: None,
+        }),
     );
 
     assert_eq!(
@@ -793,7 +796,13 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
     .await
     .expect("CommitHeaderRange must not deadlock while in the finalized write phase")?;
 
-    assert_eq!(committed, Response::Committed(block2_hash));
+    assert_eq!(
+        committed,
+        Response::CommittedHeaderRange(HeaderRangeCommitOutcome {
+            tip_hash: block2_hash,
+            reorged_at: None,
+        })
+    );
 
     assert_eq!(
         state

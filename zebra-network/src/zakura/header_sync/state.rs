@@ -8,6 +8,12 @@ pub(super) const HEADER_SYNC_ADVISORY_BACKOFF: Duration = Duration::from_secs(60
 pub(super) const HEADER_SYNC_ADVISORY_TTL: Duration = DEFAULT_LIVE_SERVICE_SUMMARY_TTL;
 pub(super) const HEADER_SYNC_STALE_ANCHOR_LINK_FAILURES: u32 = 3;
 pub(super) const HEADER_SYNC_STALE_ANCHOR_DISTINCT_PEERS: usize = 2;
+/// Deepest walk-back re-anchor below the verified block tip.
+///
+/// Mirrors `zebra_state::MAX_BLOCK_REORG_HEIGHT` (which this crate cannot
+/// depend on): the state rejects header-chain reorgs deeper than that window,
+/// so anchoring below it can never lead to a committable range.
+pub(super) const HEADER_SYNC_REANCHOR_MAX_DEPTH: u32 = 1_000;
 
 #[derive(Clone, Debug)]
 pub(super) struct HeaderSyncCore {
@@ -25,6 +31,7 @@ pub(super) struct HeaderSyncCore {
     pub(super) pending_commits: HashMap<PendingCommitKey, RangeRequest>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
     pub(super) stale_anchor: StaleAnchorFailures,
+    pub(super) fork_recovery: ForkRecovery,
 }
 
 impl HeaderSyncCore {
@@ -47,6 +54,7 @@ impl HeaderSyncCore {
             pending_commits: HashMap::new(),
             advisory: HashMap::new(),
             stale_anchor: StaleAnchorFailures::default(),
+            fork_recovery: ForkRecovery::default(),
         })
     }
 
@@ -120,6 +128,48 @@ impl HeaderSyncCore {
             want_tree_aux_roots: true,
             priority: RangePriority::Backward,
         });
+    }
+}
+
+/// Walk-back state for recovering a frontier stranded on an abandoned branch.
+///
+/// When repeated non-linking responses arrive while the header frontier sits
+/// at (or below) the verified block tip, the frontier itself — including the
+/// committed block suffix — may be on a branch the network reorged away from.
+/// Recovery re-anchors the frontier to a local ancestor at an exponentially
+/// growing depth below the verified block tip until peer responses link, at
+/// which point the higher-work range commits through the fork point.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ForkRecovery {
+    /// Depth below the verified block tip of the most recent walk-back round.
+    /// Zero when no walk-back is active; doubles every round that still fails
+    /// to link.
+    pub(super) depth: u32,
+    /// The target height of an outstanding [`HeaderSyncAction::QueryReanchorTarget`],
+    /// if one is in flight.
+    pub(super) awaiting_target: Option<block::Height>,
+}
+
+impl ForkRecovery {
+    /// Whether a walk-back is in progress, so stale-anchor evidence and the
+    /// walk-back depth must survive frontier updates.
+    pub(super) fn is_active(&self) -> bool {
+        self.depth > 0 || self.awaiting_target.is_some()
+    }
+
+    /// Returns the next walk-back depth: 1 on the first round, then doubling,
+    /// capped at [`HEADER_SYNC_REANCHOR_MAX_DEPTH`].
+    pub(super) fn next_depth(&mut self) -> u32 {
+        self.depth = self
+            .depth
+            .saturating_mul(2)
+            .clamp(1, HEADER_SYNC_REANCHOR_MAX_DEPTH);
+        self.depth
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.depth = 0;
+        self.awaiting_target = None;
     }
 }
 

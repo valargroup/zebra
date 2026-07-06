@@ -997,6 +997,19 @@ mod tests {
                         })
                         .await;
                 }
+                HeaderSyncAction::QueryReanchorTarget { height } => {
+                    let hash = local
+                        .store
+                        .lock()
+                        .expect("test store mutex is not poisoned")
+                        .headers_by_range(height, 1)
+                        .first()
+                        .map(|header| block::Hash::from(header.as_ref()));
+                    let _ = local
+                        .handle
+                        .send(HeaderSyncEvent::ReanchorTargetLoaded { height, hash })
+                        .await;
+                }
                 HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
                     let heights = local
                         .store
@@ -1349,6 +1362,14 @@ mod tests {
                         };
                         let _ = handle
                             .send(HeaderSyncEvent::NewBlockDuplicate { peer, height, hash })
+                            .await;
+                    }
+                    HeaderSyncAction::QueryReanchorTarget { height } => {
+                        let Some(handle) = endpoint.header_sync() else {
+                            continue;
+                        };
+                        let _ = handle
+                            .send(HeaderSyncEvent::ReanchorTargetLoaded { height, hash: None })
                             .await;
                     }
                     HeaderSyncAction::QueryBestHeaderTip
@@ -3100,6 +3121,9 @@ mod tests {
         )
         .await?;
 
+        // A non-contiguous response is provably malformed and still scores the
+        // peer. (A merely non-linking response no longer does: it is stale-
+        // frontier evidence for fork recovery, not misbehavior.)
         let out_of_range = e2e_peer(95);
         cluster.connect_peer(victim, out_of_range.clone()).await;
         cluster
@@ -3112,7 +3136,10 @@ mod tests {
             .inject(
                 victim,
                 out_of_range,
-                headers_message(vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()]),
+                headers_message(vec![
+                    mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
+                    mainnet_block(&BLOCK_MAINNET_3_BYTES).header.clone(),
+                ]),
             )
             .await;
         cluster

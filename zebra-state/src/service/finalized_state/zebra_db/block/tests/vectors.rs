@@ -114,7 +114,8 @@ fn header_range_commit_keeps_body_availability_separate() {
         .write_batch(batch)
         .expect("header range batch writes successfully");
 
-    assert_eq!(committed_hash, block1.hash());
+    assert_eq!(committed_hash.tip_hash, block1.hash());
+    assert_eq!(committed_hash.reorged_at, None);
     assert_eq!(state.best_header_tip(), Some((Height(1), block1.hash())));
     assert_eq!(state.finalized_tip_height(), Some(Height(0)));
     assert_eq!(state.tip(), Some((Height(0), genesis.hash())));
@@ -217,18 +218,24 @@ fn header_range_reorg_resets_advertised_body_sizes() {
 
     let original = synthetic_headers_from_state(&state, Height(0), genesis.hash(), 2, 1);
     let mut batch = DiskWriteBatch::new();
-    batch
+    let outcome = batch
         .prepare_header_range_batch(&state, genesis.hash(), &original, &[111, 222])
         .expect("original synthetic headers are valid");
+    assert_eq!(outcome.reorged_at, None);
     state.write_batch(batch).expect("header batch writes");
     assert_eq!(state.advertised_body_size(Height(1)), Some(111));
     assert_eq!(state.advertised_body_size(Height(2)), Some(222));
 
     let replacement = synthetic_headers_from_state(&state, Height(0), genesis.hash(), 3, 9);
     let mut batch = DiskWriteBatch::new();
-    batch
+    let outcome = batch
         .prepare_header_range_batch(&state, genesis.hash(), &replacement, &[0, 0, 333])
         .expect("higher-work replacement synthetic headers are valid");
+    assert_eq!(
+        outcome.reorged_at,
+        Some(Height(1)),
+        "replacing a conflicting suffix reports the first replaced height"
+    );
     state.write_batch(batch).expect("header batch writes");
 
     assert_eq!(state.advertised_body_size(Height(1)), None);
@@ -1401,13 +1408,13 @@ fn commit_header_range(
 ) -> block::Hash {
     let mut batch = DiskWriteBatch::new();
     let body_sizes = vec![0; headers.len()];
-    let committed_hash = batch
+    let outcome = batch
         .prepare_header_range_batch(state, anchor, headers, &body_sizes)
         .expect("header range is valid");
     state
         .write_batch(batch)
         .expect("header range batch writes successfully");
-    committed_hash
+    outcome.tip_hash
 }
 
 fn write_full_block_header_and_transactions(state: &ZebraDb, block: Arc<Block>) {

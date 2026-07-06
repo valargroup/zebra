@@ -190,6 +190,9 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::StateFrontiersChanged(frontiers) => {
                 self.handle_state_frontiers_changed(frontiers).await;
             }
+            HeaderSyncEvent::ReanchorTargetLoaded { height, hash } => {
+                self.handle_reanchor_target_loaded(height, hash).await;
+            }
             HeaderSyncEvent::HeaderRangeCommitted {
                 start_height,
                 tip_height,
@@ -597,7 +600,12 @@ impl HeaderSyncReactor {
         self.state.finalized_height = frontiers.finalized_height;
         self.state.verified_block_tip = frontiers.verified_block_tip;
         self.state.verified_block_hash = frontiers.verified_block_hash;
-        if self.state.best_header_tip <= self.state.verified_block_tip {
+        // During a walk-back the frontier is deliberately at or below the
+        // verified block tip, so this reset would wipe the recovery evidence
+        // on every frontier update and stall the walk-back forever.
+        if self.state.best_header_tip <= self.state.verified_block_tip
+            && !self.state.fork_recovery.is_active()
+        {
             self.state.stale_anchor.reset();
         }
         self.schedule().await;
@@ -628,6 +636,15 @@ impl HeaderSyncReactor {
         self.cancel_covered_outstanding();
         if tip_height > self.state.best_header_tip {
             self.publish_best_tip(tip_height, tip_hash).await;
+        }
+        // A commit strictly above the verified block tip means peer responses
+        // link again: the fork (if any) has been crossed, so walk-back state
+        // and stale-anchor evidence are obsolete. A commit at or below the
+        // verified tip can be a stranded peer re-serving our own chain, which
+        // must not reset an in-progress walk-back.
+        if tip_height > self.state.verified_block_tip {
+            self.state.stale_anchor.reset();
+            self.state.fork_recovery.reset();
         }
         self.notify_body_gaps().await;
         self.schedule().await;
@@ -1207,6 +1224,16 @@ impl HeaderSyncReactor {
         });
     }
 
+    /// Handles a `FirstHeaderDoesNotLink` rejection as possible evidence that
+    /// the local frontier — not the peer — is stale.
+    ///
+    /// A non-linking response to a forward request is what an honest peer
+    /// sends when the network abandoned the branch our frontier sits on, so it
+    /// must never be treated as misbehavior. Returns `true` when the failure
+    /// was absorbed here (recorded, range retried, and possibly a re-anchor
+    /// started); `false` when the caller should score the peer (backward
+    /// checkpoint-bracket ranges anchor on checkpoint hashes, which cannot be
+    /// stale).
     async fn handle_possible_stale_anchor_link_failure(
         &mut self,
         peer: &ZakuraPeerId,
@@ -1216,9 +1243,10 @@ impl HeaderSyncReactor {
         if !matches!(error, HeaderSyncWireError::FirstHeaderDoesNotLink)
             || range.priority != RangePriority::Forward
             || range.finalized
-            || self.state.best_header_tip <= self.state.verified_block_tip
         {
-            self.state.stale_anchor.reset();
+            if !self.state.fork_recovery.is_active() {
+                self.state.stale_anchor.reset();
+            }
             return false;
         }
 
@@ -1231,7 +1259,18 @@ impl HeaderSyncReactor {
             return true;
         }
 
-        self.reanchor_to_verified_block_tip().await;
+        if self.state.best_header_tip > self.state.verified_block_tip {
+            // The frontier is a header-only extension of the verified chain;
+            // dropping back to the verified block tip is free and sufficient
+            // when only the header suffix is stale.
+            self.reanchor_to_verified_block_tip().await;
+        } else {
+            // The frontier sits at (or below) the verified block tip and
+            // independent peers still cannot link to it: the committed chain
+            // suffix itself is on an abandoned branch. Walk the anchor back
+            // below the verified tip to find the fork point.
+            self.begin_fork_recovery_walk_back();
+        }
         true
     }
 
@@ -1247,6 +1286,90 @@ impl HeaderSyncReactor {
             .retain(|_, range| range.priority != RangePriority::Forward);
         self.cancel_forward_outstanding();
         self.publish_best_tip_reanchored(height, hash).await;
+    }
+
+    /// Starts (or deepens) a walk-back round: asks state for the local header
+    /// hash at an exponentially deeper ancestor of the verified block tip, so
+    /// [`Self::handle_reanchor_target_loaded`] can re-anchor the frontier there.
+    fn begin_fork_recovery_walk_back(&mut self) {
+        self.state.stale_anchor.reset();
+        if self.state.fork_recovery.awaiting_target.is_some() {
+            return;
+        }
+
+        let depth = self.state.fork_recovery.next_depth();
+        // The fork point cannot be below the finalized height (the state
+        // cannot reorg finalized blocks), and the startup anchor is the
+        // deepest hash this reactor trusts.
+        let floor = self.state.finalized_height.max(self.state.anchor.0);
+        let target = block::Height(
+            self.state
+                .verified_block_tip
+                .0
+                .saturating_sub(depth)
+                .max(floor.0),
+        );
+
+        metrics::counter!("sync.header.fork_recovery.walk_back").increment(1);
+        tracing::warn!(
+            ?depth,
+            ?target,
+            verified_block_tip = ?self.state.verified_block_tip,
+            best_header_tip = ?self.state.best_header_tip,
+            "Zakura header-sync frontier appears stranded on an abandoned \
+             branch; walking the request anchor back to find the fork point"
+        );
+
+        self.state.fork_recovery.awaiting_target = Some(target);
+        if !self.dispatch_action(HeaderSyncAction::QueryReanchorTarget { height: target }) {
+            // Try again when the next non-linking responses accumulate.
+            self.state.fork_recovery.awaiting_target = None;
+        }
+    }
+
+    /// Applies a walk-back re-anchor once state supplies the local hash at the
+    /// queried target height.
+    async fn handle_reanchor_target_loaded(
+        &mut self,
+        height: block::Height,
+        hash: Option<block::Hash>,
+    ) {
+        if self.state.fork_recovery.awaiting_target != Some(height) {
+            return;
+        }
+        self.state.fork_recovery.awaiting_target = None;
+
+        let Some(hash) = hash else {
+            // No local header at the target height; nothing to anchor on.
+            // Later rounds retry (deeper) when non-linking responses recur.
+            tracing::warn!(
+                ?height,
+                "Zakura header-sync walk-back target has no local header; cannot re-anchor"
+            );
+            return;
+        };
+        if height >= self.state.best_header_tip {
+            // The frontier moved at or below the target while the query was in
+            // flight; re-anchoring would move it the wrong way.
+            return;
+        }
+
+        metrics::counter!("sync.header.fork_recovery.reanchored").increment(1);
+        tracing::info!(
+            ?height,
+            ?hash,
+            depth = ?self.state.fork_recovery.depth,
+            "Zakura header-sync re-anchoring below the verified block tip for fork recovery"
+        );
+
+        self.state.stale_anchor.reset();
+        self.state.schedule.clear_forward();
+        self.state
+            .pending_commits
+            .retain(|_, range| range.priority != RangePriority::Forward);
+        self.cancel_forward_outstanding();
+        self.publish_best_tip_reanchored(height, hash).await;
+        self.schedule().await;
     }
 
     async fn handle_timeouts(&mut self) {
@@ -1482,7 +1605,12 @@ impl HeaderSyncReactor {
             self.state.verified_block_tip = height;
             self.state.verified_block_hash = hash;
         }
-        if self.state.best_header_tip <= self.state.verified_block_tip {
+        // See handle_state_frontiers_changed: a walk-back holds the frontier
+        // at or below the verified tip on purpose, so this reset must not fire
+        // while recovery is active.
+        if self.state.best_header_tip <= self.state.verified_block_tip
+            && !self.state.fork_recovery.is_active()
+        {
             self.state.stale_anchor.reset();
         }
     }
@@ -1746,6 +1874,13 @@ impl HeaderSyncReactor {
                 insert_u64(row, hs_trace::RANGE_COUNT, headers.len() as u64);
                 insert_u64(row, hs_trace::EXPECTED_COUNT, u64::from(*requested_count));
             }
+            HeaderSyncEvent::ReanchorTargetLoaded { height, hash } => {
+                insert_optional_str(row, hs_trace::KIND, Some("reanchor_target_loaded"));
+                insert_height(row, hs_trace::HEIGHT, *height);
+                if let Some(hash) = hash {
+                    insert_hash(row, hs_trace::HASH, *hash);
+                }
+            }
         });
     }
 
@@ -1812,6 +1947,10 @@ impl HeaderSyncReactor {
             }
             HeaderSyncAction::QueryBestHeaderTip => {
                 insert_optional_str(row, hs_trace::KIND, Some("query_best_header_tip"));
+            }
+            HeaderSyncAction::QueryReanchorTarget { height } => {
+                insert_optional_str(row, hs_trace::KIND, Some("query_reanchor_target"));
+                insert_height(row, hs_trace::HEIGHT, *height);
             }
             HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
                 insert_optional_str(row, hs_trace::KIND, Some("query_missing_block_bodies"));

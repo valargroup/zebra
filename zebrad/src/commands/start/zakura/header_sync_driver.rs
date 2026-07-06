@@ -636,6 +636,9 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     },
                 );
                 let started = Instant::now();
+                // Kept so a reorging commit can name the new-branch hash at the
+                // first replaced height without re-reading state (`Arc` clones).
+                let committed_headers = headers.clone();
                 match state
                     .clone()
                     .oneshot(zebra_state::Request::CommitHeaderRange {
@@ -646,7 +649,24 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     })
                     .await
                 {
-                    Ok(zebra_state::Response::Committed(tip_hash)) => {
+                    Ok(zebra_state::Response::CommittedHeaderRange(outcome)) => {
+                        let tip_hash = outcome.tip_hash;
+                        if let Some(reorged_at) = outcome.reorged_at {
+                            // The offset fits usize: it is bounded by the
+                            // committed range length, which is far below
+                            // u32::MAX and platform usize on all targets.
+                            let new_hash = committed_headers
+                                .get(reorged_at.0.saturating_sub(start_height.0) as usize)
+                                .map(|header| block::Hash::from(header.as_ref()));
+                            invalidate_reorged_body_suffix(
+                                state.clone(),
+                                read_state.clone(),
+                                reorged_at,
+                                new_hash,
+                                &trace,
+                            )
+                            .await;
+                        }
                         emit_commit_state(
                             &trace,
                             cs_trace::COMMIT_FINISH,
@@ -863,6 +883,36 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         warn!(?error, "failed to query Zakura best header tip")
                     }
                 }
+            }
+            HeaderSyncAction::QueryReanchorTarget { height } => {
+                let hash = match read_state
+                    .clone()
+                    .oneshot(zebra_state::ReadRequest::HeadersByHeightRange {
+                        start: height,
+                        count: 1,
+                    })
+                    .await
+                {
+                    Ok(zebra_state::ReadResponse::Headers(headers)) => {
+                        headers.first().map(|(_height, hash, _header)| *hash)
+                    }
+                    Ok(response) => {
+                        warn!(?response, "unexpected reanchor-target headers response");
+                        None
+                    }
+                    Err(error) => {
+                        warn!(
+                            ?height,
+                            ?error,
+                            "failed to read Zakura walk-back reanchor target from state"
+                        );
+                        None
+                    }
+                };
+                let _ = handles
+                    .header_sync
+                    .send(HeaderSyncEvent::ReanchorTargetLoaded { height, hash })
+                    .await;
             }
             HeaderSyncAction::QueryMissingBlockBodies { from, limit } => {
                 log_missing_block_bodies(read_state.clone(), from, limit, &trace).await;
@@ -1093,6 +1143,121 @@ async fn log_missing_block_bodies<ReadState>(
             );
             warn!(?error, "failed to query Zakura missing block bodies")
         }
+    }
+}
+
+/// Drops the committed body suffix stranded by a header-chain reorg.
+///
+/// `reorged_at` is the first height where a committed header range replaced a
+/// conflicting stored header; `new_hash` is the new branch's hash there. If
+/// the best body chain still holds a different block at that height, that
+/// block and its descendants are invalidated, resetting the chain tip to the
+/// fork point. The chain-tip mirror then publishes the reset frontier
+/// (`VerifiedReset`), and block sync re-downloads the heights on the new
+/// branch. Without this, body-gap discovery starts above the stale tip and
+/// the new branch's bodies below it are never fetched.
+async fn invalidate_reorged_body_suffix<State, ReadState>(
+    state: State,
+    read_state: ReadState,
+    reorged_at: block::Height,
+    new_hash: Option<block::Hash>,
+    trace: &ZakuraTrace,
+) where
+    State: Service<
+            zebra_state::Request,
+            Response = zebra_state::Response,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    State::Future: Send + 'static,
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    let old_hash = match read_state
+        .oneshot(zebra_state::ReadRequest::BestChainBlockHash(reorged_at))
+        .await
+    {
+        Ok(zebra_state::ReadResponse::BlockHash(hash)) => hash,
+        Ok(response) => {
+            warn!(?response, "unexpected BestChainBlockHash response");
+            None
+        }
+        Err(error) => {
+            warn!(
+                ?reorged_at,
+                ?error,
+                "failed to read the stranded body hash after a Zakura header reorg"
+            );
+            None
+        }
+    };
+    let Some(old_hash) = old_hash else {
+        // No committed body at the reorged height; nothing to invalidate.
+        return;
+    };
+    if new_hash == Some(old_hash) {
+        return;
+    }
+
+    warn!(
+        ?reorged_at,
+        ?old_hash,
+        ?new_hash,
+        "Zakura header reorg crossed the committed body suffix; \
+         invalidating the stranded branch so block sync can re-download it"
+    );
+    emit_commit_state(trace, cs_trace::COMMIT_START, "header_sync_driver", |row| {
+        insert_cs_str(row, cs_trace::ACTION, "invalidate_reorged_body_suffix");
+        insert_cs_height(row, cs_trace::HEIGHT, reorged_at);
+        insert_cs_hash(row, cs_trace::HASH, old_hash);
+    });
+    let started = Instant::now();
+    let result = state
+        .oneshot(zebra_state::Request::InvalidateBlock(old_hash))
+        .await;
+    emit_commit_state(
+        trace,
+        cs_trace::COMMIT_FINISH,
+        "header_sync_driver",
+        |row| {
+            insert_cs_str(row, cs_trace::ACTION, "invalidate_reorged_body_suffix");
+            insert_cs_height(row, cs_trace::HEIGHT, reorged_at);
+            insert_cs_hash(row, cs_trace::HASH, old_hash);
+            insert_cs_str(
+                row,
+                cs_trace::RESULT,
+                if result.is_ok() {
+                    "invalidated"
+                } else {
+                    "failed"
+                },
+            );
+            insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
+        },
+    );
+    match result {
+        Ok(zebra_state::Response::Invalidated(hash)) => {
+            metrics::counter!("sync.header.fork_recovery.body_suffix_invalidated").increment(1);
+            info!(
+                ?reorged_at,
+                ?hash,
+                "invalidated the stranded body suffix after a Zakura header reorg"
+            );
+        }
+        Ok(response) => warn!(?response, "unexpected InvalidateBlock response"),
+        Err(error) => warn!(
+            ?reorged_at,
+            ?old_hash,
+            ?error,
+            "failed to invalidate the stranded body suffix after a Zakura header reorg"
+        ),
     }
 }
 
@@ -1384,6 +1549,10 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
             }
             HeaderSyncAction::QueryBestHeaderTip => {
                 insert_cs_str(row, cs_trace::ACTION, "query_best_header_tip");
+            }
+            HeaderSyncAction::QueryReanchorTarget { height } => {
+                insert_cs_str(row, cs_trace::ACTION, "query_reanchor_target");
+                insert_cs_height(row, cs_trace::HEIGHT, *height);
             }
             HeaderSyncAction::QueryHeadersByHeightRange {
                 peer, start, count, ..

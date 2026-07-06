@@ -29,7 +29,7 @@ use crate::{
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    SemanticallyVerifiedBlock, ValidateContextError,
+    HeaderRangeCommitOutcome, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -134,7 +134,7 @@ fn commit_header_range(
     headers: Vec<Arc<block::Header>>,
     body_sizes: Vec<u32>,
     tree_aux_roots: Vec<BlockCommitmentRoots>,
-    rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
+    rsp_tx: oneshot::Sender<Result<HeaderRangeCommitOutcome, CommitHeaderRangeError>>,
 ) {
     let mut batch = crate::service::finalized_state::DiskWriteBatch::new();
     let result = batch
@@ -145,11 +145,11 @@ fn commit_header_range(
             &body_sizes,
             &tree_aux_roots,
         )
-        .and_then(|hash| {
+        .and_then(|outcome| {
             finalized_state
                 .db
                 .write_batch(batch)
-                .map(|()| hash)
+                .map(|()| outcome)
                 .map_err(|error| {
                     tracing::error!(?error, "failed to write validated header range");
 
@@ -198,7 +198,7 @@ pub enum NonFinalizedWriteMessage {
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
         tree_aux_roots: Vec<BlockCommitmentRoots>,
-        rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
+        rsp_tx: oneshot::Sender<Result<HeaderRangeCommitOutcome, CommitHeaderRangeError>>,
     },
     /// The hash of a block that should be invalidated and removed from
     /// the non-finalized state, if present.

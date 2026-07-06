@@ -3711,10 +3711,15 @@ async fn rejected_non_linking_range_traces_link_stage_and_error_kind() {
         .await
         .unwrap();
 
+    // A non-linking forward response is stale-frontier evidence, not peer
+    // misbehavior: the range is retried and the peer is never scored.
     match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::Misbehavior { peer, reason } => {
+        HeaderSyncAction::SendMessage {
+            peer,
+            msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+        } => {
             assert_eq!(peer, peer_id);
-            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+            assert_eq!(start_height, block::Height(1));
         }
         action => panic!("unexpected action: {action:?}"),
     }
@@ -4213,6 +4218,274 @@ async fn single_peer_forward_link_failures_do_not_reanchor_globally() {
         "one peer alone must not lower the global header frontier"
     );
     assert_eq!(fixture.handle.best_header_tip(), stranded_tip);
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+}
+
+/// Responds to every outbound `GetHeaders` with a non-linking header until the
+/// reactor asks for a walk-back re-anchor target, and returns that height.
+/// Panics if any peer is scored or no walk-back query arrives.
+async fn drive_non_linking_until_reanchor_query(
+    fixture: &mut ReactorFixture,
+    non_linking: Arc<block::Header>,
+) -> block::Height {
+    for _ in 0..16 {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+            } => {
+                fixture
+                    .handle
+                    .send(HeaderSyncEvent::WireMessage {
+                        peer,
+                        msg: headers_message_from(start_height, vec![non_linking.clone()]),
+                    })
+                    .await
+                    .unwrap();
+            }
+            HeaderSyncAction::QueryReanchorTarget { height } => return height,
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+    panic!("walk-back reanchor query did not arrive");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stranded_frontier_walks_back_and_recovers_through_fork_point() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    // The committed chain suffix sits on an abandoned branch: header and body
+    // frontiers are equal, and no honest response can link to the branch hash.
+    let stranded = (block::Height(2), block::Hash([0xBB; 32]));
+    let header1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header3 = mainnet_header(&BLOCK_MAINNET_3_BYTES);
+    let header4 = mainnet_header(&BLOCK_MAINNET_4_BYTES);
+    let fork_point_hash = block::Hash::from(header1.as_ref());
+
+    let mut startup = HeaderSyncStartup::new(
+        network,
+        anchor,
+        HeaderSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: stranded.0,
+            verified_block_hash: stranded.1,
+        },
+        Some(stranded),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+    let mut tip = fixture.handle.subscribe_tip();
+    let peers = [peer(71), peer(72)];
+
+    for peer_id in peers.iter().cloned() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            block::Height(0),
+            block::Height(4),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+
+    // Repeated non-linking responses from two independent peers start the
+    // walk-back one block below the verified tip.
+    let target = drive_non_linking_until_reanchor_query(&mut fixture, header3.clone()).await;
+    assert_eq!(target, block::Height(1));
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::ReanchorTargetLoaded {
+            height: target,
+            hash: Some(fork_point_hash),
+        })
+        .await
+        .unwrap();
+
+    // The frontier re-anchors below the verified block tip.
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), (block::Height(1), fork_point_hash));
+
+    // The next forward request anchors at the fork point, so a linking
+    // response commits straight through the abandoned suffix.
+    let (serving_peer, start_height, count) = loop {
+        let candidate = next_outbound_get_headers(&mut fixture.actions).await;
+        if candidate.1 == block::Height(2) {
+            break candidate;
+        }
+    };
+    assert_eq!(count, 3);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: serving_peer.clone(),
+            msg: headers_message_from(
+                start_height,
+                vec![header2.clone(), header3.clone(), header4.clone()],
+            ),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                peer,
+                anchor,
+                start_height,
+                headers,
+                ..
+            } => {
+                assert_eq!(peer, serving_peer);
+                assert_eq!(anchor, fork_point_hash);
+                assert_eq!(start_height, block::Height(2));
+                assert_eq!(headers.len(), 3);
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+
+    // A commit above the verified tip completes the recovery.
+    let tip_hash = block::Hash::from(header4.as_ref());
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(2),
+            tip_height: block::Height(4),
+            tip_hash,
+        })
+        .await
+        .unwrap();
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), (block::Height(4), tip_hash));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stranded_walk_back_deepens_exponentially_and_respects_finalized_floor() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let stranded = (block::Height(10), block::Hash([0xCC; 32]));
+    let non_linking = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+
+    let mut startup = HeaderSyncStartup::new(
+        network,
+        anchor,
+        HeaderSyncFrontiers {
+            finalized_height: block::Height(6),
+            verified_block_tip: stranded.0,
+            verified_block_hash: stranded.1,
+        },
+        Some(stranded),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+    let peers = [peer(73), peer(74)];
+
+    for peer_id in peers.iter().cloned() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            block::Height(0),
+            block::Height(12),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+
+    // Depths double per failed round (1, 2, 4, 8, ...) and the target never
+    // walks below the finalized height: 9, 8, 6, then floored at 6.
+    for (round, expected_target) in [9_u32, 8, 6, 6].into_iter().enumerate() {
+        let target =
+            drive_non_linking_until_reanchor_query(&mut fixture, non_linking.clone()).await;
+        assert_eq!(
+            target,
+            block::Height(expected_target),
+            "unexpected walk-back target in round {round}"
+        );
+        fixture
+            .handle
+            .send(HeaderSyncEvent::ReanchorTargetLoaded {
+                height: target,
+                hash: Some(block::Hash([0x90 + round as u8; 32])),
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stranded_single_peer_link_failures_do_not_walk_back() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let stranded = (block::Height(2), block::Hash([0xDD; 32]));
+    let non_linking = mainnet_header(&BLOCK_MAINNET_3_BYTES);
+
+    let mut startup = HeaderSyncStartup::new(
+        network,
+        anchor,
+        HeaderSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: stranded.0,
+            verified_block_hash: stranded.1,
+        },
+        Some(stranded),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+    let mut tip = fixture.handle.subscribe_tip();
+    let peer_id = peer(75);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    for _ in 0..5 {
+        let (served_peer, start_height, _count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(served_peer, peer_id);
+        assert_eq!(start_height, block::Height(3));
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireMessage {
+                peer: served_peer,
+                msg: headers_message_from(start_height, vec![non_linking.clone()]),
+            })
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), tip.changed())
+            .await
+            .is_err(),
+        "one peer alone must not walk the stranded frontier back"
+    );
+    assert_eq!(fixture.handle.best_header_tip(), stranded);
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 

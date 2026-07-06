@@ -283,6 +283,13 @@ pub(crate) async fn drive_header_sync_actions(
                     "suppressing Zakura header range commit until state driver is wired"
                 );
             }
+            HeaderSyncAction::QueryReanchorTarget { height } => {
+                // No state driver is wired here, so answer "no local header"
+                // to keep the reactor's walk-back state machine live.
+                let _ = handle
+                    .send(HeaderSyncEvent::ReanchorTargetLoaded { height, hash: None })
+                    .await;
+            }
             HeaderSyncAction::QueryBestHeaderTip
             | HeaderSyncAction::QueryMissingBlockBodies { .. }
             | HeaderSyncAction::BodyGaps { .. }

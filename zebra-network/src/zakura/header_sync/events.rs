@@ -217,6 +217,13 @@ pub enum HeaderSyncEvent {
     },
     /// State finalized or verified-body frontiers changed.
     StateFrontiersChanged(HeaderSyncFrontiers),
+    /// State answered a [`HeaderSyncAction::QueryReanchorTarget`] walk-back query.
+    ReanchorTargetLoaded {
+        /// The queried height.
+        height: block::Height,
+        /// The locally stored header hash at `height`, if one exists.
+        hash: Option<block::Hash>,
+    },
     /// State successfully committed a header range.
     HeaderRangeCommitted {
         /// First committed height.
@@ -282,6 +289,7 @@ impl HeaderSyncEvent {
             Self::WireDecodeFailed { .. } => "wire_decode_failed",
             Self::WireProtocolFailure { .. } => "wire_protocol_failure",
             Self::StateFrontiersChanged(_) => "state_frontiers_changed",
+            Self::ReanchorTargetLoaded { .. } => "reanchor_target_loaded",
             Self::HeaderRangeCommitted { .. } => "header_range_committed",
             Self::HeaderRangeCommitFailed { .. } => "header_range_commit_failed",
             Self::HeaderRangeResponseFinished { .. } => "header_range_response_finished",
@@ -320,6 +328,12 @@ pub enum HeaderSyncAction {
     },
     /// Ask state for the durable best header tip.
     QueryBestHeaderTip,
+    /// Ask state for the locally stored header hash at `height`, so the
+    /// stranded-frontier walk-back can re-anchor below the verified block tip.
+    QueryReanchorTarget {
+        /// The height to re-anchor to if a local header exists there.
+        height: block::Height,
+    },
     /// Ask state for a bounded contiguous range of headers.
     QueryHeadersByHeightRange {
         /// Peer that requested the range.
