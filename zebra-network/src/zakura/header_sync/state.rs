@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use zebra_chain::history_tree::HistoryTree;
+
 use super::{error::*, events::*, scheduler::*, validation::*, wire::*, *};
 use crate::zakura::{
     HeaderSyncServiceSummary, ServicePeerDirection, DEFAULT_LIVE_SERVICE_SUMMARY_TTL,
@@ -8,6 +12,10 @@ pub(super) const HEADER_SYNC_ADVISORY_BACKOFF: Duration = Duration::from_secs(60
 pub(super) const HEADER_SYNC_ADVISORY_TTL: Duration = DEFAULT_LIVE_SERVICE_SUMMARY_TTL;
 pub(super) const HEADER_SYNC_STALE_ANCHOR_LINK_FAILURES: u32 = 3;
 pub(super) const HEADER_SYNC_STALE_ANCHOR_DISTINCT_PEERS: usize = 2;
+/// Below-anchor checkpoint backfill is unused by the current sync wiring and cannot verify
+/// roots (backward ranges fold onto the previous checkpoint's tree, which this reactor never
+/// tracks), so it stays disabled. See [`HeaderSyncCore::refresh_backward_range`].
+pub(super) const BACKWARD_CHECKPOINT_BACKFILL_ENABLED: bool = false;
 
 #[derive(Clone, Debug)]
 pub(super) struct HeaderSyncCore {
@@ -17,20 +25,31 @@ pub(super) struct HeaderSyncCore {
     pub(super) verified_block_hash: block::Hash,
     pub(super) best_header_tip: block::Height,
     pub(super) best_header_hash: block::Hash,
+    pub(super) best_header_parent_hash: Option<block::Hash>,
+    /// History tree positioned at the parent of the next forward range.
+    ///
+    /// Seeded at startup from durable state and repositioned as ranges commit, so peer-supplied
+    /// roots can be folded and authenticated against header commitments. The empty tree is the
+    /// natural pre-Heartwood value.
+    pub(super) best_header_history_tree: Arc<HistoryTree>,
     pub(super) peers: HashMap<ZakuraPeerId, PeerHeaderState>,
     pub(super) parked_peers: HashSet<ZakuraPeerId>,
     pub(super) seen: HeaderHashDedup,
     pub(super) pending_new_blocks: HashSet<block::Hash>,
     pub(super) schedule: RangeScheduler,
-    pub(super) pending_commits: HashMap<PendingCommitKey, RangeRequest>,
+    pub(super) pending_commits: HashMap<PendingCommitKey, PendingHeaderCommit>,
     pub(super) advisory: HashMap<ZakuraPeerId, HeaderSyncAdvisoryPeerState>,
     pub(super) stale_anchor: StaleAnchorFailures,
+    /// True while a `QueryBestHeaderHistoryTree` rebuild is outstanding, so a run of forward ranges
+    /// that all find the tree stale dispatches only one reload.
+    pub(super) rebuild_in_flight: bool,
 }
 
 impl HeaderSyncCore {
     pub(super) fn new(startup: &HeaderSyncStartup) -> Result<Self, HeaderSyncStartError> {
         validate_anchor(&startup.network, startup.anchor)?;
         let (best_header_tip, best_header_hash) = startup.best_header_tip.unwrap_or(startup.anchor);
+        let best_header_history_tree = startup.best_header_history_tree.clone();
 
         Ok(Self {
             anchor: startup.anchor,
@@ -39,6 +58,8 @@ impl HeaderSyncCore {
             verified_block_hash: startup.frontiers.verified_block_hash,
             best_header_tip,
             best_header_hash,
+            best_header_parent_hash: startup.best_header_parent_hash,
+            best_header_history_tree,
             peers: HashMap::new(),
             parked_peers: HashSet::new(),
             seen: HeaderHashDedup::default(),
@@ -47,6 +68,7 @@ impl HeaderSyncCore {
             pending_commits: HashMap::new(),
             advisory: HashMap::new(),
             stale_anchor: StaleAnchorFailures::default(),
+            rebuild_in_flight: false,
         })
     }
 
@@ -63,7 +85,28 @@ impl HeaderSyncCore {
         }
 
         let checkpoints = startup.network.checkpoint_list();
-        let Some(start) = next_height(self.best_header_tip) else {
+        // Commitment-root work only runs through the VCT fast-sync handoff boundary.
+        // The root at `last_checkpoint` is confirmed by the next header, so root-carrying
+        // ranges stop once the frontier reaches `last_checkpoint + 1`.
+        let last_checkpoint = startup.last_checkpoint_height;
+        let root_regime_end = next_height(last_checkpoint).unwrap_or(last_checkpoint);
+        // Only persist roots for below-checkpoint heights this node forward-syncs but has
+        // not committed yet.
+        let root_region_floor = self.anchor.0.max(self.finalized_height);
+        let below_root_boundary =
+            root_region_floor < last_checkpoint && self.best_header_tip < root_regime_end;
+        let want_tree_aux_roots = below_root_boundary;
+
+        // Root-carrying ranges redeliver the tip header so its root can be confirmed.
+        let overlap_forward_range = below_root_boundary
+            && self
+                .best_header_parent_hash
+                .is_some_and(|_| self.best_header_tip > block::Height(0));
+        let Some(start) = (if overlap_forward_range {
+            Some(self.best_header_tip)
+        } else {
+            next_height(self.best_header_tip)
+        }) else {
             return;
         };
         let mut end = best_peer_tip;
@@ -77,6 +120,10 @@ impl HeaderSyncCore {
                 finalized = true;
             }
         }
+        // Keep root-carrying ranges at or below the confirming header for the last checkpoint.
+        if below_root_boundary {
+            end = end.min(root_regime_end);
+        }
 
         let count = count_between(start, end);
         if count == 0 {
@@ -85,14 +132,28 @@ impl HeaderSyncCore {
         self.schedule.ensure_forward(RangeRequest {
             start_height: start,
             count,
-            anchor_hash: self.best_header_hash,
+            anchor_hash: if overlap_forward_range {
+                self.best_header_parent_hash
+                    .expect("overlapped ranges have a parent hash")
+            } else {
+                self.best_header_hash
+            },
             finalized,
-            want_tree_aux_roots: true,
+            want_tree_aux_roots,
             priority: RangePriority::Forward,
         });
     }
 
     pub(super) fn refresh_backward_range(&mut self, startup: &HeaderSyncStartup) {
+        // Below-anchor checkpoint backfill is explicitly disabled: backward ranges fold onto the
+        // previous checkpoint's tree, which this reactor never tracks, so their roots cannot be
+        // verified, and the current node wiring never consumes backfilled headers. Leaving the
+        // scheduling live would silently emit unsupported below-anchor `GetHeaders` requests.
+        // Re-enable once backfill has a consumer and checkpoint-bracket tree tracking.
+        if !BACKWARD_CHECKPOINT_BACKFILL_ENABLED {
+            return;
+        }
+
         if self.anchor.0 == block::Height(0) {
             return;
         }
@@ -121,6 +182,27 @@ impl HeaderSyncCore {
             priority: RangePriority::Backward,
         });
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingHeaderCommit {
+    /// The full range requested from the peer.
+    ///
+    /// A peer may legally return a short prefix of the requested range. Keep the
+    /// requested range so success, local commit failure, and reanchor cleanup can
+    /// clear or retry the scheduler assignment that was created for the original
+    /// `GetHeaders` request.
+    pub(super) requested_range: RangeRequest,
+    /// The range actually delivered by the peer and handed to the commit path.
+    ///
+    /// Successful commit events are reported for this delivered range, so coverage
+    /// and verified frontier-tree lookup must use this range rather than the
+    /// original request.
+    pub(super) delivered_range: RangeRequest,
+    /// `Some` for aux-validated forward ranges; `None` for checkpoint-authenticated backward
+    /// backfill ranges, which persist no provisional roots and never install a frontier tree.
+    pub(super) verified_roots:
+        Option<zebra_chain::parallel::commitment_aux_verify::VerifiedHeaderCommitmentRoots>,
 }
 
 #[derive(Clone, Debug, Default)]

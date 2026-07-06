@@ -16,6 +16,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use zebra_chain::{
+    history_tree::{HistoryTree, HistoryTreeBlockParts},
     orchard,
     parallel::commitment_aux::BlockCommitmentRoots,
     parameters::{
@@ -30,7 +31,7 @@ use zebra_chain::{
 };
 use zebra_test::vectors::{
     BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES, BLOCK_MAINNET_4_BYTES,
-    BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_GENESIS_BYTES,
+    BLOCK_MAINNET_5_BYTES, BLOCK_MAINNET_GENESIS_BYTES, BLOCK_TESTNET_GENESIS_BYTES,
 };
 
 #[derive(Default)]
@@ -245,6 +246,48 @@ fn roots_from_height(start_height: block::Height, count: usize) -> Vec<BlockComm
         .collect()
 }
 
+/// Builds tree-aux roots whose Sapling root matches each header's own commitment on `network`, so a
+/// multi-block forward range passes header-auxiliary validation. Orchard/Ironwood roots stay empty
+/// (these fixtures are pre-NU5). Pre-Sapling heights keep the empty Sapling root.
+fn header_matching_roots(
+    network: &Network,
+    start_height: block::Height,
+    headers: &[Arc<block::Header>],
+) -> Vec<BlockCommitmentRoots> {
+    headers
+        .iter()
+        .enumerate()
+        .map(|(offset, header)| {
+            let offset = u32::try_from(offset).expect("test root count fits in u32");
+            let height = block::Height(start_height.0 + offset);
+            let sapling_root = match header
+                .commitment(network, height)
+                .expect("test header commitment parses")
+            {
+                zebra_chain::block::Commitment::FinalSaplingRoot(root) => root,
+                _ => sapling::tree::NoteCommitmentTree::default().root(),
+            };
+            BlockCommitmentRoots {
+                height,
+                sapling_root,
+                ..root_at(height)
+            }
+        })
+        .collect()
+}
+
+fn roots_message_from(
+    _start_height: block::Height,
+    headers: Vec<Arc<block::Header>>,
+    tree_aux_roots: Vec<BlockCommitmentRoots>,
+) -> HeaderSyncMessage {
+    HeaderSyncMessage::Headers {
+        body_sizes: vec![0; headers.len()],
+        headers,
+        tree_aux_roots,
+    }
+}
+
 async fn validate_headers_stateless_after_equihash_acceptance(
     headers: Vec<Arc<block::Header>>,
     context: HeaderSyncValidationContext<'_>,
@@ -322,6 +365,30 @@ fn regtest_network() -> Network {
     Network::new_regtest(Default::default())
 }
 
+fn pre_sapling_checkpoint_regtest(
+    checkpoint_height: block::Height,
+    checkpoint_hash: block::Hash,
+) -> Network {
+    let default_regtest = regtest_network();
+    Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            before_overwinter: Some(10),
+            ..Default::default()
+        },
+        checkpoints: Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), default_regtest.genesis_hash()),
+            (checkpoint_height, checkpoint_hash),
+        ])),
+        ..Default::default()
+    })
+}
+
+fn pre_sapling_test_header(bytes: &[u8], previous_hash: block::Hash) -> Arc<block::Header> {
+    let mut header = *mainnet_header(bytes);
+    header.previous_block_hash = previous_hash;
+    Arc::new(header)
+}
+
 fn checkpoint_testnet_with_hash(
     checkpoint_height: block::Height,
     checkpoint_hash: block::Hash,
@@ -393,6 +460,12 @@ fn startup_for(
     );
     startup.range_state_actions_enabled = true;
     startup.inbound_new_block_acceptance_enabled = true;
+    // Test networks (regtest/custom) usually carry only a genesis checkpoint, so their real
+    // `max_height()` is 0 and every height would count as above the VCT handoff boundary. These
+    // fixtures exercise the below-checkpoint fast-sync machinery (root verify/persist/overlap), so
+    // push the boundary above all test heights. Tests that specifically exercise the at/above-
+    // checkpoint behavior override `last_checkpoint_height` back down.
+    startup.last_checkpoint_height = block::Height::MAX;
     startup
 }
 
@@ -774,8 +847,7 @@ async fn next_non_query_action(actions: &mut mpsc::Receiver<HeaderSyncAction>) -
         let action = next_action(actions).await;
         if !matches!(
             action,
-            HeaderSyncAction::QueryBestHeaderTip
-                | HeaderSyncAction::QueryMissingBlockBodies { .. }
+            HeaderSyncAction::QueryMissingBlockBodies { .. }
                 | HeaderSyncAction::QueryHeadersByHeightRange { .. }
                 | HeaderSyncAction::HeaderAdvanced { .. }
         ) {
@@ -806,13 +878,34 @@ async fn next_outbound_get_headers(
                     HeaderSyncMessage::GetHeaders {
                         start_height,
                         count,
-                        want_tree_aux_roots: true,
+                        // Accept both root-carrying (below-checkpoint) and plain (at/above-checkpoint)
+                        // forward requests; callers that care about the flag assert it separately.
+                        want_tree_aux_roots: _,
                     },
             } => return (peer, start_height, count),
             HeaderSyncAction::Misbehavior { peer, reason } => {
                 panic!("unexpected misbehavior from {peer:?}: {reason:?}")
             }
             _ => {}
+        }
+    }
+}
+
+async fn next_forward_get_headers(
+    actions: &mut mpsc::Receiver<HeaderSyncAction>,
+) -> (block::Height, u32, bool) {
+    loop {
+        if let HeaderSyncAction::SendMessage {
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    count,
+                    want_tree_aux_roots,
+                },
+            ..
+        } = next_non_query_action(actions).await
+        {
+            return (start_height, count, want_tree_aux_roots);
         }
     }
 }
@@ -1139,18 +1232,54 @@ fn headers_codec_rejects_body_size_mismatch_truncation_and_trailing_bytes() {
 }
 
 #[test]
-fn decode_rejects_non_empty_headers_without_tree_aux_roots() {
+fn header_aux_validation_rejects_bad_roots_before_state_commit() {
+    let header = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let mut roots = root_at(block::Height(1));
+    roots.orchard_root =
+        orchard::tree::Root::try_from([0u8; 32]).expect("zero is a valid Pallas base field");
+
+    assert_ne!(
+        roots.orchard_root,
+        orchard::tree::NoteCommitmentTree::default().root(),
+        "the bad root must differ from the pre-NU5 empty Orchard root"
+    );
+
+    assert!(matches!(
+        validate_header_aux_commitments(
+            &Network::Mainnet,
+            &HistoryTree::default(),
+            &[header],
+            &[roots]
+        ),
+        Err(HeaderSyncWireError::InvalidHeaderCommitment(_))
+    ));
+}
+
+/// Tree-aux roots are an optional serving capability: a solicited non-empty `Headers`
+/// response without roots must decode (the reactor handles it non-punitively), while the
+/// same rootless frame with no correlated request is still rejected as unsolicited.
+#[test]
+fn decode_accepts_rootless_non_empty_solicited_headers() {
     let headers = vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)];
     let mut encoded = headers_message(headers).encode().unwrap();
     encoded[HEADER_SYNC_MESSAGE_TYPE_BYTES + HEADER_SYNC_COUNT_BYTES] = 0;
     encoded.truncate(encoded.len() - HEADER_SYNC_BLOCK_COMMITMENT_ROOTS_BYTES);
 
+    match HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)) {
+        Ok(HeaderSyncMessage::Headers {
+            headers,
+            tree_aux_roots,
+            ..
+        }) => {
+            assert_eq!(headers.len(), 1);
+            assert!(tree_aux_roots.is_empty());
+        }
+        other => panic!("rootless solicited Headers must decode, got {other:?}"),
+    }
+
     assert!(matches!(
-        HeaderSyncMessage::decode(&encoded, finalized_headers_context(1, 1)),
-        Err(HeaderSyncWireError::TreeAuxRootCountMismatch {
-            headers: 1,
-            roots: 0,
-        })
+        HeaderSyncMessage::decode(&encoded, HeaderSyncDecodeContext::control()),
+        Err(HeaderSyncWireError::UnsolicitedHeaders)
     ));
 }
 
@@ -1626,6 +1755,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
             start_height: start,
             tip_height: chunk_tip,
             tip_hash: block::Hash([4; 32]),
+            tip_parent_hash: Some(block::Hash([3; 32])),
         })
         .await
         .unwrap();
@@ -1641,10 +1771,7 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
             ..
         } = next_non_query_action(&mut fixture.actions).await
         {
-            assert_eq!(
-                start_height,
-                next_height(chunk_tip).expect("committed chunk tip has successor")
-            );
+            assert_eq!(start_height, chunk_tip,);
             assert_eq!(count, clamped_count);
             break;
         }
@@ -1685,45 +1812,6 @@ async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
         {
             assert_eq!(start_height, block::Height(4));
             assert_eq!(count, 5);
-            break;
-        }
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn scheduler_creates_backward_checkpoint_terminating_ranges() {
-    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(7);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id,
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        10,
-    )
-    .await;
-
-    loop {
-        if let HeaderSyncAction::SendMessage {
-            msg:
-                HeaderSyncMessage::GetHeaders {
-                    start_height,
-                    count,
-                    want_tree_aux_roots: true,
-                },
-            ..
-        } = next_non_query_action(&mut fixture.actions).await
-        {
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(count, 3);
             break;
         }
     }
@@ -1870,8 +1958,11 @@ async fn incoming_headers_match_outstanding_before_commit() {
     }
 }
 
+/// Tree-aux roots are an optional serving capability, so a rootless non-empty response to a
+/// root-carrying request is not misbehavior: the headers are unusable for the root regime and
+/// must not commit, but the peer keeps its session and the range is retried.
 #[tokio::test(flavor = "current_thread")]
-async fn rootless_non_empty_response_is_malformed() {
+async fn rootless_non_empty_response_retries_without_misbehavior() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
     let first_checkpoint = block::Height(3);
@@ -1909,12 +2000,21 @@ async fn rootless_non_empty_response_is_malformed() {
         .await
         .unwrap();
 
+    // The range must be retried (a fresh `GetHeaders` for the same start height), with no
+    // commit and no misbehavior along the way.
     loop {
         match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        want_tree_aux_roots: true,
+                        ..
+                    },
+                ..
+            } if start_height == start => break,
             HeaderSyncAction::Misbehavior { peer, reason } => {
-                assert_eq!(peer, peer_id);
-                assert_eq!(reason, HeaderSyncMisbehavior::MalformedMessage);
-                break;
+                panic!("rootless response must not be misbehavior, got {reason:?} from {peer:?}");
             }
             HeaderSyncAction::CommitHeaderRange { .. } => {
                 panic!("a rootless non-empty response must not commit")
@@ -1922,6 +2022,7 @@ async fn rootless_non_empty_response_is_malformed() {
             _ => {}
         }
     }
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2243,6 +2344,7 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
             start_height: block::Height(1),
             tip_height: block::Height(2),
             tip_hash: block::Hash([2; 32]),
+            tip_parent_hash: None,
         })
         .await
         .unwrap();
@@ -2300,6 +2402,7 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
             start_height: block::Height(1),
             tip_height: block::Height(1),
             tip_hash: committed_hash,
+            tip_parent_hash: None,
         })
         .await
         .unwrap();
@@ -2472,6 +2575,7 @@ async fn material_tip_advance_sends_rate_limited_unsolicited_status() {
                 tip_hash: block::Hash(
                     [u8::try_from(height.0).expect("test heights fit in u8"); 32],
                 ),
+                tip_parent_hash: None,
             })
             .await
             .unwrap();
@@ -2713,6 +2817,9 @@ async fn reconnect_clears_session_bound_outstanding_ranges() {
 #[tokio::test(flavor = "current_thread")]
 async fn full_block_committed_covers_outstanding_height() {
     let network = regtest_network();
+    // A full-block commit covers the outstanding height and advances the header frontier (which tracks
+    // the committed chain). The in-memory tree is untouched; a later forward range would rebuild it
+    // lazily if it needed it.
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
         (block::Height(0), network.genesis_hash()),
@@ -3904,6 +4011,7 @@ async fn header_sync_metrics_record_status_range_new_block_dedup_and_violation()
             start_height: next_height(first_checkpoint).expect("checkpoint has a successor"),
             tip_height: next_height(first_checkpoint).expect("checkpoint has a successor"),
             tip_hash: committed_hash,
+            tip_parent_hash: None,
         })
         .await
         .unwrap();
@@ -4032,6 +4140,7 @@ async fn committed_range_updates_best_tip_watch_and_does_not_advance_finality() 
             start_height: block::Height(1),
             tip_height: block::Height(1),
             tip_hash,
+            tip_parent_hash: None,
         })
         .await
         .unwrap();
@@ -4039,6 +4148,409 @@ async fn committed_range_updates_best_tip_watch_and_does_not_advance_finality() 
     tip.changed().await.unwrap();
     assert_eq!(*tip.borrow(), (block::Height(1), tip_hash));
     assert_ne!(fixture.handle.best_header_tip().0, block::Height(0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_header_aux_roots_score_before_commit() {
+    let default_regtest = regtest_network();
+    let block1 = pre_sapling_test_header(&BLOCK_MAINNET_1_BYTES, default_regtest.genesis_hash());
+    let block1_hash = block::Hash::from(block1.as_ref());
+    let network = pre_sapling_checkpoint_regtest(block::Height(1), block1_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(81);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    let mut roots = roots_from_height(start_height, 1);
+    roots[0].sapling_root =
+        sapling::tree::Root::try_from([1u8; 32]).expect("test Sapling root is valid");
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: roots_message_from(start_height, vec![block1], roots),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+                break;
+            }
+            HeaderSyncAction::CommitHeaderRange { .. } => {
+                panic!("invalid header aux roots must not reach state commit")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_header_aux_roots_reach_commit_before_advancing_tip() {
+    let default_regtest = regtest_network();
+    let block1 = pre_sapling_test_header(&BLOCK_MAINNET_1_BYTES, default_regtest.genesis_hash());
+    let block1_hash = block::Hash::from(block1.as_ref());
+    let network = pre_sapling_checkpoint_regtest(block::Height(1), block1_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+    let peer_id = peer(82);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(1),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(1));
+    assert_eq!(count, 1);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: finalized_headers_message_from(start_height, vec![block1]),
+        })
+        .await
+        .unwrap();
+
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                peer,
+                start_height,
+                headers,
+                verified_roots,
+                ..
+            } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(start_height, block::Height(1));
+                assert_eq!(headers.len(), 1);
+                let verified_roots =
+                    verified_roots.expect("forward header range carries verified roots");
+                assert!(
+                    verified_roots.confirmed_roots().is_empty(),
+                    "a one-header range verifies but has no confirmed prefix yet"
+                );
+                assert_eq!(fixture.handle.best_header_tip().0, block::Height(0));
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// When the in-memory tree is behind the header frontier — here a startup with a durable best header
+/// tip (4) but an empty tree, standing in for a non-Zakura commit that ran the frontier ahead of the
+/// tree — the forward range that needs the tree triggers exactly one `QueryBestHeaderHistoryTree`
+/// lazy rebuild (guarded), with no commit and no misbehavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_header_aux_tree_triggers_single_lazy_rebuild() {
+    let block4 = mainnet_header(&BLOCK_MAINNET_4_BYTES);
+    let block4_hash = block::Hash::from(block4.as_ref());
+    let block5 = mainnet_header(&BLOCK_MAINNET_5_BYTES);
+    let block5_hash = block::Hash::from(block5.as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(5), block5_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(4), block4_hash)),
+    ));
+    let peer_id = peer(83);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(5),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(5));
+    assert_eq!(count, 1);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id,
+            msg: finalized_headers_message_from(start_height, vec![block5]),
+        })
+        .await
+        .unwrap();
+
+    // The stale tree triggers exactly one rebuild at the current frontier; never a commit or a score.
+    let mut rebuilds = 0;
+    for _ in 0..16 {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            fixture.actions.recv(),
+        )
+        .await
+        {
+            Ok(Some(HeaderSyncAction::QueryBestHeaderHistoryTree {
+                best_header_tip, ..
+            })) => {
+                assert_eq!(best_header_tip, block::Height(4));
+                rebuilds += 1;
+            }
+            Ok(Some(HeaderSyncAction::CommitHeaderRange { .. })) => {
+                panic!("a stale tree must not commit the range");
+            }
+            Ok(Some(HeaderSyncAction::Misbehavior { .. })) => {
+                panic!("a stale tree must not score the peer");
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    assert_eq!(
+        rebuilds, 1,
+        "a stale tree triggers exactly one lazy rebuild"
+    );
+}
+
+/// A failed rebuild (`BestHeaderHistoryTreeLoaded { history_tree: None }`, e.g. a state read error)
+/// must clear the in-flight guard so a subsequent stale forward range can re-trigger the rebuild — the
+/// guard must never wedge future rebuilds. Regression test for the lazy-rebuild robustness path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_rebuild_clears_guard_and_retriggers() {
+    let block4 = mainnet_header(&BLOCK_MAINNET_4_BYTES);
+    let block4_hash = block::Hash::from(block4.as_ref());
+    let block5 = mainnet_header(&BLOCK_MAINNET_5_BYTES);
+    let block5_hash = block::Hash::from(block5.as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(5), block5_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(4), block4_hash)),
+    ));
+    let peer_id = peer(88);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(5),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // Drive one stale-tree round, feed a *failed* rebuild, then drive a second stale-tree round.
+    // A second `QueryBestHeaderHistoryTree` must be dispatched — proving the guard was cleared by the
+    // `None` completion rather than wedged.
+    let mut rebuilds = 0;
+    for round in 0..2 {
+        let (_p, start_height, _c) = next_outbound_get_headers(&mut fixture.actions).await;
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireMessage {
+                peer: peer_id.clone(),
+                msg: finalized_headers_message_from(start_height, vec![block5.clone()]),
+            })
+            .await
+            .unwrap();
+        // Wait for this round's rebuild dispatch.
+        let mut saw = false;
+        for _ in 0..16 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                fixture.actions.recv(),
+            )
+            .await
+            {
+                Ok(Some(HeaderSyncAction::QueryBestHeaderHistoryTree { .. })) => {
+                    rebuilds += 1;
+                    saw = true;
+                    break;
+                }
+                Ok(Some(HeaderSyncAction::SendMessage {
+                    msg: HeaderSyncMessage::GetHeaders { .. },
+                    ..
+                })) => { /* the retry re-request; ignore until the rebuild dispatch */ }
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(saw, "round {round}: expected a rebuild dispatch");
+        // Fail the rebuild — the guard must clear so the next round can re-trigger.
+        fixture
+            .handle
+            .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
+                best_header_tip: block::Height(4),
+                reanchor: None,
+                history_tree: None,
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        rebuilds, 2,
+        "a failed rebuild must clear the guard so the next stale range re-triggers it",
+    );
+}
+
+/// A gossiped `NewBlock` accepted ahead of the header frontier advances the header tip — the frontier
+/// tracks the committed chain. It does not touch the in-memory tree; if this were below the checkpoint
+/// and a later forward range needed the tree, the lazy rebuild would reposition it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gossip_tip_advance_advances_tip() {
+    let network = Network::Mainnet;
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+    let hash = block.hash();
+    let height = block.coinbase_height().expect("test block has height");
+    let fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
+    ));
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::NewBlockAccepted {
+            peer: peer(84),
+            height,
+            hash,
+            block,
+        })
+        .await
+        .unwrap();
+
+    // The tip advances to the gossiped height (the tip watch is updated synchronously by the bump).
+    let mut tip = fixture.handle.subscribe_tip();
+    for _ in 0..16 {
+        if fixture.handle.best_header_tip().0 == height {
+            break;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), tip.changed()).await;
+    }
+    assert_eq!(
+        fixture.handle.best_header_tip().0,
+        height,
+        "a gossip accepted ahead of the frontier must advance the header tip",
+    );
+}
+
+/// The root-carrying regime runs *through* the last checkpoint inclusive — the VCT handoff block at
+/// `last_checkpoint` reads its own persisted root — and stops one block above. Confirming the root at
+/// `last_checkpoint` needs the `last_checkpoint + 1` header, so the range is capped there.
+#[tokio::test(flavor = "current_thread")]
+async fn forward_ranges_request_roots_through_the_last_checkpoint() {
+    let network = regtest_network();
+    let genesis = (block::Height(0), network.genesis_hash());
+    let boundary = block::Height(10);
+
+    // Well below the checkpoint: request roots; capped at `last_checkpoint + 1` (heights 1..=11) so the
+    // range reaching the checkpoint can confirm the root at `last_checkpoint`.
+    let mut below = startup_for(network.clone(), genesis, None);
+    below.last_checkpoint_height = boundary;
+    let mut fixture = spawn_test_reactor(below);
+    connect_peer(&fixture, peer(70)).await;
+    advertise_tip(
+        &fixture,
+        peer(70),
+        genesis.0,
+        block::Height(20),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+    let (start, count, want) = next_forward_get_headers(&mut fixture.actions).await;
+    assert_eq!(start, block::Height(1));
+    assert!(want, "a below-checkpoint forward range must request roots");
+    assert_eq!(
+        count, 11,
+        "the range is capped one block above the last checkpoint"
+    );
+
+    // Frontier at the last checkpoint: still in the root regime (this range confirms the root at
+    // `last_checkpoint` via the successor header).
+    let mut at = startup_for(
+        network.clone(),
+        genesis,
+        Some((boundary, block::Hash([10; 32]))),
+    );
+    at.last_checkpoint_height = boundary;
+    let mut fixture = spawn_test_reactor(at);
+    connect_peer(&fixture, peer(71)).await;
+    advertise_tip(
+        &fixture,
+        peer(71),
+        boundary,
+        block::Height(20),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+    let (_start, _count, want) = next_forward_get_headers(&mut fixture.actions).await;
+    assert!(
+        want,
+        "the range reaching the last checkpoint still requests roots (to confirm its own root)",
+    );
+
+    // Frontier one block above the last checkpoint: plain, no roots.
+    let mut above = startup_for(
+        network.clone(),
+        genesis,
+        Some((block::Height(11), block::Hash([11; 32]))),
+    );
+    above.last_checkpoint_height = boundary;
+    let mut fixture = spawn_test_reactor(above);
+    connect_peer(&fixture, peer(72)).await;
+    advertise_tip(
+        &fixture,
+        peer(72),
+        block::Height(11),
+        block::Height(20),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+    let (start, _count, want) = next_forward_get_headers(&mut fixture.actions).await;
+    assert_eq!(start, block::Height(12));
+    assert!(
+        !want,
+        "above the last checkpoint the forward range is plain"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4085,9 +4597,12 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
             .handle
             .send(HeaderSyncEvent::WireMessage {
                 peer: served_peer,
-                msg: headers_message_from(
+                // Above the checkpoint the range carries no roots, so the (non-linking) response must
+                // be rootless too — else it is rejected as malformed before the link check.
+                msg: roots_message_from(
                     start_height,
                     vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+                    Vec::new(),
                 ),
             })
             .await
@@ -4111,8 +4626,10 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
                 msg:
                     HeaderSyncMessage::GetHeaders {
                         start_height,
-                        count: _,
-                        want_tree_aux_roots: true,
+                        // This test exercises reanchor-and-resume, not the root regime; accept either
+                        // flag (regtest's genesis-only `max_height` makes the resumed range's root
+                        // flag a degenerate edge).
+                        ..
                     },
                 ..
             } if saw_reanchor_action && start_height == expected_start => {
@@ -4170,9 +4687,12 @@ async fn single_peer_forward_link_failures_do_not_reanchor_globally() {
             .handle
             .send(HeaderSyncEvent::WireMessage {
                 peer: served_peer,
-                msg: headers_message_from(
+                // Above the checkpoint the range carries no roots, so the (non-linking) response must
+                // be rootless too — else it is rejected as malformed before the link check.
+                msg: roots_message_from(
                     start_height,
                     vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+                    Vec::new(),
                 ),
             })
             .await
@@ -4232,11 +4752,15 @@ async fn forward_genesis_backfill_reaches_checkpoint_before_finalized_commit() {
         }
     }
 
+    // Supply roots matching each header's own Sapling commitment: this multi-block forward range is
+    // aux-validated (Sapling activates at height 2 on this fixture network), so empty roots would be
+    // correctly rejected. The commit path is exercised with roots that pass validation.
+    let matching_roots = header_matching_roots(&network, block::Height(1), &headers);
     fixture
         .handle
         .send(HeaderSyncEvent::WireMessage {
             peer: peer_id.clone(),
-            msg: finalized_headers_message(headers.to_vec()),
+            msg: roots_message_from(block::Height(1), headers.to_vec(), matching_roots),
         })
         .await
         .unwrap();
@@ -4315,77 +4839,17 @@ async fn truncated_finalized_backfill_is_rejected_before_commit() {
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn backward_checkpoint_backfill_accepts_linking_run_as_finalized() {
-    let headers = [
-        mainnet_header(&BLOCK_MAINNET_1_BYTES),
-        mainnet_header(&BLOCK_MAINNET_2_BYTES),
-        mainnet_header(&BLOCK_MAINNET_3_BYTES),
-    ];
-    let checkpoint_hash = block::Hash::from(headers[2].as_ref());
-    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
-    let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(45);
-
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id.clone(),
-        block::Height(0),
-        block::Height(3),
-        DEFAULT_HS_RANGE,
-        1,
-    )
-    .await;
-    loop {
-        if matches!(
-            next_non_query_action(&mut fixture.actions).await,
-            HeaderSyncAction::SendMessage {
-                msg: HeaderSyncMessage::GetHeaders { .. },
-                ..
-            }
-        ) {
-            break;
-        }
-    }
-
-    fixture
-        .handle
-        .send(HeaderSyncEvent::WireMessage {
-            peer: peer_id.clone(),
-            msg: headers_message(headers.to_vec()),
-        })
-        .await
-        .unwrap();
-
-    match next_non_query_action(&mut fixture.actions).await {
-        HeaderSyncAction::CommitHeaderRange {
-            peer,
-            start_height,
-            headers,
-            finalized,
-            ..
-        } => {
-            assert_eq!(peer, peer_id);
-            assert_eq!(start_height, block::Height(1));
-            assert_eq!(headers.len(), 3);
-            assert!(finalized);
-        }
-        action => panic!("unexpected action: {action:?}"),
-    }
-}
+// Backward (below-anchor) checkpoint backfill is explicitly disabled (see
+// `backward_checkpoint_backfill_is_explicitly_disabled`), so finalized checkpoint-range
+// validation is exercised through the forward genesis-backfill path below.
 
 #[tokio::test(flavor = "current_thread")]
 async fn checkpoint_backfill_rejects_non_contiguous_run_before_commit() {
-    let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
+    let (network, _checkpoint_hash) = checkpoint_regtest(block::Height(3));
     let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), checkpoint_hash),
-        Some((block::Height(3), checkpoint_hash)),
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
     ));
     let peer_id = peer(10);
 
@@ -4497,10 +4961,12 @@ async fn checkpoint_backfill_rejects_checkpoint_hash_mismatch_before_commit() {
     ];
     let divergent_checkpoint_hash = block::Hash::from(headers[0].as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), divergent_checkpoint_hash);
+    // Forward genesis backfill toward the (divergent) first checkpoint: the linking run's last
+    // header must hash-match the checkpoint or the whole finalized range is rejected.
     let mut fixture = spawn_test_reactor(startup_for(
-        network,
-        (block::Height(3), divergent_checkpoint_hash),
-        Some((block::Height(3), divergent_checkpoint_hash)),
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        None,
     ));
     let peer_id = peer(46);
 
@@ -4875,4 +5341,549 @@ async fn misbehavior_is_recorded_without_disconnecting_the_peer() {
         !probe_cancel.is_cancelled(),
         "misbehavior is record-only: an InvalidStatus peer must NOT be disconnected",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for requested-vs-delivered range identity and backfill.
+//
+// A server cannot serve the tree-aux root for its own header tip (the root is
+// only confirmed by the next header), so the zebrad driver truncates
+// root-carrying responses to root coverage. A successful-but-short delivery is
+// therefore an expected, honest response — exactly the two-node bootstrap
+// shape where a follower requests up to a header-leading peer's tip. The tests
+// below assert the correct requester-side bookkeeping for that shape.
+// ---------------------------------------------------------------------------
+
+/// A Heartwood-at-1 regtest (PoW checks are skipped on regtest) with checkpoints at genesis and
+/// `checkpoint_height`, so synthetic post-Heartwood header chains carrying real ZIP-221
+/// commitments can drive the root-verifying forward path.
+fn heartwood_regtest_with_checkpoint(
+    checkpoint_height: block::Height,
+    checkpoint_hash: block::Hash,
+) -> Network {
+    let default_regtest = regtest_network();
+    Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(1),
+            blossom: Some(1),
+            heartwood: Some(1),
+            canopy: Some(1),
+            ..Default::default()
+        },
+        checkpoints: Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), default_regtest.genesis_hash()),
+            (checkpoint_height, checkpoint_hash),
+        ])),
+        ..Default::default()
+    })
+}
+
+/// Builds a synthetic post-Heartwood header: real solution bytes from a mainnet vector, relinked
+/// to `previous_hash`, with `commitment_bytes` set to the ZIP-221 chain history root of the
+/// parent tree (the all-zero reserved value at Heartwood activation, where the tree is empty).
+fn chain_history_test_header(
+    bytes: &[u8],
+    previous_hash: block::Hash,
+    parent_tree: &HistoryTree,
+) -> Arc<block::Header> {
+    let mut header = *mainnet_header(bytes);
+    header.previous_block_hash = previous_hash;
+    header.commitment_bytes = parent_tree
+        .hash()
+        .map(<[u8; 32]>::from)
+        .unwrap_or(block::CHAIN_HISTORY_ACTIVATION_RESERVED)
+        .into();
+    Arc::new(header)
+}
+
+/// Folds the empty-root parts for `header` at `height` into `tree` — the same ZIP-221 leaf the
+/// header-sync verifier folds when the peer supplies `root_at(height)` alongside the header.
+fn fold_empty_roots(
+    network: &Network,
+    tree: &mut HistoryTree,
+    header: &block::Header,
+    height: block::Height,
+) {
+    let roots = root_at(height);
+    tree.push_from_parts(
+        network,
+        HistoryTreeBlockParts {
+            header,
+            height,
+            sapling_root: &roots.sapling_root,
+            orchard_root: &roots.orchard_root,
+            ironwood_root: &roots.ironwood_root,
+            sapling_tx: roots.sapling_tx,
+            orchard_tx: roots.orchard_tx,
+            ironwood_tx: roots.ironwood_tx,
+        },
+    )
+    .expect("synthetic test chain extends the history tree");
+}
+
+/// Regression test: a legally-short served forward range must not
+/// permanently wedge the scheduler.
+///
+/// The short prefix commits, but the assignment for the *requested* range is only cleared on
+/// disconnect, local commit failure, or timeout — never on the success path — and `prune_covered`
+/// never fires for it because the requested end was never covered. The stale assignment then
+/// blocks `RangeScheduler::ensure`'s start-height dedupe from ever queueing the follow-up
+/// overlapping range (which shares the requested range's start height), so the follower wedges
+/// below the checkpoint and never re-requests the missing height.
+#[tokio::test(flavor = "current_thread")]
+async fn short_served_forward_range_must_not_wedge_the_scheduler() {
+    let block3 = mainnet_header(&BLOCK_MAINNET_3_BYTES);
+    let block3_hash = block::Hash::from(block3.as_ref());
+    let block4 = mainnet_header(&BLOCK_MAINNET_4_BYTES);
+    let block4_hash = block::Hash::from(block4.as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), block3_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some((block::Height(3), block3_hash)),
+    ));
+    let peer_id = peer(90);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(5),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // The follower requests up to the peer's tip: heights 4..=5, with roots.
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(4));
+    assert_eq!(count, 2);
+
+    // The peer serves a legally-short prefix: header 4 only, with its matching root (a server
+    // can never serve the root for its own tip, so it truncates the response to root coverage).
+    let matching_roots =
+        header_matching_roots(&network, block::Height(4), std::slice::from_ref(&block4));
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: roots_message_from(block::Height(4), vec![block4], matching_roots),
+        })
+        .await
+        .unwrap();
+
+    // The short prefix is accepted and committed.
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                peer,
+                start_height,
+                headers,
+                ..
+            } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(start_height, block::Height(4));
+                assert_eq!(headers.len(), 1, "the short prefix is a legal response");
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(4),
+            tip_height: block::Height(4),
+            tip_hash: block4_hash,
+            tip_parent_hash: Some(block3_hash),
+        })
+        .await
+        .unwrap();
+
+    // The uncovered remainder (height 5) must be re-requested from the peer. If the stale
+    // requested-range assignment is never cleared, the scheduler dedupes every follow-up range
+    // sharing its start height and no further `GetHeaders` is ever sent.
+    let requested_remainder = async {
+        loop {
+            match fixture.actions.recv().await {
+                Some(HeaderSyncAction::SendMessage {
+                    msg:
+                        HeaderSyncMessage::GetHeaders {
+                            start_height,
+                            count,
+                            ..
+                        },
+                    ..
+                }) => {
+                    let end = start_height.0.saturating_add(count.saturating_sub(1));
+                    if start_height.0 <= 5 && end >= 5 {
+                        break;
+                    }
+                }
+                Some(HeaderSyncAction::Misbehavior { peer, reason }) => {
+                    panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+                }
+                Some(_) => {}
+                None => panic!("reactor action channel closed"),
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), requested_remainder)
+        .await
+        .expect("scheduler wedged: height 5 was never re-requested after a legally-short delivery");
+}
+
+/// Regression test: a legally-short delivery must install the frontier
+/// history tree it just verified, keyed by the *delivered* range — not discard it because the
+/// pending-commit lookup matches on the requested range end.
+///
+/// `pending_header_history_tree` matches pending commits on the requested `range.end_height()`,
+/// so a short (but successful) delivery commits its headers while the verified tree for the
+/// delivered prefix is dropped. The next overlapping forward range then finds the cached tree
+/// behind its parent and dispatches a `QueryBestHeaderHistoryTree` rebuild — an O(frontier)
+/// durable-state fold per short range — instead of committing directly.
+#[tokio::test(flavor = "current_thread")]
+async fn short_served_forward_range_must_install_the_delivered_frontier_tree() {
+    let genesis_hash = regtest_network().genesis_hash();
+
+    // A synthetic post-Heartwood chain 1..=4 with real ZIP-221 commitments: header H commits to
+    // the history tree of its parent, so the trees are folded alongside the headers.
+    let mut tree = HistoryTree::default();
+    let h1 = chain_history_test_header(&BLOCK_MAINNET_1_BYTES, genesis_hash, &tree);
+    let h1_hash = block::Hash::from(h1.as_ref());
+    let network = heartwood_regtest_with_checkpoint(block::Height(1), h1_hash);
+
+    fold_empty_roots(&network, &mut tree, &h1, block::Height(1));
+    let tree_at_1 = tree.clone();
+    let h2 = chain_history_test_header(&BLOCK_MAINNET_2_BYTES, h1_hash, &tree);
+    let h2_hash = block::Hash::from(h2.as_ref());
+    fold_empty_roots(&network, &mut tree, &h2, block::Height(2));
+    let h3 = chain_history_test_header(&BLOCK_MAINNET_3_BYTES, h2_hash, &tree);
+    let h3_hash = block::Hash::from(h3.as_ref());
+    fold_empty_roots(&network, &mut tree, &h3, block::Height(3));
+    let h4 = chain_history_test_header(&BLOCK_MAINNET_4_BYTES, h3_hash, &tree);
+
+    let mut startup = startup_for(
+        network.clone(),
+        (block::Height(0), genesis_hash),
+        Some((block::Height(1), h1_hash)),
+    );
+    startup.best_header_history_tree = Arc::new(tree_at_1);
+    let mut fixture = spawn_test_reactor(startup);
+    let peer_id = peer(91);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // Heights 2..=4 are requested with roots.
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(2));
+    assert_eq!(count, 3);
+
+    // The peer legally serves a short prefix (2..=3); verification confirms and folds height 2,
+    // positioning the just-verified frontier tree at height 2.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: headers_message_from(block::Height(2), vec![h2.clone(), h3.clone()]),
+        })
+        .await
+        .unwrap();
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                start_height,
+                headers,
+                verified_roots,
+                ..
+            } => {
+                assert_eq!(start_height, block::Height(2));
+                assert_eq!(headers.len(), 2);
+                let verified_roots = verified_roots.expect("root-carrying range verifies");
+                assert_eq!(
+                    verified_roots.confirmed_tip(),
+                    Some(block::Height(2)),
+                    "the delivered prefix confirms height 2 and folds its root",
+                );
+                break;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(2),
+            tip_height: block::Height(3),
+            tip_hash: h3_hash,
+            tip_parent_hash: Some(h2_hash),
+        })
+        .await
+        .unwrap();
+
+    // The next forward range overlaps the committed tip: heights 3..=4 anchored on header 2.
+    let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(3));
+    assert_eq!(count, 2);
+
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: headers_message_from(block::Height(3), vec![h3, h4]),
+        })
+        .await
+        .unwrap();
+
+    // With the delivered tree installed at height 2, this range verifies against it and commits
+    // directly. Discarding the just-verified tree instead forces a `QueryBestHeaderHistoryTree`
+    // rebuild from durable state — the recurring-cost path this test guards against.
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::CommitHeaderRange {
+                start_height,
+                headers,
+                ..
+            } => {
+                assert_eq!(start_height, block::Height(3));
+                assert_eq!(headers.len(), 2);
+                break;
+            }
+            HeaderSyncAction::QueryBestHeaderHistoryTree { .. } => {
+                panic!(
+                    "the verified frontier tree for the delivered prefix was discarded: the \
+                     overlapping follow-up range should verify against the installed tree, not \
+                     trigger a durable-state rebuild"
+                );
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Regression test for the runtime lazy-rebuild reanchor. A non-Zakura path (checkpoint/legacy sync)
+/// runs the header tip ahead of the folded tree, so the forward range that needs the tree triggers a
+/// `QueryBestHeaderHistoryTree` rebuild. When durable roots have a gap the rebuilt tree lands *below*
+/// `best_header_tip - 1`, so the answer carries a [`HeaderFrontierReanchor`]. The reactor must drop its
+/// tip onto the rebuilt tree (emitting `HeaderReanchored`) and then verify the resumed forward range
+/// against it — instead of keeping the stale higher tip and re-triggering the identical deterministic
+/// rebuild forever (the pre-fix loop, where the frontier was discarded before reaching the reactor).
+#[tokio::test(flavor = "current_thread")]
+async fn lazy_rebuild_reanchors_tip_onto_lower_frontier_tree() {
+    let genesis_hash = regtest_network().genesis_hash();
+
+    // A synthetic post-Heartwood chain 1..=4 with real ZIP-221 commitments, so the resumed range can
+    // fold and verify against the reinstalled tree.
+    let mut tree = HistoryTree::default();
+    let h1 = chain_history_test_header(&BLOCK_MAINNET_1_BYTES, genesis_hash, &tree);
+    let h1_hash = block::Hash::from(h1.as_ref());
+    let network = heartwood_regtest_with_checkpoint(block::Height(1), h1_hash);
+
+    fold_empty_roots(&network, &mut tree, &h1, block::Height(1));
+    let tree_at_1 = tree.clone();
+    let h2 = chain_history_test_header(&BLOCK_MAINNET_2_BYTES, h1_hash, &tree);
+    let h2_hash = block::Hash::from(h2.as_ref());
+    fold_empty_roots(&network, &mut tree, &h2, block::Height(2));
+    let h3 = chain_history_test_header(&BLOCK_MAINNET_3_BYTES, h2_hash, &tree);
+    let h3_hash = block::Hash::from(h3.as_ref());
+    fold_empty_roots(&network, &mut tree, &h3, block::Height(3));
+    let h4 = chain_history_test_header(&BLOCK_MAINNET_4_BYTES, h3_hash, &tree);
+
+    // The header tip sits at 3 (bumped by a non-Zakura commit) but the header-frontier tree is still
+    // the empty startup default — the frontier folded nothing above the verified tip at 1.
+    let mut fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(1), h1_hash),
+        Some((block::Height(3), h3_hash)),
+    ));
+    let peer_id = peer(94);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // The forward range above the stale tip is requested and served; aux validation finds the tree
+    // behind the range's parent and dispatches exactly one rebuild against the current tip (3).
+    let (served_peer, start_height, _count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(served_peer, peer_id);
+    assert_eq!(start_height, block::Height(4));
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: headers_message_from(block::Height(4), vec![h4.clone()]),
+        })
+        .await
+        .unwrap();
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryBestHeaderHistoryTree {
+                best_header_tip, ..
+            } => {
+                assert_eq!(best_header_tip, block::Height(3));
+                break;
+            }
+            HeaderSyncAction::CommitHeaderRange { .. } => {
+                panic!("a stale tree must not commit the range")
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+
+    // Answer the rebuild with a tree that folded only to the confirmed frontier at height 1 — below
+    // `best_header_tip - 1` (2), a durable-root gap — plus the reanchor onto it.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
+            best_header_tip: block::Height(3),
+            reanchor: Some(HeaderFrontierReanchor {
+                tip: block::Height(2),
+                tip_hash: h2_hash,
+                parent_hash: h1_hash,
+            }),
+            history_tree: Some(Arc::new(tree_at_1)),
+        })
+        .await
+        .unwrap();
+
+    // The reactor drops the tip onto the rebuilt tree and resumes the forward range from the reanchor,
+    // verifying it against the reinstalled tree — never a second rebuild.
+    let mut saw_reanchor = false;
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::HeaderReanchored { new, .. } => {
+                assert_eq!(new.0, block::Height(2), "tip reanchored onto the frontier");
+                saw_reanchor = true;
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        ..
+                    },
+                ..
+            } => {
+                // Ignore the pre-reanchor retry of the stale [4..] range; only serve the range the
+                // reactor resumes from the reanchor at height 2.
+                if start_height != block::Height(2) {
+                    continue;
+                }
+                let headers = [h2.clone(), h3.clone(), h4.clone()];
+                let take = (count as usize).min(headers.len());
+                fixture
+                    .handle
+                    .send(HeaderSyncEvent::WireMessage {
+                        peer: peer_id.clone(),
+                        msg: headers_message_from(block::Height(2), headers[..take].to_vec()),
+                    })
+                    .await
+                    .unwrap();
+            }
+            HeaderSyncAction::CommitHeaderRange { start_height, .. } => {
+                assert_eq!(start_height, block::Height(2));
+                break;
+            }
+            HeaderSyncAction::QueryBestHeaderHistoryTree { .. } => panic!(
+                "the reanchored tree was ignored: the resumed range re-triggered a durable-state \
+                 rebuild instead of verifying against the reinstalled tree"
+            ),
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_reanchor,
+        "the tip must be reanchored down onto the rebuilt frontier tree"
+    );
+}
+
+/// Regression test: backward (below-anchor) checkpoint backfill is unused by the current sync
+/// wiring and does not work with root verification (backward ranges fold onto the previous
+/// checkpoint's tree, which this reactor never tracks), so it must be explicitly disabled rather
+/// than left scheduling silently.
+///
+/// A node anchored at a checkpoint above genesis whose forward frontier already matches the
+/// peer's tip has no forward work; any `GetHeaders` it emits is the backward backfill bracket.
+/// It must emit none.
+#[tokio::test(flavor = "current_thread")]
+async fn backward_checkpoint_backfill_is_explicitly_disabled() {
+    let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
+    let mut fixture = spawn_test_reactor(startup_for(
+        network,
+        (block::Height(3), checkpoint_hash),
+        Some((block::Height(3), checkpoint_hash)),
+    ));
+    let peer_id = peer(92);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(3),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // Drain actions for a bounded window: no backward `GetHeaders` may be scheduled.
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        if let HeaderSyncAction::SendMessage {
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    count,
+                    ..
+                },
+            ..
+        } = action
+        {
+            panic!(
+                "backward checkpoint backfill must be explicitly disabled, but a below-anchor \
+                 range was requested: start {start_height:?} count {count}"
+            );
+        }
+    }
 }
