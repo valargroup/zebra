@@ -194,15 +194,11 @@ impl HeaderSyncReactor {
             }
             HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
                 best_header_tip,
-                reanchor,
+                rebase,
                 history_tree,
             } => {
-                self.handle_best_header_history_tree_loaded(
-                    best_header_tip,
-                    reanchor,
-                    history_tree,
-                )
-                .await;
+                self.handle_best_header_history_tree_loaded(best_header_tip, rebase, history_tree)
+                    .await;
             }
             HeaderSyncEvent::HeaderRangeCommitted {
                 start_height,
@@ -294,7 +290,7 @@ impl HeaderSyncReactor {
                 })
                 .await;
             }
-            FrontierChange::HeaderAdvanced | FrontierChange::HeaderReanchored => {}
+            FrontierChange::HeaderAdvanced | FrontierChange::HeaderRebased => {}
         }
     }
 
@@ -457,7 +453,7 @@ impl HeaderSyncReactor {
             .or_insert_with(|| {
                 PeerHeaderState::new(
                     session,
-                    self.state.anchor,
+                    self.state.trusted_sync_start,
                     self.startup.config.advertised_max_headers_per_response(),
                     self.startup.config.advertised_max_inflight_requests(),
                     self.startup.status_refresh_interval,
@@ -643,7 +639,7 @@ impl HeaderSyncReactor {
         self.state.verified_block_tip = frontiers.verified_block_tip;
         self.state.verified_block_hash = frontiers.verified_block_hash;
         if self.state.best_header_tip <= self.state.verified_block_tip {
-            self.state.stale_anchor.reset();
+            self.state.stale_link.reset();
         }
         self.schedule().await;
     }
@@ -653,7 +649,7 @@ impl HeaderSyncReactor {
     /// (`history_tree == None`) does not wedge future rebuilds; installs only on success and only if
     /// the best header tip has not moved since the query.
     ///
-    /// When `reanchor` is set the durable header-root frontier folded *below* `best_header_tip - 1`
+    /// When `rebase` is set the durable header-root frontier folded *below* `best_header_tip - 1`
     /// (a gap left by a non-Zakura commit racing ahead), so the tree does not reach the current tip's
     /// parent. Drop the header frontier onto the rebuilt tree — mirroring the startup resume — so the
     /// next forward range's parent matches the tree; otherwise the range would re-trigger the identical
@@ -662,41 +658,37 @@ impl HeaderSyncReactor {
     async fn handle_best_header_history_tree_loaded(
         &mut self,
         best_header_tip: block::Height,
-        reanchor: Option<HeaderFrontierReanchor>,
+        rebase: Option<HeaderFrontierRebase>,
         history_tree: Option<Arc<zebra_chain::history_tree::HistoryTree>>,
     ) {
         self.state.rebuild_in_flight = false;
         if let Some(history_tree) = history_tree {
             if best_header_tip == self.state.best_header_tip {
                 self.state.best_header_history_tree = history_tree;
-                if let Some(reanchor) = reanchor {
-                    self.reanchor_header_frontier(reanchor).await;
+                if let Some(rebase) = rebase {
+                    self.rebase_header_frontier(rebase).await;
                 }
             }
         }
         self.schedule().await;
     }
 
-    /// Reanchors the header frontier down onto a just-rebuilt tree that folded below the current tip.
+    /// Rebases the header frontier down onto a just-rebuilt tree that folded below the current tip.
     ///
     /// Discards the forward schedule/commit state stranded above the frontier and repositions the tip
-    /// at `reanchor.tip`, anchored on `reanchor.parent_hash` (where the tree sits), so `schedule`
-    /// re-derives a fresh overlap forward range from the reanchored tip. Analogous to
-    /// [`Self::reanchor_to_verified_block_tip`], but lands on the confirmed header-root frontier rather
+    /// at `rebase.tip`, linked on `rebase.parent_hash` (where the tree sits), so `schedule`
+    /// re-derives a fresh overlap forward range from the rebased tip. Analogous to
+    /// [`Self::rebase_to_verified_block_tip`], but lands on the confirmed header-root frontier rather
     /// than the verified block tip, keeping the header lead already re-validated below the frontier.
-    async fn reanchor_header_frontier(&mut self, reanchor: HeaderFrontierReanchor) {
-        metrics::counter!("sync.header.history_tree.reanchor").increment(1);
+    async fn rebase_header_frontier(&mut self, rebase: HeaderFrontierRebase) {
+        metrics::counter!("sync.header.history_tree.rebase").increment(1);
         self.state.schedule.clear_forward();
         self.state
             .pending_commits
             .retain(|_, commit| commit.requested_range.priority != RangePriority::Forward);
         self.cancel_forward_outstanding();
-        self.publish_best_tip_reanchored(
-            reanchor.tip,
-            reanchor.tip_hash,
-            Some(reanchor.parent_hash),
-        )
-        .await;
+        self.publish_best_tip_rebased(rebase.tip, rebase.tip_hash, Some(rebase.parent_hash))
+            .await;
     }
 
     async fn handle_header_range_committed(
@@ -714,7 +706,9 @@ impl HeaderSyncReactor {
             None,
             None,
         );
-        let committed_history_tree = self.pending_header_history_tree(start_height, tip_height);
+        // One scan resolves both the cursor that issued the range (priority) and the post-fold
+        // frontier tree, before the retain loop below drops the pending commits.
+        let committed = self.pending_committed_range(start_height, tip_height);
         let mut clear_assignments = Vec::new();
         self.state.pending_commits.retain(|_, commit| {
             let delivered = commit.delivered_range.is_within(start_height, tip_height);
@@ -726,6 +720,22 @@ impl HeaderSyncReactor {
         for range in clear_assignments {
             self.state.schedule.retire_request(range);
         }
+
+        let backfill = matches!(committed, Some((RangePriority::Backfill, _)));
+        let committed_history_tree = committed.and_then(|(_, tree)| tree);
+        if backfill {
+            // Backfill commits advance the backfill frontier only: they never mark forward
+            // coverage, move `best_header_tip`, or produce body gaps.
+            self.handle_backfill_range_committed(
+                tip_height,
+                tip_hash,
+                tip_parent_hash,
+                committed_history_tree,
+            );
+            self.schedule().await;
+            return;
+        }
+
         self.state
             .schedule
             .mark_range_covered(start_height, tip_height);
@@ -743,6 +753,44 @@ impl HeaderSyncReactor {
         }
         self.notify_body_gaps().await;
         self.schedule().await;
+    }
+
+    /// Advances the backfill frontier for a committed backfill range.
+    ///
+    /// A bracket commit (`tip <= sync_start`) moves the frontier and installs the post-fold tree
+    /// (positioned at the tip's parent — the overlap link target of the next bracket). The stitch
+    /// commit (`tip == sync_start + 1`) confirms the sync-start root and completes the backfill;
+    /// the frontier itself stays at the sync start. A redelivered short prefix that does not
+    /// advance the frontier changes nothing.
+    fn handle_backfill_range_committed(
+        &mut self,
+        tip_height: block::Height,
+        tip_hash: block::Hash,
+        tip_parent_hash: Option<block::Hash>,
+        committed_history_tree: Option<Arc<zebra_chain::history_tree::HistoryTree>>,
+    ) {
+        let sync_start = self.state.trusted_sync_start;
+        if tip_height <= sync_start.0 && tip_height > self.state.backfill_tip {
+            self.state.backfill_tip = tip_height;
+            self.state.backfill_hash = tip_hash;
+            self.state.backfill_parent_hash = tip_parent_hash;
+            if let Some(tree) = committed_history_tree {
+                self.state.backfill_history_tree = tree;
+            }
+            // Backfill's staleness rule (in place of forward coverage): drop queued, assigned,
+            // and in-flight backfill work that ended at or below the advanced frontier, so fanout
+            // duplicates of a committed bracket don't loop against the repositioned tree. Late
+            // deliveries for the cancelled requests are tolerated like late covered responses.
+            self.state
+                .schedule
+                .retire_stale_backfill(self.state.backfill_tip);
+            self.cancel_stale_backfill_outstanding();
+        } else if next_height(sync_start.0) == Some(tip_height) {
+            self.state.backfill_sync_start_root_confirmed = true;
+            if let Some(tree) = committed_history_tree {
+                self.state.backfill_history_tree = tree;
+            }
+        }
     }
 
     async fn handle_header_range_commit_failed(
@@ -877,7 +925,7 @@ impl HeaderSyncReactor {
         match msg {
             HeaderSyncMessage::Status(status) => {
                 metrics::counter!("sync.header.peer.status.received").increment(1);
-                if status.anchor_height > status.tip_height {
+                if status.sync_start_height > status.tip_height {
                     self.report_misbehavior(peer, HeaderSyncMisbehavior::InvalidStatus)
                         .await;
                     return;
@@ -896,7 +944,7 @@ impl HeaderSyncReactor {
                 }
                 peer_state.advertised_tip = status.tip_height;
                 peer_state.advertised_hash = status.tip_hash;
-                peer_state.anchor = status.anchor_height;
+                peer_state.sync_start_height = status.sync_start_height;
                 peer_state.max_headers_per_response =
                     clamp_advertised_range(status.max_headers_per_response);
                 peer_state.max_inflight_requests = status
@@ -1237,11 +1285,11 @@ impl HeaderSyncReactor {
                 outstanding.expected_max_count,
             ),
         };
-        if let Err(error) = validate_header_range_links(outstanding.range.anchor_hash, &headers) {
+        if let Err(error) = validate_header_range_links(outstanding.range.link_hash, &headers) {
             debug!(
                 ?peer,
                 ?error,
-                anchor_hash = ?outstanding.range.anchor_hash,
+                link_hash = ?outstanding.range.link_hash,
                 start_height = ?outstanding.range.start_height,
                 count = ?header_count,
                 "Zakura header-sync rejected header range links"
@@ -1259,7 +1307,7 @@ impl HeaderSyncReactor {
                 return;
             }
             if self
-                .handle_possible_stale_anchor_link_failure(&peer, outstanding.range, &error)
+                .handle_possible_stale_link_failure(&peer, outstanding.range, &error)
                 .await
             {
                 self.schedule().await;
@@ -1327,16 +1375,39 @@ impl HeaderSyncReactor {
             }
         }
 
-        // Only below-checkpoint forward ranges carry a verifiable frontier tree and confirmed roots.
-        // Backward (checkpoint-backfill) ranges are authenticated by the checkpoint hash, not ZIP-221
-        // header commitments (they fold onto the previous checkpoint's tree, not the forward frontier
-        // this reactor caches). Above-checkpoint forward ranges request no roots (`want_tree_aux_roots`
-        // is false past the VCT handoff boundary) and are fully re-verified at block commit. Both
-        // commit their headers with no provisional roots.
-        let verified_roots = if outstanding.range.priority == RangePriority::Forward
-            && outstanding.range.want_tree_aux_roots
-        {
-            match self.validate_forward_header_aux_commitments(
+        // A backfill delivery covering the trusted sync start must reproduce the trusted hash at
+        // that height. This authenticates the non-finalized stitch range (whose end is not a
+        // checkpoint) at the reactor; state re-checks every checkpoint height as defense in depth.
+        if outstanding.range.priority == RangePriority::Backfill {
+            let sync_start = self.state.trusted_sync_start;
+            if sync_start.0 >= outstanding.range.start_height && sync_start.0 <= end_height {
+                let offset = usize::try_from(sync_start.0 .0 - outstanding.range.start_height.0)
+                    .expect("in-span offset is bounded by the delivered header count");
+                let delivered_hash = block::Hash::from(headers[offset].as_ref());
+                if delivered_hash != sync_start.1 {
+                    self.trace_range_validation_rejected(
+                        &peer,
+                        outstanding.range,
+                        header_count,
+                        "checkpoint",
+                        "sync_start_hash_mismatch",
+                    );
+                    self.report_misbehavior(peer.clone(), HeaderSyncMisbehavior::InvalidRange)
+                        .await;
+                    self.state.schedule.retry(outstanding.range);
+                    self.schedule().await;
+                    return;
+                }
+            }
+        }
+
+        // Every root-carrying range is verified against its cursor's frontier tree before commit:
+        // below-checkpoint forward ranges against the forward frontier tree, below-sync-start
+        // backfill ranges against the backfill tree. Above-checkpoint forward ranges request no
+        // roots (`want_tree_aux_roots` is false past the VCT handoff boundary), are fully
+        // re-verified at block commit, and commit their headers with no provisional roots.
+        let verified_roots = if outstanding.range.want_tree_aux_roots {
+            match self.validate_header_aux_commitments_for_range(
                 &peer,
                 outstanding.range,
                 &headers,
@@ -1344,7 +1415,8 @@ impl HeaderSyncReactor {
             ) {
                 Ok(verified_roots) => Some(verified_roots),
                 Err(error)
-                    if matches!(error, HeaderSyncWireError::MissingHeaderHistoryTree { .. }) =>
+                    if matches!(error, HeaderSyncWireError::MissingHeaderHistoryTree { .. })
+                        && outstanding.range.priority == RangePriority::Forward =>
                 {
                     debug!(
                         ?peer,
@@ -1381,6 +1453,40 @@ impl HeaderSyncReactor {
                     }
                     self.state.schedule.clear_assignment(outstanding.range);
                     self.state.schedule.retry(outstanding.range);
+                    self.schedule().await;
+                    return;
+                }
+                Err(error)
+                    if matches!(error, HeaderSyncWireError::MissingHeaderHistoryTree { .. }) =>
+                {
+                    // The backfill tree mismatched the range parent. Nothing else moves the
+                    // backfill region (the forward rebuild is keyed to `best_header_tip`, and
+                    // full-block commits below the sync start do not occur in the intended
+                    // deployment), so this indicates an internal bug rather than a racing commit.
+                    // Do not dispatch the forward tree rebuild — it would install the wrong tree.
+                    // Clear the assignment and retry; a persistently wedged backfill recovers on
+                    // restart, which reseeds the cursor at genesis.
+                    warn!(
+                        ?peer,
+                        ?error,
+                        start_height = ?outstanding.range.start_height,
+                        count = ?header_count,
+                        "Zakura header-sync backfill tree mismatched its range parent"
+                    );
+                    metrics::counter!("sync.header.backfill.tree_mismatch").increment(1);
+                    self.trace_range_validation_rejected(
+                        &peer,
+                        outstanding.range,
+                        header_count,
+                        "header_aux",
+                        header_sync_wire_error_kind(&error),
+                    );
+                    self.state.schedule.clear_assignment(outstanding.range);
+                    // A range that ended at or below the backfill frontier is a stale duplicate
+                    // of an already-committed bracket and is dropped; anything else is retried.
+                    if outstanding.range.end_height() > self.state.backfill_tip {
+                        self.state.schedule.retry(outstanding.range);
+                    }
                     self.schedule().await;
                     return;
                 }
@@ -1428,18 +1534,20 @@ impl HeaderSyncReactor {
         );
         let _ = self.dispatch_action(HeaderSyncAction::CommitHeaderRange {
             peer,
-            anchor: outstanding.range.anchor_hash,
+            link_hash: outstanding.range.link_hash,
             start_height: outstanding.range.start_height,
             headers,
             body_sizes,
             verified_roots: verified_roots.map(Box::new),
             finalized: outstanding.range.finalized,
+            backfill: outstanding.range.priority == RangePriority::Backfill,
         });
     }
 
-    // Validates the header auxiliary commitments for the given range.
-    // Returns the verified root payload if it is valid, otherwise returns an error.
-    fn validate_forward_header_aux_commitments(
+    // Validates the header auxiliary commitments for the given range against its cursor's
+    // frontier tree: forward ranges use the forward frontier tree, backfill ranges the backfill
+    // tree. Returns the verified root payload if it is valid, otherwise returns an error.
+    fn validate_header_aux_commitments_for_range(
         &self,
         peer: &ZakuraPeerId,
         range: RangeRequest,
@@ -1449,31 +1557,44 @@ impl HeaderSyncReactor {
         zebra_chain::parallel::commitment_aux_verify::VerifiedHeaderCommitmentRoots,
         HeaderSyncWireError,
     > {
-        if !range.want_tree_aux_roots || range.priority != RangePriority::Forward {
+        if !range.want_tree_aux_roots {
             return Err(HeaderSyncWireError::MissingHeaderHistoryTree {
                 height: range.start_height,
-                hash: range.anchor_hash,
+                hash: range.link_hash,
             });
         }
 
         let parent_height = previous_height(range.start_height)
             .ok_or(HeaderSyncWireError::HeightOutOfRange(range.start_height.0))?;
-        if !self.cached_header_history_tree_matches(parent_height, range.anchor_hash) {
+        let tree_matches = match range.priority {
+            RangePriority::Forward => {
+                self.cached_header_history_tree_matches(parent_height, range.link_hash)
+            }
+            RangePriority::Backfill => {
+                self.cached_backfill_history_tree_matches(parent_height, range.link_hash)
+            }
+        };
+        if !tree_matches {
             debug!(
                 ?peer,
                 start_height = ?range.start_height,
-                anchor_hash = ?range.anchor_hash,
+                link_hash = ?range.link_hash,
+                priority = range.priority.label(),
                 "Zakura header-sync cannot validate header auxiliary data without parent history tree"
             );
             return Err(HeaderSyncWireError::MissingHeaderHistoryTree {
                 height: parent_height,
-                hash: range.anchor_hash,
+                hash: range.link_hash,
             });
         }
 
+        let parent_history_tree = match range.priority {
+            RangePriority::Forward => &self.state.best_header_history_tree,
+            RangePriority::Backfill => &self.state.backfill_history_tree,
+        };
         validate_header_aux_commitments(
             &self.startup.network,
-            &self.state.best_header_history_tree,
+            parent_history_tree,
             headers,
             tree_aux_roots,
         )
@@ -1498,14 +1619,39 @@ impl HeaderSyncReactor {
         height_matches && hash_matches
     }
 
-    // Returns the history tree for the pending commit that matches the given start and tip heights.
-    // Backward (checkpoint-authenticated) commits carry no verified roots, so they never install a
-    // frontier tree; the caller keeps its existing tree in that case.
-    fn pending_header_history_tree(
+    // Returns true if the backfill history tree matches the given parent height and hash.
+    // Mirrors [`Self::cached_header_history_tree_matches`] for the backfill cursor.
+    fn cached_backfill_history_tree_matches(
+        &self,
+        parent_height: block::Height,
+        parent_hash: block::Hash,
+    ) -> bool {
+        let height_matches = header_history_tree_is_at_height(
+            &self.state.backfill_history_tree,
+            parent_height,
+            &self.startup.network,
+        );
+        let hash_matches = (parent_height == self.state.backfill_tip
+            && parent_hash == self.state.backfill_hash)
+            || (previous_height(self.state.backfill_tip) == Some(parent_height)
+                && self.state.backfill_parent_hash == Some(parent_hash));
+
+        height_matches && hash_matches
+    }
+
+    // Returns the priority and post-fold history tree of the pending commit matching the given
+    // start and tip heights. `None` when no pending commit matches (e.g. the startup
+    // best-header-tip reload, where the driver synthesizes the committed event); the tree is
+    // `None` for plain above-checkpoint ranges, which carry no verified roots — the caller keeps
+    // its existing tree in both cases.
+    fn pending_committed_range(
         &self,
         start_height: block::Height,
         tip_height: block::Height,
-    ) -> Option<Arc<zebra_chain::history_tree::HistoryTree>> {
+    ) -> Option<(
+        RangePriority,
+        Option<Arc<zebra_chain::history_tree::HistoryTree>>,
+    )> {
         self.state
             .pending_commits
             .values()
@@ -1513,11 +1659,18 @@ impl HeaderSyncReactor {
                 commit.delivered_range.start_height == start_height
                     && commit.delivered_range.end_height() == tip_height
             })
-            .and_then(|commit| commit.verified_roots.as_ref())
-            .map(|verified_roots| Arc::new(verified_roots.tree().clone()))
+            .map(|commit| {
+                (
+                    commit.delivered_range.priority,
+                    commit
+                        .verified_roots
+                        .as_ref()
+                        .map(|verified_roots| Arc::new(verified_roots.tree().clone())),
+                )
+            })
     }
 
-    async fn handle_possible_stale_anchor_link_failure(
+    async fn handle_possible_stale_link_failure(
         &mut self,
         peer: &ZakuraPeerId,
         range: RangeRequest,
@@ -1528,35 +1681,35 @@ impl HeaderSyncReactor {
             || range.finalized
             || self.state.best_header_tip <= self.state.verified_block_tip
         {
-            self.state.stale_anchor.reset();
+            self.state.stale_link.reset();
             return false;
         }
 
-        self.state.stale_anchor.record(peer.clone());
-        metrics::counter!("sync.header.stale_anchor.link_failure").increment(1);
+        self.state.stale_link.record(peer.clone());
+        metrics::counter!("sync.header.stale_link.link_failure").increment(1);
 
-        if !self.state.stale_anchor.should_reanchor() {
+        if !self.state.stale_link.should_rebase() {
             self.state.schedule.clear_assignment(range);
             self.state.schedule.retry(range);
             return true;
         }
 
-        self.reanchor_to_verified_block_tip().await;
+        self.rebase_to_verified_block_tip().await;
         true
     }
 
-    async fn reanchor_to_verified_block_tip(&mut self) {
+    async fn rebase_to_verified_block_tip(&mut self) {
         let height = self.state.verified_block_tip;
         let hash = self.state.verified_block_hash;
-        metrics::counter!("sync.header.stale_anchor.reanchored").increment(1);
+        metrics::counter!("sync.header.stale_link.rebased").increment(1);
 
-        self.state.stale_anchor.reset();
+        self.state.stale_link.reset();
         self.state.schedule.clear_forward();
         self.state
             .pending_commits
             .retain(|_, commit| commit.requested_range.priority != RangePriority::Forward);
         self.cancel_forward_outstanding();
-        self.publish_best_tip_reanchored(height, hash, None).await;
+        self.publish_best_tip_rebased(height, hash, None).await;
     }
 
     async fn handle_timeouts(&mut self) {
@@ -1607,7 +1760,7 @@ impl HeaderSyncReactor {
         }
 
         self.state.refresh_forward_range(&self.startup);
-        self.state.refresh_backward_range(&self.startup);
+        self.state.refresh_backfill_range(&self.startup);
 
         let mut peer_ids: Vec<ZakuraPeerId> = self.state.peers.keys().cloned().collect();
         peer_ids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
@@ -1793,7 +1946,7 @@ impl HeaderSyncReactor {
         self.broadcast_status_refresh().await;
     }
 
-    async fn publish_best_tip_reanchored(
+    async fn publish_best_tip_rebased(
         &mut self,
         height: block::Height,
         hash: block::Hash,
@@ -1804,9 +1957,9 @@ impl HeaderSyncReactor {
         self.state.best_header_hash = hash;
         self.state.best_header_parent_hash = parent_hash;
         metrics::gauge!("sync.header.best_tip.height").set(height.0 as f64);
-        self.trace_frontier_reanchored(height, hash);
+        self.trace_frontier_rebased(height, hash);
         let _ = self.tip.send((height, hash));
-        let _ = self.dispatch_action(HeaderSyncAction::HeaderReanchored {
+        let _ = self.dispatch_action(HeaderSyncAction::HeaderRebased {
             old,
             new: (height, hash),
         });
@@ -1820,7 +1973,7 @@ impl HeaderSyncReactor {
             self.state.verified_block_hash = hash;
         }
         if self.state.best_header_tip <= self.state.verified_block_tip {
-            self.state.stale_anchor.reset();
+            self.state.stale_link.reset();
         }
     }
 
@@ -2167,8 +2320,8 @@ impl HeaderSyncReactor {
                 insert_height(row, hs_trace::HEIGHT, *height);
                 insert_hash(row, hs_trace::HASH, *hash);
             }
-            HeaderSyncAction::HeaderReanchored { old, new } => {
-                insert_optional_str(row, hs_trace::KIND, Some("header_reanchored"));
+            HeaderSyncAction::HeaderRebased { old, new } => {
+                insert_optional_str(row, hs_trace::KIND, Some("header_rebased"));
                 insert_height(row, hs_trace::HEIGHT, new.0);
                 insert_hash(row, hs_trace::HASH, new.1);
                 insert_height(row, hs_trace::RANGE_START, old.0);
@@ -2181,7 +2334,7 @@ impl HeaderSyncReactor {
             insert_peer(row, hs_trace::PEER, peer);
             insert_height(row, hs_trace::HEIGHT, status.tip_height);
             insert_hash(row, hs_trace::HASH, status.tip_hash);
-            insert_height(row, hs_trace::RANGE_START, status.anchor_height);
+            insert_height(row, hs_trace::RANGE_START, status.sync_start_height);
             insert_u64(
                 row,
                 hs_trace::ADVERTISED_CAP,
@@ -2200,7 +2353,7 @@ impl HeaderSyncReactor {
             insert_peer(row, hs_trace::PEER, peer);
             insert_height(row, hs_trace::HEIGHT, status.tip_height);
             insert_hash(row, hs_trace::HASH, status.tip_hash);
-            insert_height(row, hs_trace::RANGE_START, status.anchor_height);
+            insert_height(row, hs_trace::RANGE_START, status.sync_start_height);
             insert_u64(
                 row,
                 hs_trace::ADVERTISED_CAP,
@@ -2324,7 +2477,7 @@ impl HeaderSyncReactor {
             insert_peer(row, hs_trace::PEER, peer);
             insert_height(row, hs_trace::RANGE_START, range.start_height);
             insert_u64(row, hs_trace::RANGE_COUNT, u64::from(count));
-            insert_hash(row, hs_trace::ANCHOR_HASH, range.anchor_hash);
+            insert_hash(row, hs_trace::LINK_HASH, range.link_hash);
             insert_optional_str(row, hs_trace::VALIDATION_STAGE, Some(validation_stage));
             insert_optional_str(row, hs_trace::ERROR_KIND, Some(error_kind));
             insert_optional_str(
@@ -2415,7 +2568,7 @@ impl HeaderSyncReactor {
         });
     }
 
-    fn trace_frontier_reanchored(&self, height: block::Height, hash: block::Hash) {
+    fn trace_frontier_rebased(&self, height: block::Height, hash: block::Hash) {
         self.emit_trace(hs_trace::HEADER_FRONTIER_REANCHORED, |row| {
             insert_height(row, hs_trace::HEIGHT, height);
             insert_hash(row, hs_trace::HASH, hash);
@@ -2483,7 +2636,7 @@ impl HeaderSyncReactor {
         HeaderSyncStatus {
             tip_height: self.state.best_header_tip,
             tip_hash: self.state.best_header_hash,
-            anchor_height: self.state.anchor.0,
+            sync_start_height: self.state.trusted_sync_start.0,
             max_headers_per_response: self.startup.config.advertised_max_headers_per_response(),
             max_inflight_requests: self.startup.config.advertised_max_inflight_requests(),
         }
@@ -2493,10 +2646,13 @@ impl HeaderSyncReactor {
         for peer in self.state.peers.values_mut() {
             let mut index = 0;
             while index < peer.outstanding.len() {
-                if self
-                    .state
-                    .schedule
-                    .is_covered(peer.outstanding[index].range)
+                // Backfill ranges are exempt from covered checks (coverage tracks the forward
+                // frontier, and the stitch range deliberately overlaps forward-covered heights).
+                if peer.outstanding[index].range.priority == RangePriority::Forward
+                    && self
+                        .state
+                        .schedule
+                        .is_covered(peer.outstanding[index].range)
                 {
                     peer.outstanding.remove(index);
                     peer.late_covered_responses = peer.late_covered_responses.saturating_add(1);
@@ -2512,6 +2668,24 @@ impl HeaderSyncReactor {
             let mut index = 0;
             while index < peer.outstanding.len() {
                 if peer.outstanding[index].range.priority == RangePriority::Forward {
+                    peer.outstanding.remove(index);
+                    peer.late_covered_responses = peer.late_covered_responses.saturating_add(1);
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    /// Cancels in-flight backfill requests that ended at or below the backfill frontier — the
+    /// backfill counterpart of [`Self::cancel_covered_outstanding`].
+    fn cancel_stale_backfill_outstanding(&mut self) {
+        let backfill_tip = self.state.backfill_tip;
+        for peer in self.state.peers.values_mut() {
+            let mut index = 0;
+            while index < peer.outstanding.len() {
+                let range = peer.outstanding[index].range;
+                if range.priority == RangePriority::Backfill && range.end_height() <= backfill_tip {
                     peer.outstanding.remove(index);
                     peer.late_covered_responses = peer.late_covered_responses.saturating_add(1);
                 } else {
@@ -2598,7 +2772,7 @@ fn trace_header_sync_message_fields(
         HeaderSyncMessage::Status(status) => {
             insert_height(row, hs_trace::HEIGHT, status.tip_height);
             insert_hash(row, hs_trace::HASH, status.tip_hash);
-            insert_height(row, hs_trace::RANGE_START, status.anchor_height);
+            insert_height(row, hs_trace::RANGE_START, status.sync_start_height);
             insert_u64(
                 row,
                 hs_trace::ADVERTISED_CAP,

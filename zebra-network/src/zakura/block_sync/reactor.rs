@@ -628,7 +628,7 @@ impl BlockSyncReactor {
                     self.handle_state_frontiers_changed(state_frontiers).await;
                 }
             }
-            FrontierChange::HeaderReanchored => {
+            FrontierChange::HeaderRebased => {
                 self.state.best_header_tip = frontier.best_header.height;
                 self.state.best_header_hash = frontier.best_header.hash;
                 self.handle_chain_tip_reset(state_frontiers, false).await;
@@ -861,7 +861,7 @@ impl BlockSyncReactor {
         // outstanding-but-unreceived. Without this clause the producer would
         // re-queue that height and issue a duplicate concurrent fetch (the original
         // filter excluded it the same way; the stale outstanding clears on its own
-        // timeout). The hash is checked so a reanchor (different hash) still
+        // timeout). The hash is checked so a rebase (different hash) still
         // re-queues. The registry's outstanding is routine-owned, so this clause is
         // now backed by per-peer state independent of `work.in_flight`.
         let blocks: Vec<_> = blocks

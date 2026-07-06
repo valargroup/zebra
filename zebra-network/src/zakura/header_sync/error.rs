@@ -3,16 +3,16 @@ use super::*;
 /// Errors that prevent the header-sync reactor from starting.
 #[derive(Debug, Error)]
 pub enum HeaderSyncStartError {
-    /// The configured anchor is neither genesis nor a hash-matching checkpoint.
-    #[error("invalid Zakura header-sync anchor at height {anchor:?}")]
-    InvalidAnchor {
-        /// Rejected anchor.
-        anchor: (block::Height, block::Hash),
+    /// The configured trusted sync start is neither genesis nor a hash-matching checkpoint.
+    #[error("invalid Zakura header-sync trusted sync start at height {trusted_sync_start:?}")]
+    InvalidTrustedSyncStart {
+        /// Rejected trusted sync start.
+        trusted_sync_start: (block::Height, block::Hash),
     },
 
-    /// Only one anchor field was configured.
+    /// Only one trusted-sync-start config field was configured.
     #[error("Zakura header-sync anchor_height and anchor_hash must be configured together")]
-    IncompleteAnchor,
+    IncompleteTrustedSyncStart,
 }
 
 /// Structured wire and stateless-validation errors for stream 5.
@@ -117,8 +117,8 @@ pub enum HeaderSyncWireError {
     #[error("non-contiguous Zakura header-sync header run")]
     NonContiguousHeaders,
 
-    /// The first header in a range did not link to its anchor.
-    #[error("first Zakura header-sync range header does not link to anchor")]
+    /// The first header in a range did not link to its link target.
+    #[error("first Zakura header-sync range header does not link to its link hash")]
     FirstHeaderDoesNotLink,
 
     /// A header commitment did not match its supplied auxiliary data.

@@ -12,7 +12,7 @@ use zebra_chain::{
 };
 use zebra_network::zakura::{
     commit_state_trace as cs_trace, BlockSyncFrontiers, Frontier, FrontierChange,
-    HeaderFrontierReanchor, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
+    HeaderFrontierRebase, HeaderSyncAction, HeaderSyncCommitFailureKind, HeaderSyncEvent,
     HeaderSyncFrontiers, ZakuraEndpoint, ZakuraHeaderSyncDriverStartup, ZakuraTrace,
     DEFAULT_HS_RANGE,
 };
@@ -68,7 +68,7 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     // Rebuild the ZIP-221 history tree so post-Heartwood header-sync root verification can resume
     // immediately after a restart. The read returns the tree positioned at the highest *contiguous*
     // confirmed header-root frontier, and that frontier's `(height, hash)` — the single authoritative
-    // value we use both to anchor overlap and to pick the resume height.
+    // value we use both to link the overlap range and to pick the resume height.
     let (best_header_history_tree, (frontier_height, frontier_hash)) = match read_state
         .clone()
         .oneshot(zebra_state::ReadRequest::BestHeaderHistoryTree {
@@ -84,11 +84,11 @@ pub(crate) async fn zakura_header_sync_driver_startup(
         ))?,
     };
 
-    // Resume one block above the contiguous frontier (where the reconstructed tree sits), anchored at
+    // Resume one block above the contiguous frontier (where the reconstructed tree sits), linked at
     // it, so the first forward range re-validates from there. If the persisted roots have a one-block
     // gap (a header-tip advance that never overlapped), this resumes from the gap instead of capping
     // all the way back to the verified tip. With no header lead there is nothing to resume, so the
-    // durable tip is kept and no overlap anchor is set.
+    // durable tip is kept and no overlap link target is set.
     let (best_header_tip, best_header_parent_hash) =
         if durable_best_header_tip.0 > verified_block_tip.0 {
             let resume_height = frontier_height
@@ -145,18 +145,18 @@ pub(crate) async fn zakura_header_sync_driver_startup(
     })
 }
 
-/// Resolves the header-frontier reanchor a runtime lazy rebuild needs when the durable header-root
+/// Resolves the header-frontier rebase a runtime lazy rebuild needs when the durable header-root
 /// `frontier` folded *below* `best_header_tip - 1` (a gap left by a non-Zakura commit racing ahead).
 ///
 /// Mirrors the startup resume in [`zakura_header_sync_driver_startup`]: resume one block above the
-/// confirmed frontier, anchored on the frontier hash, looking up the resume header's hash. Returns
+/// confirmed frontier, linked on the frontier hash, looking up the resume header's hash. Returns
 /// `Ok(None)` when the frontier already reached `best_header_tip - 1` (the common no-gap rebuild, no
-/// reanchor needed).
-async fn header_frontier_reanchor<ReadState>(
+/// rebase needed).
+async fn header_frontier_rebase<ReadState>(
     read_state: ReadState,
     best_header_tip: block::Height,
     frontier: (block::Height, block::Hash),
-) -> Result<Option<HeaderFrontierReanchor>, Report>
+) -> Result<Option<HeaderFrontierRebase>, Report>
 where
     ReadState: Service<
             zebra_state::ReadRequest,
@@ -170,7 +170,7 @@ where
         .next()
         .map_err(|_| eyre!("header frontier height overflow"))?;
     // No gap: the tree folded to `best_header_tip - 1`, so its position already matches the parent of
-    // the next forward range. Nothing to reanchor — the plain tree install suffices.
+    // the next forward range. Nothing to rebase — the plain tree install suffices.
     if resume_height >= best_header_tip {
         return Ok(None);
     }
@@ -190,7 +190,7 @@ where
             "unexpected HeadersByHeightRange response: {response:?}"
         ))?,
     };
-    Ok(Some(HeaderFrontierReanchor {
+    Ok(Some(HeaderFrontierRebase {
         tip: resume_height,
         tip_hash,
         parent_hash: frontier_hash,
@@ -642,12 +642,13 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
             }
             HeaderSyncAction::CommitHeaderRange {
                 peer,
-                anchor,
+                link_hash,
                 start_height,
                 headers,
                 body_sizes,
                 verified_roots,
                 finalized: _finalized,
+                backfill,
             } => {
                 let count = u32::try_from(headers.len()).unwrap_or(u32::MAX);
                 // Persist only the header-authenticated confirmed prefix. The range tip's root is
@@ -659,7 +660,8 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                         verified_roots.confirmed_roots().to_vec()
                     });
                 let tree_aux_roots_len = u32::try_from(committed_roots.len()).unwrap_or(u32::MAX);
-                let tip_parent_hash = header_range_tip_parent_hash(anchor, start_height, &headers);
+                let tip_parent_hash =
+                    header_range_tip_parent_hash(link_hash, start_height, &headers);
                 emit_commit_state(
                     &trace,
                     cs_trace::COMMIT_START,
@@ -674,14 +676,15 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             cs_trace::TREE_AUX_ROOTS_LEN,
                             u64::from(tree_aux_roots_len),
                         );
-                        insert_cs_hash(row, cs_trace::HASH, anchor);
+                        insert_cs_hash(row, cs_trace::HASH, link_hash);
                     },
                 );
                 let started = Instant::now();
                 match state
                     .clone()
                     .oneshot(zebra_state::Request::CommitHeaderRange {
-                        anchor,
+                        // The state API keeps the legacy `anchor` name for the link hash.
+                        anchor: link_hash,
                         headers,
                         body_sizes,
                         tree_aux_roots: committed_roots,
@@ -726,13 +729,17 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             tip_hash,
                             count,
                         );
-                        publish_header_frontier(
-                            &handles.endpoint,
-                            tip_height,
-                            tip_hash,
-                            FrontierChange::HeaderAdvanced,
-                            &trace,
-                        );
+                        // Backfill commits land below the trusted sync start; publishing them
+                        // would drag the shared sync-exchange header frontier below it.
+                        if !backfill {
+                            publish_header_frontier(
+                                &handles.endpoint,
+                                tip_height,
+                                tip_hash,
+                                FrontierChange::HeaderAdvanced,
+                                &trace,
+                            );
+                        }
                     }
                     Ok(response) => {
                         emit_commit_state(
@@ -822,7 +829,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                 // Always report completion back (`Some` on success, `None` on failure) so the reactor
                 // clears its in-flight rebuild guard even when the read errors — otherwise the guard
                 // would wedge and suppress all future rebuilds, stranding the stale tree.
-                let (history_tree, reanchor) = match read_state
+                let (history_tree, rebase) = match read_state
                     .clone()
                     .oneshot(zebra_state::ReadRequest::BestHeaderHistoryTree {
                         verified_block_tip,
@@ -833,20 +840,16 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     Ok(zebra_state::ReadResponse::BestHeaderHistoryTree { tree, frontier }) => {
                         // The fold can stop below `best_header_tip - 1` when durable roots have a gap
                         // (a non-Zakura commit raced ahead). In that case the reactor must drop its tip
-                        // onto the rebuilt tree; resolve that reanchor here, where the read access
+                        // onto the rebuilt tree; resolve that rebase here, where the read access
                         // lives, mirroring the startup resume. A resolution failure is reported as a
                         // failed rebuild (both `None`) so the guard clears and the range re-triggers,
                         // rather than installing a lower tree the stale tip could never match.
-                        match header_frontier_reanchor(
-                            read_state.clone(),
-                            best_header_tip,
-                            frontier,
-                        )
-                        .await
+                        match header_frontier_rebase(read_state.clone(), best_header_tip, frontier)
+                            .await
                         {
-                            Ok(reanchor) => (Some(tree), reanchor),
+                            Ok(rebase) => (Some(tree), rebase),
                             Err(error) => {
-                                warn!(?error, "failed to resolve Zakura header frontier reanchor");
+                                warn!(?error, "failed to resolve Zakura header frontier rebase");
                                 (None, None)
                             }
                         }
@@ -864,7 +867,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .header_sync
                     .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
                         best_header_tip,
-                        reanchor,
+                        rebase,
                         history_tree,
                     })
                     .await;
@@ -888,12 +891,12 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     &trace,
                 );
             }
-            HeaderSyncAction::HeaderReanchored { old: _, new } => {
+            HeaderSyncAction::HeaderRebased { old: _, new } => {
                 publish_header_frontier(
                     &handles.endpoint,
                     new.0,
                     new.1,
-                    FrontierChange::HeaderReanchored,
+                    FrontierChange::HeaderRebased,
                     &trace,
                 );
             }
@@ -1427,8 +1430,8 @@ fn trace_header_driver_action(trace: &ZakuraTrace, action: &HeaderSyncAction) {
                 insert_cs_height(row, cs_trace::HEIGHT, *height);
                 insert_cs_hash(row, cs_trace::HASH, *hash);
             }
-            HeaderSyncAction::HeaderReanchored { old, new } => {
-                insert_cs_str(row, cs_trace::ACTION, "header_reanchored");
+            HeaderSyncAction::HeaderRebased { old, new } => {
+                insert_cs_str(row, cs_trace::ACTION, "header_rebased");
                 insert_cs_height(row, cs_trace::BEST_HEADER_TIP, old.0);
                 insert_cs_height(row, cs_trace::HEIGHT, new.0);
                 insert_cs_hash(row, cs_trace::HASH, new.1);
@@ -1470,7 +1473,7 @@ fn trace_header_commit_finish(
 }
 
 fn header_range_tip_parent_hash(
-    anchor: block::Hash,
+    link_hash: block::Hash,
     start_height: block::Height,
     headers: &[std::sync::Arc<block::Header>],
 ) -> Option<block::Hash> {
@@ -1479,7 +1482,7 @@ fn header_range_tip_parent_hash(
     }
 
     if headers.len() == 1 {
-        return (start_height > block::Height(0)).then_some(anchor);
+        return (start_height > block::Height(0)).then_some(link_hash);
     }
 
     headers

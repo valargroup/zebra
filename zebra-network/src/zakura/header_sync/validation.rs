@@ -4,18 +4,18 @@ use zebra_chain::{
     parallel::commitment_aux_verify::{self, SuppliedRootsError, VerifiedHeaderCommitmentRoots},
 };
 
-pub(super) fn validate_anchor(
+pub(super) fn validate_trusted_sync_start(
     network: &Network,
-    anchor: (block::Height, block::Hash),
+    trusted_sync_start: (block::Height, block::Hash),
 ) -> Result<(), HeaderSyncStartError> {
-    let expected = if anchor.0 == block::Height(0) {
+    let expected = if trusted_sync_start.0 == block::Height(0) {
         Some(network.genesis_hash())
     } else {
-        network.checkpoint_list().hash(anchor.0)
+        network.checkpoint_list().hash(trusted_sync_start.0)
     };
     match expected {
-        Some(hash) if hash == anchor.1 => Ok(()),
-        _ => Err(HeaderSyncStartError::InvalidAnchor { anchor }),
+        Some(hash) if hash == trusted_sync_start.1 => Ok(()),
+        _ => Err(HeaderSyncStartError::InvalidTrustedSyncStart { trusted_sync_start }),
     }
 }
 
@@ -181,16 +181,16 @@ pub async fn validate_headers_stateless(
     validate_pow_spawn_blocking(headers, context.network).await
 }
 
-/// Check that a header range links to its anchor and is internally contiguous.
+/// Check that a header range links to its link target and is internally contiguous.
 pub fn validate_header_range_links(
-    anchor: block::Hash,
+    link_hash: block::Hash,
     headers: &[Arc<block::Header>],
 ) -> Result<(), HeaderSyncWireError> {
     let Some(first) = headers.first() else {
         return Ok(());
     };
 
-    if first.previous_block_hash != anchor {
+    if first.previous_block_hash != link_hash {
         return Err(HeaderSyncWireError::FirstHeaderDoesNotLink);
     }
 

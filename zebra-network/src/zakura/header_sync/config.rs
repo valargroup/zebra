@@ -9,7 +9,7 @@ pub struct HeaderSyncStatus {
     /// Sender's best known tip hash.
     pub tip_hash: block::Hash,
     /// Sender's lowest contiguous header height.
-    pub anchor_height: block::Height,
+    pub sync_start_height: block::Height,
     /// Maximum headers the sender will serve per response.
     pub max_headers_per_response: u32,
     /// Maximum concurrent `GetHeaders` requests the sender will service.
@@ -20,7 +20,7 @@ impl HeaderSyncStatus {
     pub(super) fn encode_to<W: Write>(&self, writer: &mut W) -> Result<(), HeaderSyncWireError> {
         write_height(writer, self.tip_height)?;
         self.tip_hash.zcash_serialize(&mut *writer)?;
-        write_height(writer, self.anchor_height)?;
+        write_height(writer, self.sync_start_height)?;
         writer.write_u32::<LittleEndian>(clamp_advertised_range(self.max_headers_per_response))?;
         writer.write_u16::<LittleEndian>(self.max_inflight_requests)?;
         Ok(())
@@ -30,7 +30,7 @@ impl HeaderSyncStatus {
         Ok(Self {
             tip_height: read_height(reader)?,
             tip_hash: block::Hash::zcash_deserialize(&mut *reader)?,
-            anchor_height: read_height(reader)?,
+            sync_start_height: read_height(reader)?,
             max_headers_per_response: clamp_advertised_range(reader.read_u32::<LittleEndian>()?),
             max_inflight_requests: reader.read_u16::<LittleEndian>()?,
         })
@@ -42,7 +42,7 @@ impl Default for HeaderSyncStatus {
         Self {
             tip_height: block::Height::MIN,
             tip_hash: block::Hash([0; 32]),
-            anchor_height: block::Height::MIN,
+            sync_start_height: block::Height::MIN,
             max_headers_per_response: DEFAULT_HS_RANGE,
             max_inflight_requests: DEFAULT_HS_MAX_INFLIGHT,
         }
@@ -67,15 +67,19 @@ pub struct ZakuraHeaderSyncConfig {
     /// Disabling this keeps range-based header sync and legacy request/response
     /// active while forcing block bodies to arrive through the block-sync stream.
     pub accept_new_blocks: bool,
-    /// Optional trusted header-sync anchor height.
+    /// Optional trusted sync-start height.
     ///
     /// When unset, header sync starts from genesis. When set, [`anchor_hash`](Self::anchor_hash)
     /// must also be set and must match genesis or a configured checkpoint.
+    ///
+    /// The config key keeps the legacy `anchor` name for compatibility.
     pub anchor_height: Option<block::Height>,
-    /// Optional trusted header-sync anchor hash.
+    /// Optional trusted sync-start hash.
     ///
     /// When unset, header sync starts from genesis. When set, [`anchor_height`](Self::anchor_height)
     /// must also be set and must match genesis or a configured checkpoint.
+    ///
+    /// The config key keeps the legacy `anchor` name for compatibility.
     pub anchor_hash: Option<block::Hash>,
 }
 
@@ -105,15 +109,15 @@ impl ZakuraHeaderSyncConfig {
             .clamp(1, LOCAL_MAX_HS_INFLIGHT_PER_PEER)
     }
 
-    /// Return the configured trusted anchor, or genesis when no override is configured.
-    pub fn anchor(
+    /// Return the configured trusted sync start, or genesis when no override is configured.
+    pub fn trusted_sync_start(
         &self,
         network: &Network,
     ) -> Result<(block::Height, block::Hash), HeaderSyncStartError> {
         match (self.anchor_height, self.anchor_hash) {
             (Some(height), Some(hash)) => Ok((height, hash)),
             (None, None) => Ok((block::Height(0), network.genesis_hash())),
-            _ => Err(HeaderSyncStartError::IncompleteAnchor),
+            _ => Err(HeaderSyncStartError::IncompleteTrustedSyncStart),
         }
     }
 }

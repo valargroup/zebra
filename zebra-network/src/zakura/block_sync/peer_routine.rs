@@ -871,7 +871,7 @@ impl PeerRoutine {
             let request = BlockRangeRequest {
                 start_height: items[0].0,
                 count,
-                anchor_hash: items[0].1.hash,
+                link_hash: items[0].1.hash,
                 // The summed size-estimate reservation for this request (released
                 // on a send failure below); equals the sum of the per-height
                 // `expected_blocks` estimates.

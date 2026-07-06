@@ -712,12 +712,12 @@ fn header_range_commit_persists_only_the_confirmed_root_prefix() {
         "the unconfirmed range tip must not have a persisted root",
     );
 
-    // An empty vector is the checkpoint-authenticated backfill shape: it is accepted and persists no
-    // provisional roots, so the trust boundary is never crossed.
+    // An empty vector is the plain above-checkpoint shape (roots neither requested nor verified):
+    // it is accepted and persists no provisional roots, so the trust boundary is never crossed.
     let mut batch = DiskWriteBatch::new();
     batch
         .prepare_header_range_batch_with_roots(&state, genesis.hash(), &headers, &[0, 0], &[])
-        .expect("an empty root vector is accepted for checkpoint-authenticated backfill");
+        .expect("an empty root vector is accepted for plain rootless ranges");
 
     // A full-length vector would include the unauthenticated tip root, so it is rejected.
     let mut batch = DiskWriteBatch::new();
@@ -732,6 +732,80 @@ fn header_range_commit_persists_only_the_confirmed_root_prefix() {
         ),
         Err(CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }),
     ));
+}
+
+/// Below-sync-start backfill shapes: a header-range commit linked on an intermediate zakura
+/// header resolves that anchor through the header index, an identical re-commit of an
+/// already-committed range (the backfill stitch redelivers the sync-start successor) is
+/// accepted, and neither regresses the best header tip.
+#[test]
+fn header_range_commit_accepts_intermediate_anchor_and_identical_recommit() {
+    let _init_guard = zebra_test::init();
+    let (state, genesis, block1) = mainnet_state_with_genesis();
+    let block2 = mainnet_block(2);
+    let block3 = mainnet_block(3);
+    let block4 = mainnet_block(4);
+
+    let headers = vec![
+        block1.header.clone(),
+        block2.header.clone(),
+        block3.header.clone(),
+        block4.header.clone(),
+    ];
+    let confirmed_roots = vec![root_at(Height(1)), root_at(Height(2)), root_at(Height(3))];
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch_with_roots(
+            &state,
+            genesis.hash(),
+            &headers,
+            &[0; 4],
+            &confirmed_roots,
+        )
+        .expect("initial header range is valid");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+    assert_eq!(state.best_header_tip(), Some((Height(4), block4.hash())));
+
+    // A below-tip re-commit of the identical prefix range (with its confirmed root) is accepted
+    // and does not move the header tip.
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch_with_roots(
+            &state,
+            genesis.hash(),
+            &headers[..2],
+            &[0; 2],
+            &[root_at(Height(1))],
+        )
+        .expect("an identical below-tip re-commit is accepted");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+    assert_eq!(state.best_header_tip(), Some((Height(4), block4.hash())));
+
+    // A range linked on an intermediate zakura header (a mid-backfill bracket anchor) resolves
+    // through the header index and re-commits identically.
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch_with_roots(
+            &state,
+            block2.hash(),
+            &headers[2..],
+            &[0; 2],
+            &[root_at(Height(3))],
+        )
+        .expect("an intermediate zakura header anchor is accepted");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+    assert_eq!(state.best_header_tip(), Some((Height(4), block4.hash())));
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(3)),
+        vec![root_at(Height(1)), root_at(Height(2)), root_at(Height(3))],
+        "confirmed roots survive identical re-commits",
+    );
 }
 
 /// Pruning-readiness guard: a committed height whose body is removed (as online

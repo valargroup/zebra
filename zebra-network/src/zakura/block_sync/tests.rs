@@ -454,7 +454,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
         request: BlockRangeRequest {
             start_height: block::Height(height),
             count: 1,
-            anchor_hash: block::Hash([byte; 32]),
+            link_hash: block::Hash([byte; 32]),
             estimated_bytes: 1,
             expected_blocks: vec![ExpectedBlock {
                 height: block::Height(height),
@@ -477,7 +477,7 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
         request: BlockRangeRequest {
             start_height: block::Height(start),
             count,
-            anchor_hash: block::Hash([byte; 32]),
+            link_hash: block::Hash([byte; 32]),
             estimated_bytes: u64::from(count),
             expected_blocks: (start..start + count)
                 .map(|height| ExpectedBlock {
@@ -4168,7 +4168,7 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
     let request = BlockRangeRequest {
         start_height: block::Height(1),
         count: 3,
-        anchor_hash: block::Hash([1; 32]),
+        link_hash: block::Hash([1; 32]),
         // Size-estimate reservation: each block reserves its size hint, so the
         // request reserves the sum of the per-height estimates below.
         estimated_bytes: THREE_BLOCK_ESTIMATE * 3,
@@ -4554,7 +4554,7 @@ fn underestimated_body_is_buffered_and_charges_budget_delta() {
     let request = BlockRangeRequest {
         start_height: block::Height(1),
         count: 1,
-        anchor_hash: block::Hash([1; 32]),
+        link_hash: block::Hash([1; 32]),
         // Size-estimate reservation: the per-height hint, not worst case.
         estimated_bytes: hint,
         expected_blocks: vec![ExpectedBlock {
@@ -8002,7 +8002,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
 }
 
 #[tokio::test]
-async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
+async fn reactor_reset_mid_download_drops_stale_links_and_releases_budget() {
     let mut config = ZakuraBlockSyncConfig {
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
         ..immediate_body_download_config()
@@ -8617,7 +8617,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
     }
 
     // A genuine fork to a different hash at height 2 reaches block sync as a reset
-    // (reanchor), which `reset_above`s the WorkQueue and clears any stale
+    // (rebase), which `reset_above`s the WorkQueue and clears any stale
     // `in_flight` claim for height 2 before the producer re-fills — the path the
     // reset path relies on to install a new per-height hash (a bare
     // `NeededBlocks` never hash-corrects an in-flight height). After that reset the
@@ -8629,7 +8629,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
             verified_block_hash: block::Hash([99; 32]),
         }))
         .await
-        .expect("fork reanchor reset queues");
+        .expect("fork rebase reset queues");
     while !matches!(
         next_action(&mut actions).await,
         BlockSyncAction::QueryNeededBlocks {
@@ -10835,7 +10835,7 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
 }
 
 #[tokio::test]
-async fn reactor_exchange_reanchor_lowers_only_best_header_target() {
+async fn reactor_exchange_rebase_lowers_only_best_header_target() {
     let initial = test_frontier_update(0, 5, 10, FrontierChange::Snapshot);
     let (exchange, startup) =
         exchange_block_sync_startup(initial, immediate_body_download_config());
@@ -10844,7 +10844,7 @@ async fn reactor_exchange_reanchor_lowers_only_best_header_target() {
     wait_for_query_needed_blocks(&mut actions, block::Height(5), block::Height(10)).await;
 
     exchange.publish_frontier(
-        test_frontier_update(0, 1, 7, FrontierChange::HeaderReanchored),
+        test_frontier_update(0, 1, 7, FrontierChange::HeaderRebased),
         "test",
     );
     wait_for_query_needed_blocks(&mut actions, block::Height(5), block::Height(7)).await;
@@ -10854,7 +10854,7 @@ async fn reactor_exchange_reanchor_lowers_only_best_header_target() {
 }
 
 #[tokio::test]
-async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
+async fn reactor_exchange_rebase_releases_stale_submitted_bodies() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = immediate_body_download_config();
     // Worst-case reservation: budget for exactly the three in-flight bodies.
@@ -10917,7 +10917,7 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
     );
 
     exchange.publish_frontier(
-        test_frontier_update(0, 0, 1, FrontierChange::HeaderReanchored),
+        test_frontier_update(0, 0, 1, FrontierChange::HeaderRebased),
         "test",
     );
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(1)).await;
@@ -10933,12 +10933,12 @@ async fn reactor_exchange_reanchor_releases_stale_submitted_bodies() {
             blocks.iter().map(block_meta).collect(),
         ))
         .await
-        .expect("needed metadata after reanchor queues");
+        .expect("needed metadata after rebase queues");
     let (got_start, got_count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
     assert_eq!(got_start, block::Height(1));
     assert_eq!(
         got_count, 3,
-        "reanchored headers must release old submitted bodies and request them again",
+        "rebased headers must release old submitted bodies and request them again",
     );
 
     reactor_task.abort();

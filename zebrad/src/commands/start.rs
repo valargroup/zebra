@@ -2800,6 +2800,137 @@ mod zakura_header_sync_driver_tests {
         endpoint.shutdown().await;
     }
 
+    /// A `backfill: true` header-range commit lands below the trusted sync start, so the driver
+    /// must not publish it as the shared sync-exchange header frontier; an identical forward
+    /// commit does publish.
+    #[tokio::test]
+    async fn header_sync_driver_backfill_commit_does_not_publish_header_frontier() {
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let genesis_hash = network.genesis_hash();
+        let mut config = zebra_network::Config {
+            network: network.clone(),
+            ..zebra_network::Config::default()
+        };
+        config.zakura.listen_addr = None;
+        let endpoint = zebra_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
+            &config,
+            |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
+            Some(ZakuraHeaderSyncDriverStartup {
+                frontiers: HeaderSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: genesis_hash,
+                },
+                best_header_tip: Some((block::Height(0), genesis_hash)),
+                best_header_parent_hash: None,
+                best_header_history_tree: Arc::new(
+                    zebra_chain::history_tree::HistoryTree::default(),
+                ),
+                verified_block_tip_hash: genesis_hash,
+            }),
+        )
+        .await
+        .expect("Zakura endpoint starts")
+        .expect("v2_p2p starts an endpoint");
+
+        let initial = endpoint
+            .current_sync_frontier()
+            .expect("driver startup initializes exchange");
+        assert_eq!(initial.frontier.best_header.height, block::Height(0));
+
+        let (action_tx, action_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handles = ZakuraHeaderSyncDriverHandles {
+            endpoint: endpoint.clone(),
+            header_sync: endpoint
+                .header_sync()
+                .expect("driver startup starts header sync"),
+        };
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let committed_hash = block1.hash();
+        let state = service_fn(move |request: zebra_state::Request| async move {
+            assert!(
+                matches!(request, zebra_state::Request::CommitHeaderRange { .. }),
+                "unexpected state request: {request:?}"
+            );
+            Ok::<_, zebra_state::BoxError>(zebra_state::Response::Committed(committed_hash))
+        });
+        let read_state = service_fn(|request: zebra_state::ReadRequest| async move {
+            panic!("unexpected read request: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::Tip(None))
+        });
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            panic!("unexpected verifier request: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_consensus::BoxError>(block::Hash([0; 32]))
+        });
+        let driver = tokio::spawn(drive_zakura_header_sync_actions(
+            action_rx,
+            handles,
+            state,
+            read_state,
+            verifier,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let peer =
+            zebra_network::zakura::ZakuraPeerId::new(vec![3; 32]).expect("test peer id is valid");
+        let commit_action =
+            |backfill: bool| zebra_network::zakura::HeaderSyncAction::CommitHeaderRange {
+                peer: peer.clone(),
+                link_hash: genesis_hash,
+                start_height: block::Height(1),
+                headers: vec![block1.header.clone()],
+                body_sizes: vec![0],
+                verified_roots: None,
+                finalized: false,
+                backfill,
+            };
+
+        // The backfill commit succeeds in state but must not move the exchange frontier.
+        action_tx
+            .send(commit_action(true))
+            .await
+            .expect("driver action channel stays open");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after_backfill = endpoint
+            .current_sync_frontier()
+            .expect("exchange remains available");
+        assert_eq!(
+            after_backfill.frontier.best_header.height,
+            block::Height(0),
+            "a backfill commit must not publish a header frontier update",
+        );
+
+        // The same commit as a forward range publishes the advanced frontier.
+        action_tx
+            .send(commit_action(false))
+            .await
+            .expect("driver action channel stays open");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let update = endpoint
+                    .current_sync_frontier()
+                    .expect("exchange remains available");
+                if update.frontier.best_header.height == block::Height(1) {
+                    assert_eq!(update.frontier.best_header.hash, committed_hash);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a forward commit publishes to the exchange");
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        endpoint.shutdown().await;
+    }
+
     #[tokio::test]
     async fn block_sync_driver_coalesces_stale_needed_queries() {
         let (action_tx, mut action_rx) = mpsc::channel(8);

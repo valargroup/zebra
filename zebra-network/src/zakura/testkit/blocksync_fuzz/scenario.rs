@@ -2,7 +2,7 @@
 //!
 //! A [`Scenario`] describes a synthetic chain, the node-under-test config, the peers
 //! it downloads from (each with a [`ServeProfile`]), and a [`TipEvent`] timeline that
-//! drives header growth, reanchors, and verified-tip resets (the "large → small"
+//! drives header growth, rebases, and verified-tip resets (the "large → small"
 //! changes). Everything is a deterministic function of `seed`, so a failing run
 //! replays from its seed (bit-exact once the Phase-2 clock lands).
 
@@ -268,13 +268,13 @@ impl PeerSpec {
 pub(crate) enum TipEventKind {
     /// Advance the best-header download target to `height` (`HeaderAdvanced`).
     GrowTo(block::Height),
-    /// Move the best-header target down to `height` (`HeaderReanchored`).
-    HeaderReanchor(block::Height),
+    /// Move the best-header target down to `height` (`HeaderRebased`).
+    HeaderRebase(block::Height),
     /// Reset the verified-body tip down to `height` (`VerifiedReset`) — a reorg/rollback.
     VerifiedReset(block::Height),
 }
 
-/// A timed change to the shared sync frontier (header growth / reanchor / reset).
+/// A timed change to the shared sync frontier (header growth / rebase / reset).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TipEvent {
     /// When, relative to run start, the change is published.
@@ -299,7 +299,7 @@ pub(crate) struct Scenario {
     pub(crate) config: ZakuraBlockSyncConfig,
     /// The peers the node downloads from.
     pub(crate) peers: Vec<PeerSpec>,
-    /// Timed frontier changes (header growth, reanchor, verified reset).
+    /// Timed frontier changes (header growth, rebase, verified reset).
     pub(crate) timeline: Vec<TipEvent>,
     /// How the mock commit pipeline drains the applyQ (default: instant).
     pub(crate) commit: CommitProfile,
