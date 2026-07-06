@@ -52,8 +52,10 @@ impl ZakuraApplyGate {
         self.in_flight
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        // Re-check after reserving so a yield that lands between the check and
-        // the increment still sees an accurate in-flight count.
+        // Load-bearing invariant: reserve before the second yielded check so a
+        // concurrent fallback either sees this apply in `in_flight` or rejects
+        // the permit and releases it here. That makes the drain a real commit
+        // barrier without locking the hot path.
         if self.is_yielded() {
             self.release();
             return None;
@@ -81,6 +83,9 @@ impl ZakuraApplyGate {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let drained = self.drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+
             let in_flight = self.in_flight.load(std::sync::atomic::Ordering::SeqCst);
             if in_flight == 0 {
                 return;

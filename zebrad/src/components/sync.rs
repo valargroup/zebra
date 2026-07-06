@@ -526,6 +526,8 @@ async fn engage_legacy_fallback_alongside_zakura(
     apply_gate: &crate::commands::start::zakura::ZakuraApplyGate,
 ) {
     metrics::counter!("sync.zakura.legacy_fallback.engaged").increment(1);
+    // Sticky by design: once legacy fallback owns body sync, the node stays in
+    // bridge mode until restart.
     metrics::gauge!("sync.zakura.legacy_fallback.active").set(1.0);
 
     // Commit barrier: two engines driving bulk commits concurrently race in

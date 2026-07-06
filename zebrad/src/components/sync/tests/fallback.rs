@@ -429,3 +429,31 @@ async fn fallback_drains_the_apply_gate_without_cancelling_zakura() {
     drain.await.expect("drain task completes");
     assert!(gate.is_yielded());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_drain_does_not_lose_concurrent_last_apply_wakeup() {
+    let gate = crate::commands::start::zakura::ZakuraApplyGate::new();
+    let permit = gate.begin_apply().expect("applies run before fallback");
+
+    let drain_gate = gate.clone();
+    let drain = tokio::spawn(async move {
+        drain_gate
+            .yield_and_drain(std::time::Duration::from_secs(30))
+            .await;
+    });
+
+    let dropper = tokio::task::spawn_blocking(move || drop(permit));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        dropper.await.expect("dropper task completes");
+        drain.await.expect("drain task completes");
+    })
+    .await
+    .expect("drain must observe the final apply release without waiting for its timeout");
+
+    assert!(gate.is_yielded());
+    assert!(
+        gate.begin_apply().is_none(),
+        "no new Zakura applies may start after the concurrent drain"
+    );
+}
