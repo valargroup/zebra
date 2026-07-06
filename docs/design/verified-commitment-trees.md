@@ -724,10 +724,13 @@ commitment before it influences the anchor set or the history MMR.** Consequence
 - **Increment 6e — bound the frontier tree to below the last checkpoint (current).** Root
   verification, the one-block overlap, and the in-memory header-frontier tree now run only while the
   frontier is below the last checkpoint (the VCT handoff height, the only region the roots are
-  consumed); at/above it header sync runs plainly (§6.4). Because that region is checkpoint-final and
-  gossip-free, the tree advances only by fold-on-commit and never needs a live reload, so the
-  reorg/gossip/catch-up tree-reload machinery (a `QueryBestHeaderHistoryTree` action, its
-  `BestHeaderHistoryTreeLoaded` reply, and the reactor's reload dispatches) is **removed**. The
+  consumed); at/above it header sync runs plainly (§6.4). In the pure Zakura path (header sync
+  leading) the tree advances only by fold-on-commit and never reloads. However, a non-Zakura commit
+  path (checkpoint, legacy sync, or gossip) can advance the verified tip past the folded frontier,
+  leaving the in-memory tree behind the next range's parent. The tree-reload machinery (the
+  `QueryBestHeaderHistoryTree` action, its `BestHeaderHistoryTreeLoaded` reply, and the reactor's
+  guarded reload dispatch) is therefore **retained as the sole recovery path** for that case: the
+  reactor rebuilds the tree at the current frontier from durable state and retries the range. The
   reanchor/follow-verified-tip scheduling is kept but gated to fire only at/above the checkpoint.
 - **Increment 7 — indexing follower lane (archive only).** Relocate `tx_by_loc` + address
   indexes and the per-height trees + subtree CFs onto an async follower, so archive mode regains

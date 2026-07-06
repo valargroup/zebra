@@ -1689,6 +1689,17 @@ where
     // Stays `None` while the tree is still at the base.
     let mut reconstructed_frontier: Option<(block::Height, block::Hash)> = None;
 
+    // A large header lead means minutes of folding (the fleet has seen multi-million-header
+    // leads), and this runs both at startup and on the runtime lazy-rebuild path — log progress
+    // so the work is visible instead of appearing as a silent stall.
+    const FOLD_PROGRESS_LOG_INTERVAL: u32 = 100_000;
+    let fold_total = mmr_tree_height_target
+        .0
+        .saturating_sub(verified_block_tip.0);
+    let fold_started = std::time::Instant::now();
+    let mut folded: u32 = 0;
+    let mut folded_at_last_log: u32 = 0;
+
     while next <= mmr_tree_height_target {
         // `+ 1` because the range is inclusive of `mmr_tree_height_target`.
         let remaining = mmr_tree_height_target.0 - next.0 + 1;
@@ -1705,6 +1716,18 @@ where
             reconstructed_frontier = headers
                 .get(contiguous - 1)
                 .map(|(height, hash, _header)| (*height, *hash));
+
+            folded = folded.saturating_add(contiguous as u32);
+            if folded - folded_at_last_log >= FOLD_PROGRESS_LOG_INTERVAL {
+                folded_at_last_log = folded;
+                tracing::info!(
+                    folded,
+                    total = fold_total,
+                    target = ?mmr_tree_height_target,
+                    elapsed = ?fold_started.elapsed(),
+                    "rebuilding header-tip history tree from persisted roots"
+                );
+            }
 
             let roots_by_height = headers
                 .iter()
@@ -1729,6 +1752,15 @@ where
             break;
         };
         next = block::Height(advanced_blocks);
+    }
+
+    if folded >= FOLD_PROGRESS_LOG_INTERVAL {
+        tracing::info!(
+            folded,
+            frontier = ?reconstructed_frontier.map(|(height, _hash)| height),
+            elapsed = ?fold_started.elapsed(),
+            "rebuilt header-tip history tree from persisted roots"
+        );
     }
 
     // The frontier is the last folded height, or the verified base when nothing folded. The base
