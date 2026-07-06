@@ -35,6 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed three Zakura header-store write paths that could leave the on-disk
+  header store internally incoherent after chain forks, causing nodes to
+  reject valid headers from honest peers (`InvalidDifficultyThreshold` /
+  `UnknownAnchor`) and wedge below the network tip until manual intervention.
+  Header ranges must now link to their anchor and be internally contiguous
+  (rejected with the new `UnlinkedRange` error otherwise, which is classified
+  as a local, non-peer-scoring failure), header ranges re-delivered over
+  heights that already have committed block bodies no longer re-insert
+  provisional header rows below the body tip, and the header row seeded from
+  a committed best-chain block is skipped when it does not link to the stored
+  row below it (header-range sync converges the store instead).
 - Fixed dual-stack Zakura fallback shutting down the Zakura serving layer. When
   the stall watchdog resumes legacy `ChainSync`, Zakura now keeps its header-
   and block-sync reactors alive as a serving/advertising bridge while an apply
