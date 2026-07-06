@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.
+- After a legacy fallback, the dual-stack watchdog now re-promotes Zakura to
+  the body-sync driver once legacy `ChainSync` is caught up and stable (three
+  consecutive exhausted sync rounds with the tip advancing by at most two
+  blocks). Fallback was previously permanent per process lifetime, so every
+  min-difficulty burst demoted one more node's Zakura sync to a serve-only
+  bridge until restart. The hand-back reuses the apply-gate commit barrier in
+  reverse and is counted in `sync.zakura.repromoted`.
 - The dual-stack Zakura stall watchdog no longer shuts down the Zakura header-
   and block-sync reactors when it falls back to legacy `ChainSync`. Killing
   them turned every fallback into a fleet-wide Zakura outage: the fallback

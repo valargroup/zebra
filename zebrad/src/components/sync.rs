@@ -530,6 +530,53 @@ where
 /// following local commits through the chain-tip mirror — the same way
 /// gossip-driven commits already coexist with the legacy syncer. Duplicate
 /// commits from the overlap window are rejected by the verifier as usual.
+/// Consecutive stable legacy sync rounds required before Zakura is
+/// re-promoted to the driver role after a fallback.
+const ZAKURA_REPROMOTE_STABLE_ROUNDS: usize = 3;
+
+/// Maximum state-tip advance (in blocks) a legacy sync round may make and
+/// still count as "stable" for re-promotion: at-tip rounds only pick up the
+/// occasional gossip-adjacent block, while catch-up rounds move hundreds.
+const ZAKURA_REPROMOTE_MAX_ROUND_PROGRESS: u32 = 2;
+
+/// Counts consecutive stable legacy sync rounds for the re-promotion decision.
+#[derive(Debug, Default)]
+struct RepromotionTracker {
+    stable_rounds: usize,
+}
+
+impl RepromotionTracker {
+    /// Records one legacy sync round; returns `true` when enough consecutive
+    /// stable rounds have accumulated to re-promote Zakura.
+    fn record_round(
+        &mut self,
+        exhausted: bool,
+        before: Option<Height>,
+        after: Option<Height>,
+    ) -> bool {
+        let progressed = match (before, after) {
+            (Some(before), Some(after)) => after.0.saturating_sub(before.0),
+            // Unknown tips cannot prove stability.
+            _ => u32::MAX,
+        };
+        if exhausted && progressed <= ZAKURA_REPROMOTE_MAX_ROUND_PROGRESS {
+            self.stable_rounds += 1;
+        } else {
+            self.stable_rounds = 0;
+        }
+        self.stable_rounds >= ZAKURA_REPROMOTE_STABLE_ROUNDS
+    }
+}
+
+/// Returns the bulk-apply pipeline to Zakura after a completed legacy
+/// catch-up, and records the mode switch.
+fn repromote_zakura(apply_gate: &crate::commands::start::zakura::ZakuraApplyGate) {
+    apply_gate.unyield();
+    metrics::counter!("sync.zakura.repromoted").increment(1);
+    metrics::gauge!("sync.zakura.legacy_fallback.active").set(0.0);
+    warn!("re-promoted Zakura sync to the body-sync driver after legacy catch-up");
+}
+
 async fn engage_legacy_fallback_alongside_zakura(
     apply_gate: &crate::commands::start::zakura::ZakuraApplyGate,
 ) {
@@ -1002,71 +1049,125 @@ where
             / ZAKURA_BODY_SYNC_STALL_POLL.as_secs())
         .max(1);
 
-        let initial_tip = self.latest_chain_tip.best_tip_height();
-        let mut tracker = ZakuraStallTracker::new(initial_tip);
-        let mut legacy_probe = ZakuraLegacyProbe::new(initial_tip);
-        loop {
-            sleep(ZAKURA_BODY_SYNC_STALL_POLL).await;
+        // Fallback is a cycle, not a ratchet: when Zakura stalls, legacy
+        // ChainSync drives until the node is caught up and stable, then the
+        // apply gate is returned to Zakura and the watchdog resumes. Without
+        // re-promotion, every burst permanently demoted one more node's Zakura
+        // sync to a serve-only bridge.
+        'drive_cycle: loop {
+            let initial_tip = self.latest_chain_tip.best_tip_height();
+            let mut tracker = ZakuraStallTracker::new(initial_tip);
+            let mut legacy_probe = ZakuraLegacyProbe::new(initial_tip);
+            loop {
+                sleep(ZAKURA_BODY_SYNC_STALL_POLL).await;
 
-            let verified_height = self.latest_chain_tip.best_tip_height();
-            let header_tip_height = best_header_tip_height(&mut read_state).await;
-            if let Some(sync_length) = zakura_sync_status_length(verified_height, header_tip_height)
-            {
-                self.recent_syncs.push_extend_tips_length(sync_length);
-            }
+                let verified_height = self.latest_chain_tip.best_tip_height();
+                let header_tip_height = best_header_tip_height(&mut read_state).await;
+                if let Some(sync_length) =
+                    zakura_sync_status_length(verified_height, header_tip_height)
+                {
+                    self.recent_syncs.push_extend_tips_length(sync_length);
+                }
 
-            match zakura_watchdog_action(
-                &mut tracker,
-                &mut legacy_probe,
-                verified_height,
-                header_tip_height,
-                max_idle_polls,
-                legacy_fallback,
-            ) {
-                ZakuraWatchdogAction::ContinueWaiting => continue,
-                ZakuraWatchdogAction::WarnOnly => {
-                    warn!(
-                        verified_tip = ?verified_height,
-                        header_tip = ?header_tip_height,
-                        stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
-                        "Zakura body sync is not closing the gap to the network tip; legacy \
-                         fallback disabled (legacy_p2p is off), continuing to wait for Zakura"
-                    );
-                    continue;
-                }
-                ZakuraWatchdogAction::FallbackToLegacy => {
-                    warn!(
-                        verified_tip = ?verified_height,
-                        header_tip = ?header_tip_height,
-                        stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
-                        "Zakura body sync is not closing the gap to the network tip; resuming \
-                         legacy ChainSync as the body-sync driver while Zakura keeps serving \
-                         peers and following local commits"
-                    );
-                    engage_legacy_fallback_alongside_zakura(&apply_gate).await;
-                    return self.sync().await;
-                }
-                ZakuraWatchdogAction::ProbeLegacyPeers => {
-                    let blocks_ahead = self.legacy_peers_blocks_ahead().await;
-                    info!(
-                        verified_tip = ?verified_height,
-                        ?blocks_ahead,
-                        "Zakura watchdog probed legacy peers for connected blocks ahead"
-                    );
-                    if legacy_probe_supports_fallback(blocks_ahead) {
+                match zakura_watchdog_action(
+                    &mut tracker,
+                    &mut legacy_probe,
+                    verified_height,
+                    header_tip_height,
+                    max_idle_polls,
+                    legacy_fallback,
+                ) {
+                    ZakuraWatchdogAction::ContinueWaiting => continue,
+                    ZakuraWatchdogAction::WarnOnly => {
                         warn!(
                             verified_tip = ?verified_height,
                             header_tip = ?header_tip_height,
-                            ?blocks_ahead,
-                            "Zakura body sync is frozen while legacy peers advertise a much \
-                             higher tip; resuming legacy ChainSync as the body-sync driver \
-                             while Zakura keeps serving peers and following local commits"
+                            stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
+                            "Zakura body sync is not closing the gap to the network tip; legacy \
+                             fallback disabled (legacy_p2p is off), continuing to wait for Zakura"
+                        );
+                        continue;
+                    }
+                    ZakuraWatchdogAction::FallbackToLegacy => {
+                        warn!(
+                            verified_tip = ?verified_height,
+                            header_tip = ?header_tip_height,
+                            stall = ?ZAKURA_BODY_SYNC_STALL_TIMEOUT,
+                            "Zakura body sync is not closing the gap to the network tip; resuming \
+                             legacy ChainSync as the body-sync driver while Zakura keeps serving \
+                             peers and following local commits"
                         );
                         engage_legacy_fallback_alongside_zakura(&apply_gate).await;
-                        return self.sync().await;
+                        self.sync_until_caught_up_and_stable().await?;
+                        repromote_zakura(&apply_gate);
+                        continue 'drive_cycle;
+                    }
+                    ZakuraWatchdogAction::ProbeLegacyPeers => {
+                        let blocks_ahead = self.legacy_peers_blocks_ahead().await;
+                        info!(
+                            verified_tip = ?verified_height,
+                            ?blocks_ahead,
+                            "Zakura watchdog probed legacy peers for connected blocks ahead"
+                        );
+                        if legacy_probe_supports_fallback(blocks_ahead) {
+                            warn!(
+                                verified_tip = ?verified_height,
+                                header_tip = ?header_tip_height,
+                                ?blocks_ahead,
+                                "Zakura body sync is frozen while legacy peers advertise a much \
+                                 higher tip; resuming legacy ChainSync as the body-sync driver \
+                                 while Zakura keeps serving peers and following local commits"
+                            );
+                            engage_legacy_fallback_alongside_zakura(&apply_gate).await;
+                            self.sync_until_caught_up_and_stable().await?;
+                            repromote_zakura(&apply_gate);
+                            continue 'drive_cycle;
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Drives legacy sync rounds until the node is caught up and the tip is
+    /// stable, then returns so Zakura can be re-promoted to the driver role.
+    ///
+    /// "Caught up and stable" means [`ZAKURA_REPROMOTE_STABLE_ROUNDS`]
+    /// consecutive sync rounds each exhausted their prospective tip set while
+    /// advancing the state tip by at most
+    /// [`ZAKURA_REPROMOTE_MAX_ROUND_PROGRESS`] blocks — legacy is no longer
+    /// adding anything gossip would not. Returns between rounds, so no legacy
+    /// bulk downloads are in flight when the caller re-promotes Zakura.
+    async fn sync_until_caught_up_and_stable(&mut self) -> Result<(), Report> {
+        let mut tracker = RepromotionTracker::default();
+        loop {
+            let before = self.latest_chain_tip.best_tip_height();
+            let round = self.try_to_sync().await;
+            if round.is_err() {
+                self.downloads.cancel_all();
+            }
+            let after = self.latest_chain_tip.best_tip_height();
+
+            if tracker.record_round(round.is_ok(), before, after) {
+                info!(
+                    state_tip = ?after,
+                    "legacy catch-up is complete and stable; re-promoting Zakura sync"
+                );
+                return Ok(());
+            }
+
+            self.update_metrics();
+            let restart_delay = if self.is_regtest {
+                REGTEST_SYNC_RESTART_DELAY
+            } else {
+                SYNC_RESTART_SLEEP
+            };
+            info!(
+                timeout = ?restart_delay,
+                state_tip = ?after,
+                "waiting to restart sync"
+            );
+            sleep(restart_delay).await;
         }
     }
 

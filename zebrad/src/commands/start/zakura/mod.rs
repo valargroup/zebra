@@ -71,6 +71,16 @@ impl ZakuraApplyGate {
         }
     }
 
+    /// Returns the apply pipeline to Zakura after a legacy catch-up completes.
+    ///
+    /// Safe without a drain in this direction: the caller only re-promotes
+    /// after the legacy sync loop has returned between rounds, so no legacy
+    /// bulk work is in flight when Zakura resumes driving.
+    pub(crate) fn unyield(&self) {
+        self.yielded
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Yields the apply pipeline to legacy sync and waits until in-flight
     /// applies drain, bounded by `timeout` (each apply already has its own
     /// driver timeout, so the bound is a backstop, not the primary limit).

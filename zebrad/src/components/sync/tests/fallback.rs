@@ -439,3 +439,50 @@ async fn fallback_drains_the_apply_gate_without_cancelling_zakura() {
     drain.await.expect("drain task completes");
     assert!(gate.is_yielded());
 }
+
+/// Re-promotion requires consecutive stable rounds: catch-up rounds (large
+/// tip advances) and failed rounds reset the count; unknown tips never count.
+#[test]
+fn repromotion_requires_consecutive_stable_rounds() {
+    use super::super::RepromotionTracker;
+
+    let mut tracker = RepromotionTracker::default();
+
+    // Catch-up rounds: big progress, never re-promotes.
+    assert!(!tracker.record_round(true, Some(Height(0)), Some(Height(500))));
+    assert!(!tracker.record_round(true, Some(Height(500)), Some(Height(900))));
+
+    // Two stable rounds are not enough...
+    assert!(!tracker.record_round(true, Some(Height(900)), Some(Height(901))));
+    assert!(!tracker.record_round(true, Some(Height(901)), Some(Height(901))));
+    // ...a failed round resets...
+    assert!(!tracker.record_round(false, Some(Height(901)), Some(Height(901))));
+    assert!(!tracker.record_round(true, Some(Height(901)), Some(Height(902))));
+    assert!(!tracker.record_round(true, Some(Height(902)), Some(Height(902))));
+    // ...and the third consecutive stable round re-promotes.
+    assert!(tracker.record_round(true, Some(Height(902)), Some(Height(902))));
+
+    // Unknown tips cannot prove stability.
+    let mut tracker = RepromotionTracker::default();
+    assert!(!tracker.record_round(true, None, Some(Height(1))));
+    assert!(!tracker.record_round(true, Some(Height(1)), None));
+}
+
+/// The apply gate round-trips: yielded blocks new applies, unyield restores them.
+#[tokio::test]
+async fn apply_gate_unyield_restores_zakura_applies() {
+    let gate = crate::commands::start::zakura::ZakuraApplyGate::new();
+    assert!(gate.begin_apply().is_some());
+
+    gate.yield_and_drain(std::time::Duration::from_secs(1))
+        .await;
+    assert!(gate.is_yielded());
+    assert!(gate.begin_apply().is_none());
+
+    gate.unyield();
+    assert!(!gate.is_yielded());
+    assert!(
+        gate.begin_apply().is_some(),
+        "re-promotion must let Zakura applies start again"
+    );
+}
