@@ -24,7 +24,7 @@ use zebra_test::mock_service::{MockService, PanicAssertion};
 
 use crate::components::{
     mempool::{self, *},
-    sync::RecentSyncLengths,
+    sync::{RecentSyncLengths, SyncStatus},
 };
 
 /// A [`MockService`] representing the network service.
@@ -677,6 +677,120 @@ async fn mempool_cancel_downloads_after_network_upgrade() -> Result<(), Report> 
     mempool.dummy_call().await;
 
     // Check if download was cancelled and transaction was retried.
+    let request = peer_set
+        .try_next_request()
+        .await
+        .expect("unexpected missing mempool retry");
+
+    assert_eq!(
+        request.request(),
+        &zebra_network::Request::TransactionsById(iter::once(uncommitted_tx_id).collect()),
+    );
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    Ok(())
+}
+
+/// Check that a chain tip reset does not disable an already-active mempool when the legacy
+/// sync status says Zebra is far from the tip, and that pending transactions are still
+/// requeued for download.
+///
+/// Regression test: the reset path used to re-initialise the active state through
+/// `update_state()`, whose initial-activation gate refused to re-enable the mempool while
+/// far-from-tip, silently leaving it disabled and dropping the collected retries.
+#[tokio::test(flavor = "multi_thread")]
+async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Result<(), Report> {
+    // Use a configured Testnet that activates NU5 at `NU5_ACTIVATION_TEST_HEIGHT`, so a real
+    // network-upgrade `TipAction::Reset` is reachable from generated blocks. Under the
+    // `next_height` reset semantics, committing the block at `NU5_ACTIVATION_TEST_HEIGHT - 1`
+    // produces a `Reset` (since the next height is the NU5 activation height).
+    let network = nu_activation_test_network();
+
+    // Generate enough blocks to commit a chain that reaches the NU5 reset boundary, plus a spare
+    // block whose coinbase transaction we queue for download (it is never committed, so it is not
+    // in the best chain and a network download is attempted).
+    let blocks = generate_test_chain(&network, NU5_ACTIVATION_TEST_HEIGHT as usize + 2);
+    let reset_block = blocks[NU5_ACTIVATION_TEST_HEIGHT as usize - 1].clone();
+    assert_eq!(
+        reset_block.coinbase_height(),
+        Some(Height(NU5_ACTIVATION_TEST_HEIGHT - 1)),
+        "reset block should be one below the NU5 activation height"
+    );
+    let uncommitted_tx_id = blocks
+        .last()
+        .expect("generated chain is non-empty")
+        .transactions[0]
+        .unmined_id();
+
+    // Don't commit the mainnet genesis block; we commit the generated chain instead.
+    let (
+        mut mempool,
+        mut peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, false).await;
+
+    // Commit the chain up to (but not including) the NU5 reset boundary. These commits are the
+    // genesis reset followed by plain `Grow`s, leaving the tip at `NU5_ACTIVATION_TEST_HEIGHT - 2`.
+    for block in &blocks[..NU5_ACTIVATION_TEST_HEIGHT as usize - 1] {
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block.clone(),
+        )
+        .await;
+    }
+
+    // Enable the mempool now that the tip is past genesis and stable.
+    mempool.enable(&mut recent_syncs).await;
+    assert!(mempool.is_enabled());
+
+    // Queue the uncommitted transaction for download.
+    let response = mempool
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Queue(vec![uncommitted_tx_id.into()]))
+        .await
+        .unwrap();
+    let queued_responses = match response {
+        Response::Queued(queue_responses) => queue_responses,
+        _ => unreachable!("will never happen in this test"),
+    };
+    assert_eq!(queued_responses.len(), 1);
+    assert!(queued_responses[0].is_ok());
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    // Query the mempool to make it poll chain_tip_change.
+    mempool.dummy_call().await;
+
+    // Ignore all the previous network requests.
+    while let Some(_request) = peer_set.try_next_request().await {}
+
+    // Pretend legacy sync discovery is far from tip, without polling the mempool yet, so the
+    // reset and the far-from-tip status are observed in the same `poll_ready()` call.
+    SyncStatus::sync_far_from_tip(&mut recent_syncs);
+
+    // Commit the NU5 activation boundary block. This is a network upgrade reset
+    // (`TipAction::Reset`).
+    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, reset_block)
+        .await;
+
+    // Query the mempool to make it poll chain_tip_change and handle the reset.
+    mempool.dummy_call().await;
+
+    // The reset must not disable the already-active mempool, even though the legacy sync
+    // status says Zebra is far from the tip.
+    assert!(
+        mempool.is_enabled(),
+        "mempool must stay enabled through a chain tip reset while legacy sync status is far \
+         from tip"
+    );
+
+    // Check that the download was cancelled and the transaction was retried.
     let request = peer_set
         .try_next_request()
         .await
