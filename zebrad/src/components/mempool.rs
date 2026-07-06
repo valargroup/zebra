@@ -544,7 +544,10 @@ impl Service<Request> for Mempool {
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let tip_action = self.chain_tip_change.last_tip_change();
+        let should_check_tip = self.is_enabled() || self.is_caught_up_to_start();
+        let tip_action = should_check_tip
+            .then(|| self.chain_tip_change.last_tip_change())
+            .flatten();
 
         // TODO: Consider broadcasting a `MempoolChange` when the mempool is disabled.
         let is_state_changed = self.update_state(tip_action.as_ref());
