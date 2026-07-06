@@ -2111,7 +2111,11 @@ mod zakura_header_sync_driver_tests {
 
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::mpsc;
-    use tower::{service_fn, util::BoxService, ServiceExt};
+    use tower::{
+        service_fn,
+        util::{BoxCloneService, BoxService},
+        ServiceExt,
+    };
     use zebra_chain::serialization::ZcashDeserializeInto;
     use zebra_chain::{block, orchard, parallel::commitment_aux::BlockCommitmentRoots, sapling};
     use zebra_network::zakura::testkit::{TraceCapture, TraceValue};
@@ -2192,6 +2196,132 @@ mod zakura_header_sync_driver_tests {
             tip_rx,
             zebra_network::zakura::ZakuraBlockSyncConfig::default(),
         )
+    }
+
+    fn test_zakura_peer(byte: u8) -> zebra_network::zakura::ZakuraPeerId {
+        zebra_network::zakura::ZakuraPeerId::new(vec![byte; 32]).expect("test peer id is valid")
+    }
+
+    fn read_state_serving_blocks(
+        blocks: Vec<Arc<block::Block>>,
+        query_seen: Option<Arc<Mutex<Option<oneshot::Sender<()>>>>>,
+    ) -> BoxCloneService<zebra_state::ReadRequest, zebra_state::ReadResponse, zebra_state::BoxError>
+    {
+        BoxCloneService::new(service_fn(move |request: zebra_state::ReadRequest| {
+            let blocks = blocks.clone();
+            let query_seen = query_seen.clone();
+            async move {
+                match request {
+                    zebra_state::ReadRequest::BlocksByHeightRange { start, count } => {
+                        if let Some(query_seen) = query_seen {
+                            if let Some(query_seen) = query_seen
+                                .lock()
+                                .expect("query signal mutex is not poisoned")
+                                .take()
+                            {
+                                let _ = query_seen.send(());
+                            }
+                        }
+
+                        let end = (start + i64::from(count.saturating_sub(1)))
+                            .unwrap_or(block::Height::MAX);
+                        let blocks = blocks
+                            .into_iter()
+                            .filter_map(|block| {
+                                let height = block.coinbase_height()?;
+                                (height >= start && height <= end).then_some((height, block, 0))
+                            })
+                            .collect();
+
+                        Ok(zebra_state::ReadResponse::Blocks(blocks))
+                    }
+                    zebra_state::ReadRequest::FinalizedTip => {
+                        let tip = blocks
+                            .iter()
+                            .filter_map(|block| Some((block.coinbase_height()?, block.hash())))
+                            .max_by_key(|(height, _hash)| *height);
+                        Ok(zebra_state::ReadResponse::FinalizedTip(tip))
+                    }
+                    zebra_state::ReadRequest::Tip => {
+                        let tip = blocks
+                            .iter()
+                            .filter_map(|block| Some((block.coinbase_height()?, block.hash())))
+                            .max_by_key(|(height, _hash)| *height);
+                        Ok(zebra_state::ReadResponse::Tip(tip))
+                    }
+                    request => {
+                        panic!("unexpected read request in fallback driver test: {request:?}")
+                    }
+                }
+            }
+        }))
+    }
+
+    fn counting_verifier(
+        commit_count: Arc<AtomicUsize>,
+        release_first: Option<Arc<tokio::sync::Notify>>,
+    ) -> BoxCloneService<zebra_consensus::Request, block::Hash, zebra_consensus::BoxError> {
+        BoxCloneService::new(service_fn(move |request: zebra_consensus::Request| {
+            let commit_count = commit_count.clone();
+            let release_first = release_first.clone();
+            async move {
+                match request {
+                    zebra_consensus::Request::Commit(block) => {
+                        let height = block.coinbase_height().expect("test block has height");
+                        commit_count.fetch_add(1, Ordering::SeqCst);
+
+                        if height == block::Height(1) {
+                            if let Some(release_first) = release_first {
+                                release_first.notified().await;
+                            }
+                        }
+
+                        Ok::<_, zebra_consensus::BoxError>(block.hash())
+                    }
+                    request => {
+                        panic!("unexpected consensus request in fallback driver test: {request:?}")
+                    }
+                }
+            }
+        }))
+    }
+
+    async fn wait_for_query_seen(query_seen_rx: oneshot::Receiver<()>) {
+        tokio::time::timeout(Duration::from_secs(1), query_seen_rx)
+            .await
+            .expect("driver handles the serving query")
+            .expect("query signal sender remains live");
+    }
+
+    fn assert_abandoned_apply_trace_rows(
+        rows: &[&serde_json::Value],
+        tokens: impl IntoIterator<Item = u64>,
+    ) {
+        for token in tokens {
+            assert!(
+                rows.iter().any(|row| {
+                    row.get("event").and_then(serde_json::Value::as_str)
+                        == Some(cs_trace::REACTOR_EVENT_SENT)
+                        && row
+                            .get(cs_trace::ACTION)
+                            .and_then(serde_json::Value::as_str)
+                            == Some("block_apply_finished")
+                        && row
+                            .get(cs_trace::APPLY_TOKEN)
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(token)
+                        && row
+                            .get(cs_trace::RESULT)
+                            .and_then(serde_json::Value::as_str)
+                            == Some("timed_out")
+                        && row
+                            .get(cs_trace::LOCAL_FRONTIER)
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                }),
+                "missing abandoned apply trace row for token {token}; rows: {rows:?}",
+            );
+        }
     }
 
     #[test]
@@ -3609,6 +3739,379 @@ mod zakura_header_sync_driver_tests {
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_yield_abandons_new_submit_blocks_without_verifying() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let mut capture =
+            TraceCapture::for_test("fallback_yield_abandons_new_submit_blocks_without_verifying")
+                .unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let mut startup = block_sync_startup_for_test();
+        startup.trace = trace.clone();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let commit_count = Arc::new(AtomicUsize::new(0));
+        let verifier = counting_verifier(commit_count.clone(), None);
+        let handoff = super::zakura::BlockSyncHandoff::new();
+        handoff.yield_to_legacy(Duration::from_secs(1)).await;
+        let (query_seen_tx, query_seen_rx) = oneshot::channel();
+        let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
+        let read_state = read_state_serving_blocks(vec![block.clone()], Some(query_seen));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height(0),
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            1,
+            1,
+            trace.clone(),
+            None,
+            handoff,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        // Send 2 actions to the driver
+        // Submit block should be acked as abandoned.
+        // QueryBlocksByHeightRange should still be served, proving Zakura is still alive as a serving bridge.
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 77,
+                block: block.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        action_tx
+            .send(BlockSyncAction::QueryBlocksByHeightRange {
+                peer: test_zakura_peer(77),
+                start: block::Height(1),
+                count: 1,
+            })
+            .await
+            .expect("driver action channel stays open");
+        wait_for_query_seen(query_seen_rx).await;
+
+        // Check no verifier call was made.
+        assert_eq!(
+            commit_count.load(Ordering::SeqCst),
+            0,
+            "post-fallback submissions must not call the verifier"
+        );
+
+
+        // Inspect Zakura commit-state traces.
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        let rows = commit_state.rows();
+
+        // The driver did not drop this submit block.
+        // Instead, it marked it as abandoned.
+        assert_abandoned_apply_trace_rows(&rows, [77]);
+        commit_state.assert_row(
+            cs_trace::REACTOR_EVENT_SENT,
+            &[
+                (
+                    cs_trace::ACTION,
+                    TraceValue::Str("block_range_response_ready"),
+                ),
+                (cs_trace::RANGE_START, TraceValue::U64(1)),
+                (cs_trace::RANGE_COUNT, TraceValue::U64(1)),
+            ],
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_yield_releases_queued_submit_blocks() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let mut capture =
+            TraceCapture::for_test("fallback_yield_releases_queued_submit_blocks").unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let mut startup = block_sync_startup_for_test();
+        startup.trace = trace.clone();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let commit_count = Arc::new(AtomicUsize::new(0));
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let verifier = counting_verifier(commit_count.clone(), Some(release_first.clone()));
+        let (query_seen_tx, query_seen_rx) = oneshot::channel();
+        let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
+        let read_state =
+            read_state_serving_blocks(vec![block1.clone(), block2.clone()], Some(query_seen));
+        let handoff = super::zakura::BlockSyncHandoff::new();
+        let drain_handoff = handoff.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height(0),
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            1,
+            1,
+            trace.clone(),
+            None,
+            handoff,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 1,
+                block: block1.clone(),
+            })
+            .await
+            .expect("driver action channel stays open");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while commit_count.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first commit starts");
+
+        // Block 2 sits in the driver's apply queue due to apply limit of 1.
+        action_tx
+            .send(BlockSyncAction::SubmitBlock {
+                token: 2,
+                block: block2.clone(),
+            })
+            .await
+            .expect("second block queues behind the full apply limit");
+        let drain = tokio::spawn(async move {
+            drain_handoff.yield_to_legacy(Duration::from_secs(5)).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "fallback waits for the in-flight apply before legacy sync resumes"
+        );
+
+        release_first.notify_waiters();
+        drain.await.expect("fallback drain task exits");
+        action_tx
+            .send(BlockSyncAction::QueryBlocksByHeightRange {
+                peer: test_zakura_peer(78),
+                start: block::Height(1),
+                count: 1,
+            })
+            .await
+            .expect("driver action channel stays open");
+        wait_for_query_seen(query_seen_rx).await;
+
+        // Check the verifier was called for the first block.
+        assert_eq!(
+            commit_count.load(Ordering::SeqCst),
+            1,
+            "fallback must not start the queued body after yielding"
+        );
+
+        // Second block was acknowledged as abandoned.
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        let rows = commit_state.rows();
+        assert_abandoned_apply_trace_rows(&rows, [2]);
+        commit_state.assert_row(
+            cs_trace::REACTOR_EVENT_SENT,
+            &[
+                (cs_trace::APPLY_TOKEN, TraceValue::U64(1)),
+                (cs_trace::RESULT, TraceValue::Str("committed")),
+            ],
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_yield_still_serves_block_range_queries() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let mut capture =
+            TraceCapture::for_test("fallback_yield_still_serves_block_range_queries").unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let mut startup = block_sync_startup_for_test();
+        startup.trace = trace.clone();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let commit_count = Arc::new(AtomicUsize::new(0));
+        let verifier = counting_verifier(commit_count.clone(), None);
+        let (query_seen_tx, query_seen_rx) = oneshot::channel();
+        let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
+        let read_state = read_state_serving_blocks(vec![block.clone()], Some(query_seen));
+        let handoff = super::zakura::BlockSyncHandoff::new();
+        handoff.yield_to_legacy(Duration::from_secs(1)).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height(0),
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            1,
+            1,
+            trace.clone(),
+            None,
+            handoff,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        // Send a serving query to Zakura.
+        action_tx
+            .send(BlockSyncAction::QueryBlocksByHeightRange {
+                peer: test_zakura_peer(79),
+                start: block::Height(1),
+                count: 1,
+            })
+            .await
+            .expect("driver action channel stays open");
+        wait_for_query_seen(query_seen_rx).await;
+        assert_eq!(commit_count.load(Ordering::SeqCst), 0);
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        reader.table(COMMIT_STATE_TABLE.table()).assert_row(
+            cs_trace::REACTOR_EVENT_SENT,
+            &[
+                (
+                    cs_trace::ACTION,
+                    TraceValue::Str("block_range_response_ready"),
+                ),
+                (cs_trace::RANGE_START, TraceValue::U64(1)),
+                (cs_trace::RANGE_COUNT, TraceValue::U64(1)),
+            ],
+        );
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn fallback_yield_handles_submit_storm_without_restarting_applies() {
+        const SUBMIT_COUNT: u64 = 128;
+
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let (action_tx, action_rx) = mpsc::channel(256);
+        let mut capture = TraceCapture::for_test(
+            "fallback_yield_handles_submit_storm_without_restarting_applies",
+        )
+        .unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let mut startup = block_sync_startup_for_test();
+        startup.trace = trace.clone();
+        let (block_sync, _reactor_actions, reactor_task) =
+            zebra_network::zakura::spawn_block_sync_reactor(startup);
+        let commit_count = Arc::new(AtomicUsize::new(0));
+        let verifier = counting_verifier(commit_count.clone(), None);
+        let (query_seen_tx, query_seen_rx) = oneshot::channel();
+        let query_seen = Arc::new(Mutex::new(Some(query_seen_tx)));
+        let read_state =
+            read_state_serving_blocks(vec![block1.clone(), block2.clone()], Some(query_seen));
+        let handoff = super::zakura::BlockSyncHandoff::new();
+        handoff.yield_to_legacy(Duration::from_secs(1)).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let driver = tokio::spawn(drive_block_sync_actions(
+            action_rx,
+            zebra_network::zakura::ZakuraSupervisorHandle::new(1),
+            None,
+            block_sync,
+            zebra_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+            block::Height(0),
+            sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
+            1,
+            1,
+            trace.clone(),
+            None,
+            handoff,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        for token in 1..=SUBMIT_COUNT {
+            let block = if token % 2 == 0 {
+                block2.clone()
+            } else {
+                block1.clone()
+            };
+            action_tx
+                .send(BlockSyncAction::SubmitBlock { token, block })
+                .await
+                .expect("driver action channel stays open during submit storm");
+        }
+        action_tx
+            .send(BlockSyncAction::QueryBlocksByHeightRange {
+                peer: test_zakura_peer(80),
+                start: block::Height(1),
+                count: 2,
+            })
+            .await
+            .expect("driver action channel handles serving work after submit storm");
+        wait_for_query_seen(query_seen_rx).await;
+
+        assert_eq!(
+            commit_count.load(Ordering::SeqCst),
+            0,
+            "post-fallback submit storm must not restart Zakura applies"
+        );
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        let rows = commit_state.rows();
+        assert_abandoned_apply_trace_rows(&rows, 1..=SUBMIT_COUNT);
+        commit_state.assert_row(
+            cs_trace::REACTOR_EVENT_SENT,
+            &[
+                (
+                    cs_trace::ACTION,
+                    TraceValue::Str("block_range_response_ready"),
+                ),
+                (cs_trace::RANGE_START, TraceValue::U64(1)),
+                (cs_trace::RANGE_COUNT, TraceValue::U64(2)),
+            ],
+        );
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("driver exits after post-fallback submit storm")
+            .expect("driver task exits cleanly");
         reactor_task.abort();
     }
 
