@@ -110,7 +110,7 @@ pub fn init() -> impl Drop {
             .with(ErrorLayer::default())
             .init();
 
-        color_eyre::config::HookBuilder::default()
+        if let Err(error) = color_eyre::config::HookBuilder::default()
             .add_frame_filter(Box::new(|frames| {
                 let mut displayed = std::collections::HashSet::new();
                 let filters = &[
@@ -151,7 +151,13 @@ pub fn init() -> impl Drop {
             }))
             .panic_message(SkipTestReturnedErrPanicMessages)
             .install()
-            .unwrap();
+        {
+            let message = error.to_string();
+            assert!(
+                message.contains("hook has already been installed"),
+                "failed to install color-eyre test hook: {error:?}",
+            );
+        }
     });
 
     drop_guard

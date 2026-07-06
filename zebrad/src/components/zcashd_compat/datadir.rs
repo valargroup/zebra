@@ -347,9 +347,16 @@ fn is_truthy(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        io::{self, Write},
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
 
     use tempfile::TempDir;
+    use tracing::Dispatch;
+    use tracing_subscriber::fmt::{self, writer::MakeWriter};
 
     use super::{
         audit_zcash_conf, ensure_zcashd_datadir, resolve_zcashd_conf_path, BOOTSTRAP_ZCASH_CONF,
@@ -418,46 +425,96 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Debug)]
+    struct TestLogWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'writer> MakeWriter<'writer> for TestLogWriter {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output
+                .lock()
+                .expect("test log buffer should not be poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn captured_logs(action: impl FnOnce()) -> String {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestLogWriter {
+            output: Arc::clone(&output),
+        };
+        let subscriber = fmt::Subscriber::builder()
+            .with_writer(writer)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        tracing::dispatcher::with_default(&Dispatch::new(subscriber), action);
+
+        let logs = output
+            .lock()
+            .expect("test log buffer should not be poisoned")
+            .clone();
+        String::from_utf8(logs).expect("tracing logs should be valid UTF-8")
+    }
+
     #[test]
-    #[tracing_test::traced_test]
     fn resolves_first_conf_arg_and_warns_on_duplicate() {
         let datadir = PathBuf::from("/zcashd-datadir");
         let extra_args = vec!["-conf=old.conf".to_string(), "--conf=new.conf".to_string()];
 
-        assert_eq!(
-            resolve_zcashd_conf_path(&datadir, &extra_args),
-            datadir.join("old.conf")
-        );
+        let logs = captured_logs(|| {
+            assert_eq!(
+                resolve_zcashd_conf_path(&datadir, &extra_args),
+                datadir.join("old.conf")
+            );
+        });
 
-        assert!(logs_contain("multiple path values"));
+        assert!(logs.contains("multiple path values"));
     }
 
     #[test]
-    #[tracing_test::traced_test]
     fn ignores_paired_conf_arg_and_warns() {
         let datadir = PathBuf::from("/zcashd-datadir");
         let extra_args = vec!["-conf".to_string(), "custom.conf".to_string()];
 
-        assert_eq!(
-            resolve_zcashd_conf_path(&datadir, &extra_args),
-            datadir.join("zcash.conf")
-        );
+        let logs = captured_logs(|| {
+            assert_eq!(
+                resolve_zcashd_conf_path(&datadir, &extra_args),
+                datadir.join("zcash.conf")
+            );
+        });
 
-        assert!(logs_contain("paired zcashd_extra_args"));
+        assert!(logs.contains("paired zcashd_extra_args"));
     }
 
     #[test]
-    #[tracing_test::traced_test]
     fn ignores_empty_conf_arg_and_warns() {
         let datadir = PathBuf::from("/zcashd-datadir");
         let extra_args = vec!["-conf=".to_string()];
 
-        assert_eq!(
-            resolve_zcashd_conf_path(&datadir, &extra_args),
-            datadir.join("zcash.conf")
-        );
+        let logs = captured_logs(|| {
+            assert_eq!(
+                resolve_zcashd_conf_path(&datadir, &extra_args),
+                datadir.join("zcash.conf")
+            );
+        });
 
-        assert!(logs_contain("empty zcashd_extra_args value"));
+        assert!(logs.contains("empty zcashd_extra_args value"));
     }
 
     #[test]
@@ -481,7 +538,6 @@ mod tests {
     }
 
     #[test]
-    #[tracing_test::traced_test]
     fn ignores_paired_datadir_extra_arg_override_and_warns() {
         let temp_dir = TempDir::new().expect("tempdir should be created");
         let datadir = temp_dir.path().join("zcashd-datadir");
@@ -491,8 +547,10 @@ mod tests {
             override_datadir.to_string_lossy().to_string(),
         ];
 
-        ensure_zcashd_datadir(&datadir, &extra_args)
-            .expect("paired datadir override warning should be non-fatal");
+        let logs = captured_logs(|| {
+            ensure_zcashd_datadir(&datadir, &extra_args)
+                .expect("paired datadir override warning should be non-fatal");
+        });
 
         assert_eq!(
             fs::read_to_string(datadir.join("zcash.conf"))
@@ -503,7 +561,7 @@ mod tests {
             !override_datadir.exists(),
             "paired datadir should not be used for bootstrap inference"
         );
-        assert!(logs_contain("paired zcashd_extra_args"));
+        assert!(logs.contains("paired zcashd_extra_args"));
     }
 
     #[test]
@@ -530,7 +588,6 @@ mod tests {
     }
 
     #[test]
-    #[tracing_test::traced_test]
     fn warns_on_listen_but_continues() {
         let temp_dir = TempDir::new().expect("tempdir should be created");
         let conf_path = temp_dir.path().join("zcash.conf");
@@ -540,14 +597,15 @@ mod tests {
         )
         .expect("config should be written");
 
-        audit_zcash_conf(&conf_path).expect("config audit should continue");
+        let logs = captured_logs(|| {
+            audit_zcash_conf(&conf_path).expect("config audit should continue");
+        });
 
-        assert!(logs_contain("listen"));
-        assert!(logs_contain("overridden by supervisor CLI arguments"));
+        assert!(logs.contains("listen"));
+        assert!(logs.contains("overridden by supervisor CLI arguments"));
     }
 
     #[test]
-    #[tracing_test::traced_test]
     fn warns_on_bind() {
         let temp_dir = TempDir::new().expect("tempdir should be created");
         let conf_path = temp_dir.path().join("zcash.conf");
@@ -557,23 +615,24 @@ mod tests {
         )
         .expect("config should be written");
 
-        audit_zcash_conf(&conf_path).expect("config audit should continue");
+        let logs = captured_logs(|| {
+            audit_zcash_conf(&conf_path).expect("config audit should continue");
+        });
 
-        assert!(logs_contain("bind"));
-        assert!(logs_contain("incompatible with -zebra-compat"));
+        assert!(logs.contains("bind"));
+        assert!(logs.contains("incompatible with -zebra-compat"));
     }
 
     #[test]
-    #[tracing_test::traced_test]
     fn warns_missing_deprecation_ack() {
         let temp_dir = TempDir::new().expect("tempdir should be created");
         let conf_path = temp_dir.path().join("zcash.conf");
         fs::write(&conf_path, "\n").expect("config should be written");
 
-        audit_zcash_conf(&conf_path).expect("config audit should continue");
+        let logs = captured_logs(|| {
+            audit_zcash_conf(&conf_path).expect("config audit should continue");
+        });
 
-        assert!(logs_contain(
-            "missing the zcashd deprecation acknowledgement"
-        ));
+        assert!(logs.contains("missing the zcashd deprecation acknowledgement"));
     }
 }
