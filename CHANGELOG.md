@@ -44,6 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.
+- Fixed Zakura header sync permanently stranding a node whose committed chain
+  suffix ends up on a branch the network abandoned. Header sync only requested
+  headers forward from its own frontier hash and treated every non-linking
+  response as peer misbehavior, so after a reorg a zakura-only node rejected
+  all honest headers forever (`first_header_does_not_link`), flagged the
+  honest peers, and never caught up — restarts did not help. Non-linking
+  forward responses are no longer scored; after repeated failures from
+  independent peers the request anchor now walks back below the verified block
+  tip (exponentially deeper per round, at most `MAX_BLOCK_REORG_HEIGHT`, never
+  below the finalized height) until responses link, the higher-work header
+  range commits through the fork point, and the stranded committed body suffix
+  is invalidated so block sync re-downloads the new branch. Recovery progress
+  is logged and counted (`sync.header.fork_recovery.*`).
 - Fixed dual-stack nodes (`v2_p2p` and `legacy_p2p` both enabled) permanently
   shutting down their own Zakura header- and block-sync drivers when a legacy
   peer on a foreign fork answered the body-sync stall watchdog's cross-check
