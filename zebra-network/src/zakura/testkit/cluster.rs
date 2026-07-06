@@ -156,9 +156,10 @@ mod tests {
             HeaderSyncCommitFailureKind, HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle,
             HeaderSyncMessage, HeaderSyncMisbehavior, HeaderSyncPeerSession, HeaderSyncStartup,
             HeaderSyncStatus, Peer, Service, ServicePeerLimits, Stream, ZakuraBlockSyncConfig,
-            ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace, MAX_BS_RESPONSE_BYTES,
-            ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC, ZAKURA_CAP_LEGACY_GOSSIP,
-            ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_HEADER_SYNC,
+            ZakuraConnId, ZakuraHeaderSyncConfig, ZakuraLocalLimits, ZakuraTrace,
+            MAX_BS_RESPONSE_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
+            ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_GOSSIP,
+            ZAKURA_STREAM_HEADER_SYNC,
         },
         Config,
     };
@@ -306,7 +307,7 @@ mod tests {
             });
         }
 
-        fn remove_peer(&self, peer: &ZakuraPeerId) {
+        fn remove_peer(&self, peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {
             let senders = self.senders.clone();
             let peer = peer.clone();
             tokio::spawn(async move {
@@ -379,7 +380,7 @@ mod tests {
             });
         }
 
-        fn remove_peer(&self, peer: &ZakuraPeerId) {
+        fn remove_peer(&self, peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {
             let _ = self.events.send(TaskExitProbeEvent::Removed(peer.clone()));
         }
     }
@@ -1098,20 +1099,25 @@ mod tests {
                 };
                 match action {
                     BlockSyncAction::QueryNeededBlocks {
-                        verified_block_tip,
+                        from,
+                        limit,
                         best_header_tip,
                     } => {
-                        let metas = by_height
-                            .range(
-                                verified_block_tip.next().unwrap_or(verified_block_tip)
-                                    ..=best_header_tip,
-                            )
-                            .map(|(height, block)| BlockSyncBlockMeta {
-                                height: *height,
-                                hash: block.hash(),
-                                size: BlockSizeEstimate::Advertised(block_size(block)),
-                            })
-                            .collect();
+                        let metas = if limit == 0 {
+                            Vec::new()
+                        } else {
+                            let end = (from + i64::from(limit.saturating_sub(1)))
+                                .unwrap_or(block::Height::MAX)
+                                .min(best_header_tip);
+                            by_height
+                                .range(from..=end)
+                                .map(|(height, block)| BlockSyncBlockMeta {
+                                    height: *height,
+                                    hash: block.hash(),
+                                    size: BlockSizeEstimate::Advertised(block_size(block)),
+                                })
+                                .collect()
+                        };
                         let _ = handle.send(BlockSyncEvent::NeededBlocks(metas)).await;
                     }
                     BlockSyncAction::SubmitBlock { token, block } => {

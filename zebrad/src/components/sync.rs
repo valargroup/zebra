@@ -457,6 +457,31 @@ fn legacy_probe_supports_fallback(blocks_ahead: Option<HeightDiff>) -> bool {
     matches!(blocks_ahead, Some(blocks_ahead) if blocks_ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD)
 }
 
+/// Converts Zakura's local body/header gap into the legacy sync-status
+/// "recent length" signal used by mempool and RPC readiness.
+///
+/// When Zakura owns body sync, the legacy [`ChainSync`] loop is paused, so
+/// `recent_syncs` would otherwise stay empty or stale. A zero or small local
+/// header/body gap means the node is close enough to the tip for the existing
+/// [`SyncStatus`] heuristic; a large gap keeps mempool disabled.
+fn zakura_sync_status_length(
+    verified_height: Option<Height>,
+    header_tip_height: Option<Height>,
+) -> Option<usize> {
+    let (Some(verified_height), Some(header_tip_height)) = (verified_height, header_tip_height)
+    else {
+        return None;
+    };
+
+    let gap = header_tip_height - verified_height;
+
+    if gap <= 0 {
+        Some(0)
+    } else {
+        Some(usize::try_from(gap).unwrap_or(usize::MAX))
+    }
+}
+
 /// Decides whether Zakura block sync should be considered stalled — so the
 /// legacy [`ChainSync::sync`] body downloader resumes as a fallback — from the
 /// latest verified body tip. Returns `true` once `max_idle_polls` consecutive
@@ -975,6 +1000,10 @@ where
 
             let verified_height = self.latest_chain_tip.best_tip_height();
             let header_tip_height = best_header_tip_height(&mut read_state).await;
+            if let Some(sync_length) = zakura_sync_status_length(verified_height, header_tip_height)
+            {
+                self.recent_syncs.push_extend_tips_length(sync_length);
+            }
 
             match zakura_watchdog_action(
                 &mut tracker,
@@ -1009,6 +1038,11 @@ where
                 }
                 ZakuraWatchdogAction::ProbeLegacyPeers => {
                     let blocks_ahead = self.legacy_peers_blocks_ahead().await;
+                    info!(
+                        verified_tip = ?verified_height,
+                        ?blocks_ahead,
+                        "Zakura watchdog probed legacy peers for connected blocks ahead"
+                    );
                     if legacy_probe_supports_fallback(blocks_ahead) {
                         warn!(
                             verified_tip = ?verified_height,
@@ -1026,16 +1060,24 @@ where
         }
     }
 
-    /// Probes the legacy peer set for how far ahead the network is, returning the
-    /// greatest number of block hashes any peer offered beyond our tip (`None` if
-    /// no peer answered).
+    /// Probes the legacy peer set for how far ahead the network is on **our**
+    /// chain, returning the longest run of peer-offered headers that extends a
+    /// block we already have (`None` if no peer answered).
     ///
     /// This is the watchdog's network-truth cross-check. It deliberately uses the
-    /// legacy `FindBlocks` path rather than the Zakura header frontier: a fleet
+    /// legacy `FindHeaders` path rather than the Zakura header frontier: a fleet
     /// that restarts in lockstep stalls every node's header sync at the same
     /// height, so the Zakura frontier collapses to the common stuck tip and can no
     /// longer reveal that the network has moved on. The legacy peers' advertised
-    /// hashes are independent of that, so they still expose the true tip.
+    /// headers are independent of that, so they still expose the true tip.
+    ///
+    /// Headers (not bare hashes) are required so connectivity can be verified: a
+    /// legacy peer on a foreign fork (for example a canonical-network node peered
+    /// with a fork fleet through public seeders) answers with hashes that are all
+    /// unknown to us but do not extend our chain. Counting those as "blocks
+    /// ahead" made the watchdog kill Zakura sync on nodes that were exactly at
+    /// their network's tip. Only headers whose parent chain anchors in our state
+    /// count; a response that never links to our chain counts as zero.
     ///
     /// Read-only: unlike [`Self::obtain_tips`] it touches none of the syncer's
     /// download bookkeeping, so it is safe to call from the watchdog loop.
@@ -1061,7 +1103,7 @@ where
             }
             let ready_tip_network = self.tip_network.ready().await.ok()?;
             requests.push(tokio::spawn(ready_tip_network.call(
-                zn::Request::FindBlocks {
+                zn::Request::FindHeaders {
                     known_blocks: block_locator.clone(),
                     stop: None,
                 },
@@ -1070,26 +1112,45 @@ where
 
         let mut best_ahead: Option<HeightDiff> = None;
         while let Some(res) = requests.next().await {
-            let hashes = match res {
-                Ok(Ok(zn::Response::BlockHashes(hashes))) => hashes,
+            let headers = match res {
+                Ok(Ok(zn::Response::BlockHeaders(headers))) => headers,
                 // Best-effort: ignore failed/cancelled fanout requests and any
                 // unexpected response, exactly like the obtain_tips fanout does.
                 _ => continue,
             };
 
-            // Count the hashes this peer offered that we do not already have: that
-            // run is how many blocks beyond our tip the peer is advertising. Stop
-            // at the threshold so a far-behind node never pays for the whole
-            // (up to 500-hash) response.
+            // Count the run of offered headers that extends our own chain: skip
+            // any prefix we already have, then require the first unknown header
+            // to anchor at a block in our state and every later one to link to
+            // its predecessor in the response. A foreign-fork response never
+            // anchors and counts zero. Stop at the threshold so a far-behind
+            // node never pays for the whole (up to 160-header) response.
             let mut ahead: HeightDiff = 0;
-            for hash in hashes {
+            let mut run_parent: Option<block::Hash> = None;
+            for counted in headers {
+                let hash = counted.header.hash();
                 // `state_contains` errs only if the state service is gone; treat
                 // an error as "known" so a failing probe never forces a fallback.
-                if !self.state_contains(hash).await.unwrap_or(true) {
-                    ahead += 1;
-                    if ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD {
-                        return Some(ahead);
-                    }
+                if self.state_contains(hash).await.unwrap_or(true) {
+                    ahead = 0;
+                    run_parent = Some(hash);
+                    continue;
+                }
+                let parent = counted.header.previous_block_hash;
+                let anchored = match run_parent {
+                    Some(run_parent) => parent == run_parent,
+                    None => self.state_contains(parent).await.unwrap_or(false),
+                };
+                if !anchored {
+                    // Unknown header that does not extend our chain: foreign fork
+                    // or a gapped response; nothing here is "ahead" of us.
+                    ahead = 0;
+                    break;
+                }
+                ahead += 1;
+                run_parent = Some(hash);
+                if ahead >= ZAKURA_LEGACY_BEHIND_THRESHOLD {
+                    return Some(ahead);
                 }
             }
             best_ahead = Some(best_ahead.unwrap_or(0).max(ahead));

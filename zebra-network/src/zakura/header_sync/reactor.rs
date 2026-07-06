@@ -79,20 +79,28 @@ impl HeaderSyncReactor {
         }
 
         let mut ticks = time::interval(self.empty_headers_retry_delay());
+        let exit_reason;
         loop {
+            // Liveness watermark: a frozen reactor is otherwise invisible (the
+            // process, transport, and other services keep running). Exposing the
+            // loop count lets an external watcher detect a stall in seconds.
+            metrics::counter!("sync.header.reactor.iterations").increment(1);
             tokio::select! {
                 biased;
                 _ = self.startup.shutdown.cancelled() => {
+                    exit_reason = "shutdown";
                     break;
                 }
                 event = self.lifecycle.recv() => {
                     let Some(event) = event else {
+                        exit_reason = "lifecycle_channel_closed";
                         break;
                     };
                     self.handle_event(event).await;
                 }
                 event = self.events.recv() => {
                     let Some(event) = event else {
+                        exit_reason = "events_channel_closed";
                         break;
                     };
                     self.handle_event(event).await;
@@ -115,14 +123,31 @@ impl HeaderSyncReactor {
                     }
                 }
                 _ = ticks.tick() => {
+                    metrics::counter!("sync.header.reactor.event_started", "kind" => "tick").increment(1);
                     self.handle_timeouts().await;
+                    self.refresh_statuses();
+                    metrics::counter!("sync.header.reactor.event_finished", "kind" => "tick").increment(1);
                 }
             }
         }
+        // A reactor exit is fatal to header sync on this node but the process
+        // keeps running, so it must be loud.
+        tracing::warn!(exit_reason, "Zakura header-sync reactor exited");
+        metrics::counter!("sync.header.reactor.exited", "reason" => exit_reason).increment(1);
     }
 
     async fn handle_event(&mut self, event: HeaderSyncEvent) {
         self.trace_event_received(&event);
+        // Started/finished pairs expose which event kind an await inside
+        // `handle_event` is stuck on: after a freeze, exactly one kind shows
+        // started == finished + 1.
+        let kind = event.metrics_label();
+        metrics::counter!("sync.header.reactor.event_started", "kind" => kind).increment(1);
+        self.handle_event_inner(event).await;
+        metrics::counter!("sync.header.reactor.event_finished", "kind" => kind).increment(1);
+    }
+
+    async fn handle_event_inner(&mut self, event: HeaderSyncEvent) {
         match event {
             HeaderSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
             HeaderSyncEvent::PeerDisconnected(peer) => self.handle_peer_disconnected(peer),
@@ -367,7 +392,11 @@ impl HeaderSyncReactor {
         let direction = session.direction();
         let decision = self.admission_decision_for(&peer, direction);
         if decision != ServiceAdmissionDecision::Admit {
-            tracing::debug!(
+            // A parked peer stays connected but never receives a status, which
+            // from its side is indistinguishable from a wedged remote. Keep
+            // this visible at default log levels and in metrics.
+            metrics::counter!("sync.header.peer.parked").increment(1);
+            tracing::info!(
                 ?peer,
                 ?direction,
                 ?decision,
@@ -1347,41 +1376,79 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn send_status(&mut self, peer: &ZakuraPeerId) {
+    fn send_status(&mut self, peer: &ZakuraPeerId) -> bool {
+        self.send_status_inner(peer, false)
+    }
+
+    /// Sends the current status even when identical to the last one sent.
+    ///
+    /// The connection-level freshness reaper only counts inbound application
+    /// messages, so two peers at the same tip would otherwise go mutually
+    /// silent and reap healthy connections every idle window. The periodic
+    /// refresh uses this forced send as an application keepalive: it is gated
+    /// by the peer's unsolicited meter (`status_refresh_interval` spacing),
+    /// which stays far above the remote's inbound status minimum interval, so
+    /// the redundant status is never classified as status spam.
+    fn send_status_keepalive(&mut self, peer: &ZakuraPeerId) -> bool {
+        self.send_status_inner(peer, true)
+    }
+
+    fn send_status_inner(&mut self, peer: &ZakuraPeerId, force: bool) -> bool {
         let status = self.local_status();
         // Suppress a status identical to the last one we sent this peer over its
         // current session: it advances nothing and the peer's inbound status
-        // rate limiter would treat the redundant message as spam.
-        match self.state.peers.get_mut(peer) {
-            Some(peer_state) if peer_state.status_differs_from_last_sent(status) => {
-                peer_state.record_sent_status(status);
+        // rate limiter would treat the redundant message as spam. Keepalive
+        // sends are exempt: their meter keeps them above that limit.
+        let session = match self.state.peers.get(peer) {
+            Some(peer_state) if force || peer_state.status_differs_from_last_sent(status) => {
+                peer_state.session.clone()
             }
             Some(_) => {
                 metrics::counter!("sync.header.peer.status.suppressed_redundant").increment(1);
-                return;
+                return false;
             }
-            None => return,
-        }
-        metrics::counter!("sync.header.peer.status.sent").increment(1);
-        self.trace_status_sent(peer, status);
-        if let Some(peer_state) = self.state.peers.get(peer) {
-            if let Err(error) = peer_state.session.try_send_status(status) {
+            None => return false,
+        };
+        match session.try_send_status(status) {
+            Ok(()) => {
+                if let Some(peer_state) = self.state.peers.get_mut(peer) {
+                    peer_state.record_sent_status(status);
+                }
+                metrics::counter!("sync.header.peer.status.sent").increment(1);
+                self.trace_status_sent(peer, status);
+                #[cfg(test)]
+                let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
+                    peer: peer.clone(),
+                    msg: HeaderSyncMessage::Status(status),
+                });
+                true
+            }
+            Err(error) => {
+                metrics::counter!("sync.header.peer.status.send_failed").increment(1);
                 tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
                 self.trace_queue_send_failed(
                     peer,
                     "status",
                     &error,
-                    peer_state.session.outbound_capacity(),
-                    peer_state.session.outbound_max_capacity(),
+                    session.outbound_capacity(),
+                    session.outbound_max_capacity(),
                     |_| {},
                 );
+                false
             }
         }
-        #[cfg(test)]
-        let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
-            peer: peer.clone(),
-            msg: HeaderSyncMessage::Status(status),
-        });
+    }
+
+    fn send_status_and_mark_unsolicited(&mut self, peer: &ZakuraPeerId, now: Instant) -> bool {
+        if !self.send_status(peer) {
+            return false;
+        }
+
+        if let Some(peer_state) = self.state.peers.get_mut(peer) {
+            peer_state.meters.unsolicited.mark_taken(now);
+        }
+
+        true
     }
 
     async fn publish_best_tip(&mut self, height: block::Height, hash: block::Hash) {
@@ -1420,13 +1487,64 @@ impl HeaderSyncReactor {
         }
     }
 
+    /// Periodic status refresh, doubling as an application-level keepalive.
+    ///
+    /// Every peer whose unsolicited meter is ready (one `status_refresh_interval`
+    /// since the last unsolicited send) gets the current status even when it is
+    /// unchanged: the connection freshness reaper only counts inbound messages,
+    /// so without this two peers idle at the same tip reap their healthy
+    /// connection every idle window. A failed send does not mark the meter, so
+    /// a peer whose initial status was lost to a dead session is retried on the
+    /// next tick instead of staying connected-but-mute.
+    fn refresh_statuses(&mut self) {
+        let now = Instant::now();
+        let status = self.local_status();
+
+        // Unsent or changed statuses retry on the fast unsolicited budget, so a
+        // peer whose initial status was lost to a dead session queue recovers on
+        // the next tick instead of staying connected-but-mute.
+        let retry_ids: Vec<_> = self
+            .state
+            .peers
+            .iter()
+            .filter(|(_peer_id, peer)| {
+                peer.status_differs_from_last_sent(status) && peer.meters.unsolicited.is_ready(now)
+            })
+            .map(|(peer_id, _peer)| peer_id.clone())
+            .collect();
+        for peer in retry_ids {
+            self.send_status_and_mark_unsolicited(&peer, now);
+        }
+
+        // Redundant keepalives run on the slower spam-safe keepalive budget.
+        let keepalive_ids: Vec<_> = self
+            .state
+            .peers
+            .iter()
+            .filter(|(_peer_id, peer)| {
+                !peer.status_differs_from_last_sent(status)
+                    && peer.meters.keepalive.is_ready(now)
+                    && peer.meters.unsolicited.is_ready(now)
+            })
+            .map(|(peer_id, _peer)| peer_id.clone())
+            .collect();
+        for peer in keepalive_ids {
+            if self.send_status_keepalive(&peer) {
+                if let Some(peer_state) = self.state.peers.get_mut(&peer) {
+                    peer_state.meters.keepalive.mark_taken(now);
+                    peer_state.meters.unsolicited.mark_taken(now);
+                }
+            }
+        }
+    }
+
     async fn broadcast_status_refresh(&mut self) {
         let now = Instant::now();
         let status = self.local_status();
         let peer_ids: Vec<_> = self
             .state
             .peers
-            .iter_mut()
+            .iter()
             .filter_map(|(peer_id, peer)| {
                 // Never re-send a peer a status identical to its last one: the
                 // peer's inbound rate limiter would treat it as spam. A redundant
@@ -1435,34 +1553,15 @@ impl HeaderSyncReactor {
                     metrics::counter!("sync.header.peer.status.suppressed_redundant").increment(1);
                     return None;
                 }
-                if !peer.meters.unsolicited.try_take(now) {
+                if !peer.meters.unsolicited.is_ready(now) {
                     return None;
                 }
-                peer.record_sent_status(status);
                 Some(peer_id.clone())
             })
             .collect();
 
         for peer in peer_ids {
-            let Some(peer_state) = self.state.peers.get(&peer) else {
-                continue;
-            };
-            if let Err(error) = peer_state.session.try_send_status(status) {
-                tracing::debug!(?peer, ?error, "failed to queue Zakura header-sync Status");
-                self.trace_queue_send_failed(
-                    &peer,
-                    "status",
-                    &error,
-                    peer_state.session.outbound_capacity(),
-                    peer_state.session.outbound_max_capacity(),
-                    |row| insert_optional_str(row, qs_trace::REASON, Some("refresh")),
-                );
-            }
-            #[cfg(test)]
-            let _ = self.actions.try_send(HeaderSyncAction::SendMessage {
-                peer,
-                msg: HeaderSyncMessage::Status(status),
-            });
+            self.send_status_and_mark_unsolicited(&peer, now);
         }
     }
 
