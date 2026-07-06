@@ -1002,11 +1002,14 @@ impl NonFinalizedState {
                 // For now, we don't show any work here, see the deleted code in PR #7087.
                 let mut desc = String::new();
 
-                if let Some(recent_fork_height) = chain.recent_fork_height() {
-                    let recent_fork_length = chain
-                        .recent_fork_length()
-                        .expect("just checked recent fork height");
-
+                // Both are `None`-checked: invalidating a chain suffix can leave
+                // `last_fork_height` above the truncated tip, making the length
+                // `None` while the height is `Some`. This is metrics-only display
+                // code and must never panic the block write task (it crash-looped
+                // a node when the Zakura fork-recovery invalidation first hit it).
+                if let (Some(recent_fork_height), Some(recent_fork_length)) =
+                    (chain.recent_fork_height(), chain.recent_fork_length())
+                {
                     let mut plural = "s";
                     if recent_fork_length == 1 {
                         plural = "";
