@@ -1125,12 +1125,32 @@ impl PeerRoutine {
                 // continuous backpressure): plausibly transient local write congestion, not
                 // a dead peer. While outbound is full the select loop does not drain inbound
                 // frames (`if outbound_queue_has_capacity`), so a block the peer already sent
-                // may be waiting behind our write side. Grant one short, BOUNDED grace. This
-                // is the *only* liveness extension: a peer that stopped reading holds outbound
-                // full past `request_timeout`, falls through to the disconnect arm, and is
-                // disconnected at the liveness deadline — it cannot dodge the timer.
+                // may be waiting behind our write side. Grant one short, BOUNDED grace: a peer
+                // that stopped reading holds outbound full past `request_timeout`, falls
+                // through to the disconnect arm, and is disconnected at the liveness
+                // deadline — it cannot dodge the timer.
                 self.window
                     .extend_liveness_deadline(now, self.config.request_timeout);
+                Ok(())
+            }
+            LivenessOutcome::Disconnect if self.sequencer_view.borrow().applying_len > 0 => {
+                // Bodies are sitting in the LOCAL apply pipeline, so "no accepted
+                // block progress" cannot be blamed on this peer: nothing can make
+                // accepted progress while our own commits are not landing. During a
+                // 45-minute verifier-layer commit stall this arm's absence exiled
+                // healthy peers one by one into the no-progress cooldown (observed
+                // live: t2 parks +4, t4 down to 2 peers). Defer the disconnect; a
+                // genuinely dead peer is caught as soon as the pipeline drains
+                // (`applying_len == 0`), and its timed-out requests were already
+                // requeued to other peers by `expire_due_timeouts`.
+                self.window
+                    .extend_liveness_deadline(now, self.config.request_timeout);
+                metrics::counter!("sync.block.liveness.deferred_local_stall").increment(1);
+                tracing::debug!(
+                    peer = ?self.peer,
+                    applying_len = self.sequencer_view.borrow().applying_len,
+                    "deferring block-sync liveness disconnect: local apply pipeline is stalled"
+                );
                 Ok(())
             }
             LivenessOutcome::Disconnect => {
@@ -2715,6 +2735,80 @@ mod tests {
         assert!(
             matches!(routine.window.check_liveness(now), LivenessOutcome::Ok),
             "the peer owes nothing and must not be disconnected"
+        );
+    }
+
+    /// An expired liveness deadline must not disconnect a peer while the LOCAL
+    /// apply pipeline holds unfinished bodies: nothing can make "accepted block
+    /// progress" while our own commits are not landing. During a live
+    /// verifier-layer commit stall this exiled healthy peers one by one into
+    /// the no-progress cooldown until the peer set collapsed. Once the
+    /// pipeline drains, the same expired deadline disconnects as before.
+    #[tokio::test]
+    async fn liveness_disconnect_is_deferred_while_local_applies_are_stalled() {
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+
+        let cancel = CancellationToken::new();
+        let (out_send, _out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![9u8; 32]).expect("test peer id is within bounds");
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let (actions_tx, _actions_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let mut view = initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(100),
+            verified_block_hash: block::Hash([0; 32]),
+        });
+        view.applying_len = 60;
+        let (view_tx, view_rx) = watch::channel(view.clone());
+
+        let mut routine = PeerRoutine::new(
+            peer,
+            session,
+            in_recv,
+            config,
+            0,
+            budget,
+            work,
+            Arc::new(PeerRegistry::new()),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            control_tx,
+            actions_tx,
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+
+        let now = Instant::now();
+        // An armed deadline that expired 10s ago.
+        routine
+            .window
+            .arm_liveness(now - Duration::from_secs(60), Duration::from_secs(50));
+
+        assert!(
+            routine.check_block_liveness(now).is_ok(),
+            "an expired deadline must be deferred while local applies are stalled"
+        );
+
+        // The pipeline drains: the same expired deadline now disconnects.
+        view.applying_len = 0;
+        view_tx
+            .send(view)
+            .expect("view receiver is held by the routine");
+        // The deferral extended the deadline by request_timeout; move past it.
+        let later = now + routine.config.request_timeout + Duration::from_secs(1);
+        assert!(
+            routine.check_block_liveness(later).is_err(),
+            "a drained pipeline must restore the liveness disconnect"
         );
     }
 }

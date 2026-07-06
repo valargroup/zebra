@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.
+- Zakura block-sync liveness disconnects are now deferred while the local
+  apply pipeline holds unfinished bodies: "no accepted block progress" cannot
+  be blamed on a peer while the node's own commits are not landing. During a
+  ~45-minute local commit stall the old behavior exiled healthy peers one by
+  one into the no-progress cooldown. A genuinely dead peer is still caught as
+  soon as the pipeline drains. Deferrals are counted in
+  `sync.block.liveness.deferred_local_stall`.
 - Fixed a chain-tip reset (fork-recovery invalidation, `invalidateblock`)
   being silently discarded by the Zakura chain-tip mirror. The mirror maxed
   the reset tip against a `latest_chain_tip` watch that may not have observed
