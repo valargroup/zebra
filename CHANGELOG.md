@@ -44,6 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
   transaction verifier was converted to `InternalDowncastError` instead of a
   missing transparent input.
+- Fixed a chain-tip reset (fork-recovery invalidation, `invalidateblock`)
+  being silently discarded by the Zakura chain-tip mirror. The mirror maxed
+  the reset tip against a `latest_chain_tip` watch that may not have observed
+  the reset yet, republished the stale higher tip, and turned the downstream
+  `VerifiedReset` into a no-op — the block-sync sequencer then pinned one
+  block above the real tip, never requested the missing parent, and every
+  body commit timed out until restart. On `TipAction::Reset` the action's tip
+  is now published verbatim; the anti-regression maxing only applies to
+  `Grow`.
 - Fixed Zakura block-sync peers being serially disconnected and parked at the
   chain tip by a stale liveness deadline. When the download floor passed a
   request because other peers' deliveries satisfied its heights, the floor GC

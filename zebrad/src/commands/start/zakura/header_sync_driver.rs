@@ -1553,13 +1553,11 @@ pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(
                 insert_cs_height(row, cs_trace::FINALIZED_HEIGHT, finalized_height);
             },
         );
-        let action_tip = Some((height, hash));
-        let verified_block_tip =
-            verified_block_tip_from_state(finalized_tip, action_tip, (height, hash));
-        let verified_block_tip = verified_block_tip_from_state(
-            Some(verified_block_tip),
+        let verified_block_tip = chain_tip_mirror_verified_tip(
+            &action,
+            finalized_tip,
+            (height, hash),
             latest_chain_tip.best_tip_height_and_hash(),
-            verified_block_tip,
         );
 
         emit_commit_state(
@@ -1701,6 +1699,32 @@ pub(crate) fn block_sync_chain_tip_event(
     match action {
         zebra_state::TipAction::Grow { .. } => BlockSyncEvent::ChainTipGrow(frontiers),
         zebra_state::TipAction::Reset { .. } => BlockSyncEvent::ChainTipReset(frontiers),
+    }
+}
+
+/// The verified-body tip the chain-tip mirror publishes for a tip action.
+///
+/// On `Grow`, the action tip is maxed against the finalized tip and the
+/// `latest_chain_tip` watch so a lagging source cannot regress the frontier.
+/// On `Reset` the action's tip IS the authoritative post-reset chain tip:
+/// maxing it against a watch that has not yet observed the reset republishes
+/// the stale higher tip, turns the downstream `VerifiedReset` into a no-op,
+/// and pins the block-sync sequencer one block above the real tip — it then
+/// never requests the missing parent and every body commit times out
+/// (observed live after a fork-recovery invalidation).
+pub(crate) fn chain_tip_mirror_verified_tip(
+    action: &zebra_state::TipAction,
+    finalized_tip: Option<(block::Height, block::Hash)>,
+    action_tip: (block::Height, block::Hash),
+    latest_tip: Option<(block::Height, block::Hash)>,
+) -> (block::Height, block::Hash) {
+    match action {
+        zebra_state::TipAction::Reset { .. } => action_tip,
+        zebra_state::TipAction::Grow { .. } => {
+            let verified_block_tip =
+                verified_block_tip_from_state(finalized_tip, Some(action_tip), action_tip);
+            verified_block_tip_from_state(Some(verified_block_tip), latest_tip, verified_block_tip)
+        }
     }
 }
 

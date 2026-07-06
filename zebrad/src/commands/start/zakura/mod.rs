@@ -130,8 +130,8 @@ pub(crate) use frontier::{query_block_sync_frontiers, verified_block_tip_from_st
 #[cfg(test)]
 pub(crate) use header_sync_driver::{
     block_roots_cover_range, block_sync_chain_tip_event, body_sizes_for_served_header_range,
-    chain_tip_mirror_frontier_change, header_range_commit_failure_kind,
-    notify_block_sync_header_tip, reconcile_stranded_body_suffix,
+    chain_tip_mirror_frontier_change, chain_tip_mirror_verified_tip,
+    header_range_commit_failure_kind, notify_block_sync_header_tip, reconcile_stranded_body_suffix,
     root_covered_query_best_header_tip, tree_aux_roots_for_served_header_range,
 };
 pub(crate) use header_sync_driver::{

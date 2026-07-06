@@ -2917,6 +2917,31 @@ mod zakura_header_sync_driver_tests {
     /// when the committed suffix sits on a branch the header chain reorged away
     /// from (e.g. after a crash between a durable header reorg and its body
     /// invalidation, when later commits report no header conflict).
+    /// On `TipAction::Reset` the mirror must publish the action's tip verbatim:
+    /// maxing it against a `latest_chain_tip` watch that has not yet observed
+    /// the reset republishes the stale higher tip, turns the `VerifiedReset`
+    /// into a no-op, and pins the block-sync sequencer one block above the
+    /// real tip (observed live after a fork-recovery invalidation: every body
+    /// commit then timed out waiting for a parent that was never requested).
+    #[test]
+    fn chain_tip_mirror_reset_tip_is_authoritative() {
+        use super::zakura::chain_tip_mirror_verified_tip;
+
+        let reset_tip = (block::Height(100), block::Hash([1; 32]));
+        let stale_watch_tip = Some((block::Height(101), block::Hash([2; 32])));
+        let finalized = Some((block::Height(90), block::Hash([3; 32])));
+        let reset = zebra_state::TipAction::Reset {
+            height: reset_tip.0,
+            hash: reset_tip.1,
+        };
+
+        assert_eq!(
+            chain_tip_mirror_verified_tip(&reset, finalized, reset_tip, stale_watch_tip),
+            reset_tip,
+            "a reset's tip is authoritative and must not be maxed against stale sources"
+        );
+    }
+
     #[tokio::test]
     async fn stranded_body_suffix_is_reconciled_by_invalidation() {
         use std::sync::atomic::{AtomicBool, Ordering};
