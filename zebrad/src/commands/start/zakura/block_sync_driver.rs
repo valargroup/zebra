@@ -473,6 +473,10 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             BlockSyncAction::SubmitBlock { token, block } => {
                 let class = block_apply_class(block.as_ref(), max_checkpoint_height);
                 let height = block.coinbase_height();
+                if apply_gate.is_yielded() {
+                    abandon_yielded_block_apply(&block_sync, token, block.as_ref(), &trace);
+                    continue;
+                }
                 emit_commit_state(
                     &trace,
                     cs_trace::BLOCK_SUBMIT_QUEUED,
@@ -558,6 +562,60 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             }
         }
     }
+}
+
+fn abandon_yielded_block_apply(
+    block_sync: &BlockSyncHandle,
+    token: BlockApplyToken,
+    block: &block::Block,
+    trace: &ZakuraTrace,
+) {
+    let Some((height, expected_hash, result, event)) =
+        yielded_block_apply_finished_event(token, block)
+    else {
+        warn!(
+            expected_hash = ?block.hash(),
+            "dropping yielded Zakura block-sync body without coinbase height"
+        );
+        return;
+    };
+
+    let _ = block_sync.send_control(event);
+    emit_commit_state(
+        trace,
+        cs_trace::REACTOR_EVENT_SENT,
+        "block_sync_driver",
+        |row| {
+            insert_cs_str(row, cs_trace::ACTION, "block_apply_finished");
+            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
+            insert_cs_height(row, cs_trace::HEIGHT, height);
+            insert_cs_hash(row, cs_trace::HASH, expected_hash);
+            insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
+            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, false);
+        },
+    );
+}
+
+pub(crate) fn yielded_block_apply_finished_event(
+    token: BlockApplyToken,
+    block: &block::Block,
+) -> Option<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
+    let height = block.coinbase_height()?;
+    let hash = block.hash();
+    let result = BlockApplyResult::TimedOut;
+
+    Some((
+        height,
+        hash,
+        result,
+        BlockSyncEvent::BlockApplyFinished {
+            token,
+            height,
+            hash,
+            result,
+            local_frontier: None,
+        },
+    ))
 }
 
 pub(crate) fn coalesce_ready_needed_block_queries(

@@ -2133,10 +2133,10 @@ mod zakura_header_sync_driver_tests {
         commit_block_sync_body, drive_block_sync_actions, drive_zakura_header_sync_actions,
         header_range_commit_failure_kind, notify_block_sync_header_tip, query_block_sync_frontiers,
         query_block_sync_needed_blocks, root_covered_query_best_header_tip,
-        tree_aux_roots_for_served_header_range, verified_block_tip_from_state, BlockApplyClass,
-        BlocksyncThroughputProbe, ZakuraHeaderSyncDriverHandles,
-        ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL, ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
+        tree_aux_roots_for_served_header_range, verified_block_tip_from_state,
+        yielded_block_apply_finished_event, BlockApplyClass, BlocksyncThroughputProbe,
+        ZakuraHeaderSyncDriverHandles, ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL,
+        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW,
     };
 
     fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
@@ -3720,6 +3720,33 @@ mod zakura_header_sync_driver_tests {
             "shutdown must drop queued bodies instead of starting new commits"
         );
         reactor_task.abort();
+    }
+
+    #[test]
+    fn block_sync_driver_releases_yielded_submit_blocks_without_queueing() {
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_height = block.coinbase_height().expect("test block has height");
+        let block_hash = block.hash();
+
+        let Some((height, hash, result, event)) =
+            yielded_block_apply_finished_event(99, block.as_ref())
+        else {
+            panic!("test block has a coinbase height");
+        };
+
+        assert_eq!(height, block_height);
+        assert_eq!(hash, block_hash);
+        assert_eq!(result, BlockApplyResult::TimedOut);
+        assert!(matches!(
+            event,
+            BlockSyncEvent::BlockApplyFinished {
+                token: 99,
+                height,
+                hash,
+                result: BlockApplyResult::TimedOut,
+                local_frontier: None,
+            } if height == block_height && hash == block_hash
+        ));
     }
 
     /// A checkpoint-class commit must wait for the checkpoint verifier to
