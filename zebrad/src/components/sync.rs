@@ -523,7 +523,7 @@ where
 /// the fallback node might be the only peer with working legacy ingest, so it
 /// must keep advertising frontiers and serving headers/bodies to Zakura peers.
 async fn engage_legacy_fallback_alongside_zakura(
-    apply_gate: &crate::commands::start::zakura::ZakuraApplyGate,
+    block_sync_handoff: &crate::commands::start::zakura::BlockSyncHandoff,
 ) {
     metrics::counter!("sync.zakura.legacy_fallback.engaged").increment(1);
     // Sticky by design: once legacy fallback owns body sync, the node stays in
@@ -533,8 +533,8 @@ async fn engage_legacy_fallback_alongside_zakura(
     // Commit barrier: two engines driving bulk commits concurrently race in
     // the applying queue, so stop new Zakura applies and drain in-flight ones
     // before legacy ChainSync takes the pipeline.
-    apply_gate
-        .yield_and_drain(std::time::Duration::from_secs(60))
+    block_sync_handoff
+        .yield_to_legacy(std::time::Duration::from_secs(60))
         .await;
 }
 
@@ -968,12 +968,12 @@ where
     /// for the legacy-informed cross-check, which only probes legacy peers when
     /// the verified tip is frozen and the node looks caught up to its own header
     /// frontier.
-    #[instrument(skip(self, read_state, apply_gate))]
+    #[instrument(skip(self, read_state, block_sync_handoff))]
     pub(crate) async fn bootstrap_genesis_then_pause<RS>(
         mut self,
         mut read_state: RS,
         legacy_fallback: bool,
-        apply_gate: std::sync::Arc<crate::commands::start::zakura::ZakuraApplyGate>,
+        block_sync_handoff: std::sync::Arc<crate::commands::start::zakura::BlockSyncHandoff>,
     ) -> Result<(), Report>
     where
         RS: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
@@ -1034,7 +1034,7 @@ where
                          legacy ChainSync as the body-sync driver while Zakura keeps serving \
                          peers and following local commits"
                     );
-                    engage_legacy_fallback_alongside_zakura(&apply_gate).await;
+                    engage_legacy_fallback_alongside_zakura(&block_sync_handoff).await;
                     return self.sync().await;
                 }
                 ZakuraWatchdogAction::ProbeLegacyPeers => {
@@ -1053,7 +1053,7 @@ where
                              higher tip; resuming legacy ChainSync as the body-sync driver \
                              while Zakura keeps serving peers and following local commits"
                         );
-                        engage_legacy_fallback_alongside_zakura(&apply_gate).await;
+                        engage_legacy_fallback_alongside_zakura(&block_sync_handoff).await;
                         return self.sync().await;
                     }
                 }

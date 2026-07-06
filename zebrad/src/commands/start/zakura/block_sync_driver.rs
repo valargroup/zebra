@@ -111,7 +111,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     combined_apply_limit: usize,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
-    apply_gate: std::sync::Arc<super::ZakuraApplyGate>,
+    block_sync_handoff: std::sync::Arc<super::BlockSyncHandoff>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
     ReadState: Service<
@@ -150,9 +150,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut shutting_down = false;
 
     loop {
-        if apply_gate.is_yielded() {
-            release_yielded_pending_applies(&block_sync, &mut pending_applies, &trace);
-            release_yielded_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
+        if block_sync_handoff.is_yielded_to_legacy() {
+            release_pending_applies(&block_sync, &mut pending_applies, &trace);
+            release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
         }
 
         if !shutting_down && shutdown.as_mut().now_or_never().is_some() {
@@ -165,7 +165,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         if shutting_down {
             if let Some(completed) = in_flight_applies.next().await {
                 handle_completed_block_apply(
-                    &apply_gate,
+                    &block_sync_handoff,
                     completed,
                     &mut pending_applies,
                     &mut in_flight_applies,
@@ -192,7 +192,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         if !in_flight_applies.is_empty() {
             if let Some(Some(completed)) = in_flight_applies.next().now_or_never() {
                 handle_completed_block_apply(
-                    &apply_gate,
+                    &block_sync_handoff,
                     completed,
                     &mut pending_applies,
                     &mut in_flight_applies,
@@ -234,7 +234,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         continue;
                     };
                     handle_completed_block_apply(
-                        &apply_gate,
+                        &block_sync_handoff,
                         completed,
                         &mut pending_applies,
                         &mut in_flight_applies,
@@ -478,8 +478,8 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             BlockSyncAction::SubmitBlock { token, block } => {
                 let class = block_apply_class(block.as_ref(), max_checkpoint_height);
                 let height = block.coinbase_height();
-                if apply_gate.is_yielded() {
-                    abandon_yielded_block_apply(&block_sync, token, block.as_ref(), &trace);
+                if block_sync_handoff.is_yielded_to_legacy() {
+                    abandon_block_apply(&block_sync, token, block.as_ref(), &trace);
                     continue;
                 }
                 emit_commit_state(
@@ -548,7 +548,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block,
                 });
                 drain_pending_block_applies(
-                    &apply_gate,
+                    &block_sync_handoff,
                     &mut pending_applies,
                     &mut in_flight_applies,
                     &mut checkpoint_in_flight,
@@ -569,18 +569,18 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     }
 }
 
-fn abandon_yielded_block_apply(
+fn abandon_block_apply(
     block_sync: &BlockSyncHandle,
     token: BlockApplyToken,
     block: &block::Block,
     trace: &ZakuraTrace,
 ) {
     let Some((height, expected_hash, result, event)) =
-        yielded_block_apply_finished_event(token, block)
+        abandoned_block_apply_finished_event(token, block)
     else {
         warn!(
             expected_hash = ?block.hash(),
-            "dropping yielded Zakura block-sync body without coinbase height"
+            "dropping abandoned Zakura block-sync body without coinbase height"
         );
         return;
     };
@@ -601,7 +601,7 @@ fn abandon_yielded_block_apply(
     );
 }
 
-pub(crate) fn yielded_block_apply_finished_event(
+pub(crate) fn abandoned_block_apply_finished_event(
     token: BlockApplyToken,
     block: &block::Block,
 ) -> Option<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
@@ -623,19 +623,19 @@ pub(crate) fn yielded_block_apply_finished_event(
     ))
 }
 
-fn yielded_pending_apply_finished_events(
+fn abandoned_pending_apply_finished_events(
     pending_applies: &mut VecDeque<PendingBlockApply>,
 ) -> Vec<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
     let mut events = Vec::new();
     while let Some(pending) = pending_applies.pop_front() {
         if let Some(event) =
-            yielded_block_apply_finished_event(pending.token, pending.block.as_ref())
+            abandoned_block_apply_finished_event(pending.token, pending.block.as_ref())
         {
             events.push(event);
         } else {
             warn!(
                 expected_hash = ?pending.block.hash(),
-                "dropping yielded Zakura block-sync body without coinbase height"
+                "dropping abandoned Zakura block-sync body without coinbase height"
             );
         }
     }
@@ -738,7 +738,7 @@ pub(crate) fn coalesce_stale_needed_block_queries(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_completed_block_apply<ReadState, BlockVerifier>(
-    apply_gate: &std::sync::Arc<super::ZakuraApplyGate>,
+    handoff: &std::sync::Arc<super::BlockSyncHandoff>,
     completed: BlockApplyCompletion,
     pending_applies: &mut VecDeque<PendingBlockApply>,
     in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyCompletion>>,
@@ -773,7 +773,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     observe_block_apply_completion(completed, checkpoint_frontier_refresh);
 
     drain_pending_block_applies(
-        apply_gate,
+        handoff,
         pending_applies,
         in_flight_applies,
         checkpoint_in_flight,
@@ -793,7 +793,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
 
 #[allow(clippy::too_many_arguments)]
 fn drain_pending_block_applies<ReadState, BlockVerifier>(
-    apply_gate: &std::sync::Arc<super::ZakuraApplyGate>,
+    handoff: &std::sync::Arc<super::BlockSyncHandoff>,
     pending_applies: &mut VecDeque<PendingBlockApply>,
     in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyCompletion>>,
     checkpoint_in_flight: &mut usize,
@@ -823,8 +823,8 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
     BlockVerifier::Future: Send + 'static,
 {
     // Once legacy fallback owns body commits, start no new Zakura applies. The
-    // loop's yielded drain releases queued bodies outside the apply-start path.
-    if apply_gate.is_yielded() {
+    // loop releases queued bodies outside the apply-start path.
+    if handoff.is_yielded_to_legacy() {
         return;
     }
 
@@ -859,7 +859,7 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
         }
 
         let class = pending.class;
-        let Some(permit) = apply_gate.begin_apply() else {
+        let Some(permit) = handoff.begin_apply() else {
             decrement_in_flight_apply_count(class, checkpoint_in_flight, full_in_flight);
             pending_applies.push_front(pending);
             return;
@@ -888,17 +888,17 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
     }
 }
 
-fn release_yielded_pending_applies(
+fn release_pending_applies(
     block_sync: &BlockSyncHandle,
     pending_applies: &mut VecDeque<PendingBlockApply>,
     trace: &ZakuraTrace,
 ) {
     for (height, expected_hash, result, event) in
-        yielded_pending_apply_finished_events(pending_applies)
+        abandoned_pending_apply_finished_events(pending_applies)
     {
         let token = match &event {
             BlockSyncEvent::BlockApplyFinished { token, .. } => *token,
-            _ => unreachable!("yielded apply release only builds BlockApplyFinished events"),
+            _ => unreachable!("abandoned apply release only builds BlockApplyFinished events"),
         };
 
         let _ = block_sync.send_control(event);
@@ -918,14 +918,14 @@ fn release_yielded_pending_applies(
     }
 }
 
-fn release_yielded_pending_probe_applies(
+fn release_pending_probe_applies(
     block_sync: &BlockSyncHandle,
     pending_probe_applies: &mut BTreeMap<block::Height, PendingBlockApply>,
     trace: &ZakuraTrace,
 ) {
     let pending = std::mem::take(pending_probe_applies);
     for pending in pending.into_values() {
-        abandon_yielded_block_apply(block_sync, pending.token, pending.block.as_ref(), trace);
+        abandon_block_apply(block_sync, pending.token, pending.block.as_ref(), trace);
     }
 }
 
@@ -1653,7 +1653,7 @@ mod tests {
     }
 
     #[test]
-    fn yielded_pending_apply_events_drain_queued_blocks() {
+    fn abandoned_pending_apply_events_drain_queued_blocks() {
         let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
         let block1_height = block1.coinbase_height().expect("test block has height");
@@ -1673,11 +1673,11 @@ mod tests {
             },
         ]);
 
-        let events = yielded_pending_apply_finished_events(&mut pending_applies);
+        let events = abandoned_pending_apply_finished_events(&mut pending_applies);
 
         assert!(
             pending_applies.is_empty(),
-            "yielded pending applies must be drained and dropped"
+            "abandoned pending applies must be drained and dropped"
         );
         assert_eq!(events.len(), 2);
         assert!(matches!(

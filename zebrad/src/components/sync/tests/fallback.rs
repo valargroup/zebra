@@ -239,14 +239,14 @@ fn stalled_zakura_with_legacy_fallback_keeps_zakura_reactors_alive() {
         ZakuraWatchdogAction::FallbackToLegacy,
         "a frozen verified tip must trigger legacy fallback when it is enabled"
     );
-    let gate = crate::commands::start::zakura::ZakuraApplyGate::new();
-    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&gate));
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
     assert!(
-        gate.is_yielded(),
-        "fallback must yield the Zakura apply gate"
+        handoff.is_yielded_to_legacy(),
+        "fallback must yield Zakura block sync to legacy sync"
     );
     assert!(
-        gate.begin_apply().is_none(),
+        handoff.begin_apply().is_none(),
         "no new Zakura applies may start after the fallback engages"
     );
 }
@@ -315,11 +315,11 @@ fn frozen_zero_gap_with_legacy_peers_ahead_engages_fallback() {
         "legacy peers at or above the behind threshold must trigger fallback"
     );
 
-    let gate = crate::commands::start::zakura::ZakuraApplyGate::new();
-    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&gate));
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
     assert!(
-        gate.is_yielded(),
-        "fallback must yield the Zakura apply gate"
+        handoff.is_yielded_to_legacy(),
+        "fallback must yield Zakura block sync to legacy sync"
     );
 }
 
@@ -407,13 +407,13 @@ fn zakura_sync_status_lengths_drive_existing_mempool_gate() {
 /// barrier for Zakura body applies, while leaving the reactors alive as a
 /// serving bridge.
 #[tokio::test(start_paused = true)]
-async fn fallback_drains_the_apply_gate_without_cancelling_zakura() {
-    let gate = crate::commands::start::zakura::ZakuraApplyGate::new();
-    let permit = gate.begin_apply().expect("applies run before fallback");
+async fn fallback_handoff_drains_applies_without_cancelling_zakura() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let permit = handoff.begin_apply().expect("applies run before fallback");
 
-    let drain_gate = gate.clone();
+    let drain_handoff = handoff.clone();
     let drain =
-        tokio::spawn(async move { engage_legacy_fallback_alongside_zakura(&drain_gate).await });
+        tokio::spawn(async move { engage_legacy_fallback_alongside_zakura(&drain_handoff).await });
 
     tokio::task::yield_now().await;
     assert!(
@@ -421,24 +421,24 @@ async fn fallback_drains_the_apply_gate_without_cancelling_zakura() {
         "the drain waits for in-flight applies"
     );
     assert!(
-        gate.begin_apply().is_none(),
+        handoff.begin_apply().is_none(),
         "no new Zakura applies may start once fallback begins"
     );
 
     drop(permit);
     drain.await.expect("drain task completes");
-    assert!(gate.is_yielded());
+    assert!(handoff.is_yielded_to_legacy());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fallback_drain_does_not_lose_concurrent_last_apply_wakeup() {
-    let gate = crate::commands::start::zakura::ZakuraApplyGate::new();
-    let permit = gate.begin_apply().expect("applies run before fallback");
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let permit = handoff.begin_apply().expect("applies run before fallback");
 
-    let drain_gate = gate.clone();
+    let drain_handoff = handoff.clone();
     let drain = tokio::spawn(async move {
-        drain_gate
-            .yield_and_drain(std::time::Duration::from_secs(30))
+        drain_handoff
+            .yield_to_legacy(std::time::Duration::from_secs(30))
             .await;
     });
 
@@ -451,9 +451,9 @@ async fn fallback_drain_does_not_lose_concurrent_last_apply_wakeup() {
     .await
     .expect("drain must observe the final apply release without waiting for its timeout");
 
-    assert!(gate.is_yielded());
+    assert!(handoff.is_yielded_to_legacy());
     assert!(
-        gate.begin_apply().is_none(),
+        handoff.begin_apply().is_none(),
         "no new Zakura applies may start after the concurrent drain"
     );
 }
