@@ -111,6 +111,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     combined_apply_limit: usize,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
+    apply_gate: std::sync::Arc<super::ZakuraApplyGate>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
     ReadState: Service<
@@ -159,6 +160,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         if shutting_down {
             if let Some(completed) = in_flight_applies.next().await {
                 handle_completed_block_apply(
+                    &apply_gate,
                     completed,
                     &mut pending_applies,
                     &mut in_flight_applies,
@@ -185,6 +187,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         if !in_flight_applies.is_empty() {
             if let Some(Some(completed)) = in_flight_applies.next().now_or_never() {
                 handle_completed_block_apply(
+                    &apply_gate,
                     completed,
                     &mut pending_applies,
                     &mut in_flight_applies,
@@ -226,6 +229,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         continue;
                     };
                     handle_completed_block_apply(
+                    &apply_gate,
                         completed,
                         &mut pending_applies,
                         &mut in_flight_applies,
@@ -535,6 +539,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block,
                 });
                 drain_pending_block_applies(
+                    &apply_gate,
                     &mut pending_applies,
                     &mut in_flight_applies,
                     &mut checkpoint_in_flight,
@@ -651,6 +656,7 @@ pub(crate) fn coalesce_stale_needed_block_queries(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_completed_block_apply<ReadState, BlockVerifier>(
+    apply_gate: &std::sync::Arc<super::ZakuraApplyGate>,
     completed: BlockApplyCompletion,
     pending_applies: &mut VecDeque<PendingBlockApply>,
     in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyCompletion>>,
@@ -685,6 +691,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     observe_block_apply_completion(completed, checkpoint_frontier_refresh);
 
     drain_pending_block_applies(
+        apply_gate,
         pending_applies,
         in_flight_applies,
         checkpoint_in_flight,
@@ -704,6 +711,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
 
 #[allow(clippy::too_many_arguments)]
 fn drain_pending_block_applies<ReadState, BlockVerifier>(
+    apply_gate: &std::sync::Arc<super::ZakuraApplyGate>,
     pending_applies: &mut VecDeque<PendingBlockApply>,
     in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyCompletion>>,
     checkpoint_in_flight: &mut usize,
@@ -732,6 +740,14 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
+    // Once the pipeline has yielded to legacy ChainSync, start no new applies:
+    // two engines driving bulk commits concurrently race in the applying
+    // queue. Queued blocks stay pending; legacy commits cover their heights
+    // and the sequencer releases them as its frontier advances.
+    if apply_gate.is_yielded() {
+        return;
+    }
+
     // The checkpoint verifier can hold a complete range until its checkpoint is
     // reached. Keep room for the current range and the next complete range.
     let checkpoint_pipeline_apply_limit = checkpoint_apply_limit.saturating_mul(2);
@@ -763,19 +779,33 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
         }
 
         let class = pending.class;
+        let Some(permit) = apply_gate.begin_apply() else {
+            // Yielded while draining: put the block back and stop starting
+            // applies. Its in-flight accounting was already incremented above,
+            // so hand it back too.
+            decrement_in_flight_apply_count(class, checkpoint_in_flight, full_in_flight);
+            pending_applies.push_front(pending);
+            return;
+        };
+        let apply = apply_block_sync_body(
+            block_verifier.clone(),
+            latest_chain_tip.clone(),
+            endpoint.clone(),
+            read_state.clone(),
+            block_sync.clone(),
+            pending.token,
+            pending.block,
+            class,
+            trace.clone(),
+            throughput_probe.clone(),
+        );
         in_flight_applies.push(
-            apply_block_sync_body(
-                block_verifier.clone(),
-                latest_chain_tip.clone(),
-                endpoint.clone(),
-                read_state.clone(),
-                block_sync.clone(),
-                pending.token,
-                pending.block,
-                class,
-                trace.clone(),
-                throughput_probe.clone(),
-            )
+            async move {
+                // Holds the apply-gate slot for the whole apply, so the legacy
+                // fallback's drain barrier sees it until completion.
+                let _permit = permit;
+                apply.await
+            }
             .boxed(),
         );
     }

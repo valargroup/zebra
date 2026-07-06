@@ -663,6 +663,10 @@ impl StartCmd {
             )
             .await;
 
+        // Gates the Zakura bulk-apply pipeline so the legacy fallback can drain
+        // in-flight applies before driving commits through the same pipeline.
+        let zakura_apply_gate = zakura::ZakuraApplyGate::new();
+
         if let Some(endpoint) = zakura_endpoint.clone() {
             let trace = endpoint.trace();
             if let (Some(header_sync), Some(shutdown), Some(actions)) = (
@@ -706,6 +710,7 @@ impl StartCmd {
                             config.sync.zakura_block_apply_concurrency_limit,
                             trace.clone(),
                             blocksync_throughput_probe.clone(),
+                            zakura_apply_gate.clone(),
                             shutdown.clone().cancelled_owned(),
                         )
                         .in_current_span(),
@@ -986,7 +991,11 @@ impl StartCmd {
             let legacy_fallback = config.network.v2_p2p && config.network.legacy_p2p;
             tokio::spawn(
                 syncer
-                    .bootstrap_genesis_then_pause(read_only_state_service.clone(), legacy_fallback)
+                    .bootstrap_genesis_then_pause(
+                        read_only_state_service.clone(),
+                        legacy_fallback,
+                        zakura_apply_gate.clone(),
+                    )
                     .in_current_span(),
             )
         } else {
@@ -3178,6 +3187,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3320,6 +3330,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             trace.clone(),
             Some(probe),
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3469,6 +3480,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3582,6 +3594,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3683,6 +3696,7 @@ mod zakura_header_sync_driver_tests {
             1,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3785,6 +3799,7 @@ mod zakura_header_sync_driver_tests {
             1,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -3896,6 +3911,7 @@ mod zakura_header_sync_driver_tests {
             1,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4297,6 +4313,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4390,6 +4407,7 @@ mod zakura_header_sync_driver_tests {
             zebra_consensus::MAX_CHECKPOINT_HEIGHT_GAP,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4510,6 +4528,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4633,6 +4652,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             trace,
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4769,6 +4789,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -4898,6 +4919,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },
@@ -5052,6 +5074,7 @@ mod zakura_header_sync_driver_tests {
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
             zebra_network::zakura::ZakuraTrace::noop(),
             None,
+            super::zakura::ZakuraApplyGate::new(),
             async move {
                 let _ = shutdown_rx.await;
             },

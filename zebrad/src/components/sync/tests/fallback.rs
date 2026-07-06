@@ -241,9 +241,18 @@ fn stalled_zakura_with_legacy_fallback_keeps_zakura_reactors_alive() {
         ZakuraWatchdogAction::FallbackToLegacy,
         "a frozen verified tip must trigger legacy fallback when it is enabled"
     );
-    // The hand-off is now driver-only: nothing in the fallback path may cancel
-    // Zakura work, so there is no shutdown token to assert on.
-    super::super::engage_legacy_fallback_alongside_zakura();
+    // The hand-off drains the apply gate but cancels no Zakura work: with no
+    // in-flight applies this returns immediately, and the gate ends yielded.
+    let gate = crate::commands::start::zakura::ZakuraApplyGate::new();
+    futures::executor::block_on(super::super::engage_legacy_fallback_alongside_zakura(&gate));
+    assert!(
+        gate.is_yielded(),
+        "fallback must yield the Zakura apply gate"
+    );
+    assert!(
+        gate.begin_apply().is_none(),
+        "no new Zakura applies may start after the fallback engages"
+    );
 }
 
 #[test]
@@ -311,7 +320,12 @@ fn frozen_zero_gap_with_legacy_peers_ahead_engages_fallback() {
         "legacy peers at or above the behind threshold must trigger fallback"
     );
 
-    super::super::engage_legacy_fallback_alongside_zakura();
+    let gate = crate::commands::start::zakura::ZakuraApplyGate::new();
+    futures::executor::block_on(super::super::engage_legacy_fallback_alongside_zakura(&gate));
+    assert!(
+        gate.is_yielded(),
+        "fallback must yield the Zakura apply gate"
+    );
 }
 
 #[test]
@@ -395,12 +409,33 @@ fn zakura_sync_status_lengths_drive_existing_mempool_gate() {
 }
 
 /// Locks in the fallback behavior: engaging legacy fallback must not signal any
-/// Zakura shutdown — the reactors stay alive as a serving bridge. This test
-/// documents the intentional inversion of the old "fallback cancels the Zakura
-/// shutdown token" contract.
-#[test]
-fn fallback_does_not_cancel_any_zakura_shutdown_token() {
-    // The hand-off helper takes no token and cancels nothing; it only records
-    // the mode switch. Must not panic.
-    super::super::engage_legacy_fallback_alongside_zakura();
+/// Zakura shutdown — the reactors stay alive as a serving bridge — but it must
+/// be a commit barrier: in-flight Zakura applies drain before it returns, and
+/// no new applies can start afterwards. This documents the intentional
+/// inversion of the old "fallback cancels the Zakura shutdown token" contract.
+#[tokio::test(start_paused = true)]
+async fn fallback_drains_the_apply_gate_without_cancelling_zakura() {
+    let gate = crate::commands::start::zakura::ZakuraApplyGate::new();
+    let permit = gate.begin_apply().expect("applies run before the fallback");
+
+    let drain_gate = gate.clone();
+    let drain = tokio::spawn(async move {
+        super::super::engage_legacy_fallback_alongside_zakura(&drain_gate).await
+    });
+
+    // The barrier must wait for the in-flight apply...
+    tokio::task::yield_now().await;
+    assert!(
+        !drain.is_finished(),
+        "the drain waits for in-flight applies"
+    );
+    assert!(
+        gate.begin_apply().is_none(),
+        "no new Zakura applies may start once the fallback begins"
+    );
+
+    // ...and complete as soon as it finishes.
+    drop(permit);
+    drain.await.expect("drain task completes");
+    assert!(gate.is_yielded());
 }

@@ -7,6 +7,101 @@ use zebra_network::zakura::{
     ZakuraTrace, COMMIT_STATE_TABLE,
 };
 
+/// Gates the Zakura block-sync bulk-apply pipeline so the legacy `ChainSync`
+/// fallback can drain it before driving commits through the same verifier and
+/// state pipeline.
+///
+/// Two sync engines submitting bulk commits concurrently race in the applying
+/// queue (ordering races can poison the parent-error map and trip the
+/// same-hash commit lockout), so the fallback must be a commit barrier: once
+/// yielded, the block-sync driver starts no new applies, and the watchdog
+/// waits for in-flight applies to finish before resuming legacy sync. The
+/// Zakura reactors stay alive throughout — serving, statuses, and header
+/// commits are unaffected; only bulk body applies are gated.
+#[derive(Debug)]
+pub(crate) struct ZakuraApplyGate {
+    yielded: std::sync::atomic::AtomicBool,
+    in_flight: std::sync::atomic::AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+/// Tracks one in-flight Zakura block apply; dropping it releases the slot and
+/// wakes a pending [`ZakuraApplyGate::yield_and_drain`].
+#[derive(Debug)]
+pub(crate) struct ZakuraApplyPermit(std::sync::Arc<ZakuraApplyGate>);
+
+impl ZakuraApplyGate {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            yielded: std::sync::atomic::AtomicBool::new(false),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Whether the pipeline has been yielded to legacy sync.
+    pub(crate) fn is_yielded(&self) -> bool {
+        self.yielded.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns a permit for one block apply, or `None` once the pipeline has
+    /// been yielded to legacy sync.
+    pub(crate) fn begin_apply(self: &std::sync::Arc<Self>) -> Option<ZakuraApplyPermit> {
+        if self.is_yielded() {
+            return None;
+        }
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Re-check after reserving so a yield that lands between the check and
+        // the increment still sees an accurate in-flight count.
+        if self.is_yielded() {
+            self.release();
+            return None;
+        }
+        Some(ZakuraApplyPermit(self.clone()))
+    }
+
+    fn release(&self) {
+        if self
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.drained.notify_waiters();
+        }
+    }
+
+    /// Yields the apply pipeline to legacy sync and waits until in-flight
+    /// applies drain, bounded by `timeout` (each apply already has its own
+    /// driver timeout, so the bound is a backstop, not the primary limit).
+    pub(crate) async fn yield_and_drain(&self, timeout: Duration) {
+        self.yielded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let drained = self.drained.notified();
+            let in_flight = self.in_flight.load(std::sync::atomic::Ordering::SeqCst);
+            if in_flight == 0 {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, drained).await.is_err() {
+                tracing::warn!(
+                    in_flight,
+                    "timed out draining Zakura block applies before legacy fallback; \
+                     remaining applies resolve through their own driver timeouts"
+                );
+                return;
+            }
+        }
+    }
+}
+
+impl Drop for ZakuraApplyPermit {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 pub(crate) mod block_sync_driver;
 pub(crate) mod frontier;
 pub(crate) mod header_sync_driver;
