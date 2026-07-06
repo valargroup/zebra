@@ -1492,7 +1492,6 @@ pub(crate) fn header_range_commit_failure_kind(
         | zebra_state::CommitHeaderRangeError::BodySizeCountMismatch { .. }
         | zebra_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. }
         | zebra_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. }
-        | zebra_state::CommitHeaderRangeError::UnknownAnchor { .. }
         | zebra_state::CommitHeaderRangeError::HeightOverflow
         | zebra_state::CommitHeaderRangeError::ImmutableConflict { .. }
         | zebra_state::CommitHeaderRangeError::ReorgTooDeep { .. }
@@ -1506,7 +1505,15 @@ pub(crate) fn header_range_commit_failure_kind(
         // InvalidDifficultyThreshold at 4148005 from all peers, for hours).
         // Never score the peer for these — the reactor treats them as
         // stale-anchor evidence and walks back instead.
-        zebra_state::CommitHeaderRangeError::ValidateContextError(_) => {
+        // UnknownAnchor cannot be the peer's fault at all: the anchor is our
+        // own request bookkeeping, and it fails when the reactor's in-memory
+        // frontier references a hash the header store does not have (observed
+        // live at 4148376 — a mirror-advanced frontier over a store whose
+        // suffix rows diverged). The walk-back re-anchors from the STORE
+        // (`QueryReanchorTarget`), which is exactly the self-correction this
+        // state needs.
+        zebra_state::CommitHeaderRangeError::ValidateContextError(_)
+        | zebra_state::CommitHeaderRangeError::UnknownAnchor { .. } => {
             HeaderSyncCommitFailureKind::ContextMismatch
         }
         _ => HeaderSyncCommitFailureKind::Local,
