@@ -150,6 +150,11 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut shutting_down = false;
 
     loop {
+        if apply_gate.is_yielded() {
+            release_yielded_pending_applies(&block_sync, &mut pending_applies, &trace);
+            release_yielded_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
+        }
+
         if !shutting_down && shutdown.as_mut().now_or_never().is_some() {
             shutting_down = true;
             pending_applies.clear();
@@ -618,6 +623,25 @@ pub(crate) fn yielded_block_apply_finished_event(
     ))
 }
 
+fn yielded_pending_apply_finished_events(
+    pending_applies: &mut VecDeque<PendingBlockApply>,
+) -> Vec<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
+    let mut events = Vec::new();
+    while let Some(pending) = pending_applies.pop_front() {
+        if let Some(event) =
+            yielded_block_apply_finished_event(pending.token, pending.block.as_ref())
+        {
+            events.push(event);
+        } else {
+            warn!(
+                expected_hash = ?pending.block.hash(),
+                "dropping yielded Zakura block-sync body without coinbase height"
+            );
+        }
+    }
+    events
+}
+
 pub(crate) fn coalesce_ready_needed_block_queries(
     actions: &mut mpsc::Receiver<BlockSyncAction>,
     deferred_actions: &mut VecDeque<BlockSyncAction>,
@@ -798,8 +822,8 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
-    // Once legacy fallback owns body commits, start no new Zakura applies. Queued
-    // blocks stay pending and the sequencer releases them as the frontier advances.
+    // Once legacy fallback owns body commits, start no new Zakura applies. The
+    // loop's yielded drain releases queued bodies outside the apply-start path.
     if apply_gate.is_yielded() {
         return;
     }
@@ -861,6 +885,47 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
             }
             .boxed(),
         );
+    }
+}
+
+fn release_yielded_pending_applies(
+    block_sync: &BlockSyncHandle,
+    pending_applies: &mut VecDeque<PendingBlockApply>,
+    trace: &ZakuraTrace,
+) {
+    for (height, expected_hash, result, event) in
+        yielded_pending_apply_finished_events(pending_applies)
+    {
+        let token = match &event {
+            BlockSyncEvent::BlockApplyFinished { token, .. } => *token,
+            _ => unreachable!("yielded apply release only builds BlockApplyFinished events"),
+        };
+
+        let _ = block_sync.send_control(event);
+        emit_commit_state(
+            trace,
+            cs_trace::REACTOR_EVENT_SENT,
+            "block_sync_driver",
+            |row| {
+                insert_cs_str(row, cs_trace::ACTION, "block_apply_finished");
+                insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
+                insert_cs_height(row, cs_trace::HEIGHT, height);
+                insert_cs_hash(row, cs_trace::HASH, expected_hash);
+                insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
+                insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, false);
+            },
+        );
+    }
+}
+
+fn release_yielded_pending_probe_applies(
+    block_sync: &BlockSyncHandle,
+    pending_probe_applies: &mut BTreeMap<block::Height, PendingBlockApply>,
+    trace: &ZakuraTrace,
+) {
+    let pending = std::mem::take(pending_probe_applies);
+    for pending in pending.into_values() {
+        abandon_yielded_block_apply(block_sync, pending.token, pending.block.as_ref(), trace);
     }
 }
 
@@ -1574,4 +1639,82 @@ fn block_sync_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
 
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zebra_chain::serialization::ZcashDeserializeInto;
+    use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+
+    fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
+        Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
+    }
+
+    #[test]
+    fn yielded_pending_apply_events_drain_queued_blocks() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let block1_height = block1.coinbase_height().expect("test block has height");
+        let block2_height = block2.coinbase_height().expect("test block has height");
+        let block1_hash = block1.hash();
+        let block2_hash = block2.hash();
+        let mut pending_applies = VecDeque::from([
+            PendingBlockApply {
+                token: 11,
+                class: BlockApplyClass::Full,
+                block: block1,
+            },
+            PendingBlockApply {
+                token: 12,
+                class: BlockApplyClass::Full,
+                block: block2,
+            },
+        ]);
+
+        let events = yielded_pending_apply_finished_events(&mut pending_applies);
+
+        assert!(
+            pending_applies.is_empty(),
+            "yielded pending applies must be drained and dropped"
+        );
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            (
+                height,
+                hash,
+                BlockApplyResult::TimedOut,
+                BlockSyncEvent::BlockApplyFinished {
+                    token: 11,
+                    height: event_height,
+                    hash: event_hash,
+                    result: BlockApplyResult::TimedOut,
+                    local_frontier: None,
+                },
+            ) if height == block1_height
+                && hash == block1_hash
+                && event_height == block1_height
+                && event_hash == block1_hash
+        ));
+        assert!(matches!(
+            events[1],
+            (
+                height,
+                hash,
+                BlockApplyResult::TimedOut,
+                BlockSyncEvent::BlockApplyFinished {
+                    token: 12,
+                    height: event_height,
+                    hash: event_hash,
+                    result: BlockApplyResult::TimedOut,
+                    local_frontier: None,
+                },
+            ) if height == block2_height
+                && hash == block2_hash
+                && event_height == block2_height
+                && event_hash == block2_hash
+        ));
+    }
 }
