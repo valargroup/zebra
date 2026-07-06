@@ -52,7 +52,7 @@ pub use config::{
 };
 pub use error::{HeaderSyncStartError, HeaderSyncWireError};
 pub use events::{
-    ExpectedHeadersResponse, HeaderFrontierReanchor, HeaderSyncAction, HeaderSyncCommitFailureKind,
+    ExpectedHeadersResponse, HeaderFrontierRebase, HeaderSyncAction, HeaderSyncCommitFailureKind,
     HeaderSyncEvent, HeaderSyncFrontiers, HeaderSyncHandle, HeaderSyncMisbehavior,
     HeaderSyncStartup,
 };

@@ -483,14 +483,14 @@ async fn spawn_mock_node(
     config: &HarnessConfig,
     trace: &mut HarnessTrace,
 ) -> Result<usize, BoxError> {
-    let anchor = (block::Height(0), mainnet_genesis_hash());
+    let trusted_sync_start = (block::Height(0), mainnet_genesis_hash());
     let builder = ZakuraTestNode::builder(seed)
         .limits(config.limits())
         .max_connections_per_ip(config.seeds.saturating_add(1))
         .tracer(trace.tracer_for_node(seed))
         .header_sync_driver(
             Config::default().network,
-            anchor,
+            trusted_sync_start,
             HeaderSyncFrontiers {
                 finalized_height: initial_frontiers.finalized_height,
                 verified_block_tip: initial_frontiers.verified_block_tip,

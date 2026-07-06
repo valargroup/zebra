@@ -218,7 +218,7 @@ pub struct ZakuraTestNodeBuilder {
 #[derive(Clone, Debug)]
 struct TestHeaderSyncStartup {
     network: Network,
-    anchor: (block::Height, block::Hash),
+    trusted_sync_start: (block::Height, block::Hash),
     frontiers: HeaderSyncFrontiers,
     best_header_tip: Option<(block::Height, block::Hash)>,
     verified_block_tip_hash: block::Hash,
@@ -338,16 +338,16 @@ impl ZakuraTestNodeBuilder {
     pub fn header_sync_driver(
         mut self,
         network: Network,
-        anchor: (block::Height, block::Hash),
+        trusted_sync_start: (block::Height, block::Hash),
         frontiers: HeaderSyncFrontiers,
         best_header_tip: Option<(block::Height, block::Hash)>,
     ) -> Self {
         self.header_sync = Some(TestHeaderSyncStartup {
             network,
-            anchor,
+            trusted_sync_start,
             frontiers,
             best_header_tip,
-            verified_block_tip_hash: anchor.1,
+            verified_block_tip_hash: trusted_sync_start.1,
         });
         self
     }
@@ -402,14 +402,14 @@ impl ZakuraTestNodeBuilder {
         let header_sync = if let Some(header_sync) = self.header_sync {
             let TestHeaderSyncStartup {
                 network,
-                anchor,
+                trusted_sync_start,
                 frontiers,
                 best_header_tip,
                 verified_block_tip_hash,
             } = header_sync;
             let mut startup = HeaderSyncStartup::new(
                 network,
-                anchor,
+                trusted_sync_start,
                 frontiers,
                 best_header_tip,
                 ZakuraHeaderSyncConfig::default(),
@@ -433,7 +433,7 @@ impl ZakuraTestNodeBuilder {
                     verified_block_tip: frontiers.verified_block_tip,
                     verified_block_hash: verified_block_tip_hash,
                 },
-                best_header_tip.unwrap_or(anchor),
+                best_header_tip.unwrap_or(trusted_sync_start),
                 handle.subscribe_tip(),
                 self.block_sync_config.clone(),
             );

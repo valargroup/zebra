@@ -451,7 +451,7 @@ mod tests {
             store
         }
 
-        fn with_checkpoint_anchor(height: u32) -> Self {
+        fn with_checkpoint_sync_start(height: u32) -> Self {
             let mut store = Self::genesis_only();
             let block = mainnet_block(block_bytes(height));
             store
@@ -498,7 +498,7 @@ mod tests {
 
         fn commit_headers(
             &mut self,
-            anchor: block::Hash,
+            link_hash: block::Hash,
             start: block::Height,
             headers: Vec<Arc<block::Header>>,
             finalized: bool,
@@ -507,7 +507,7 @@ mod tests {
                 return Err(kind);
             }
 
-            let mut expected_previous = anchor;
+            let mut expected_previous = link_hash;
             for (offset, header) in headers.iter().enumerate() {
                 if header.previous_block_hash != expected_previous {
                     return Err(HeaderSyncCommitFailureKind::InvalidPeerRange);
@@ -611,7 +611,7 @@ mod tests {
             &mut self,
             seed: u8,
             network: Network,
-            anchor: (block::Height, block::Hash),
+            trusted_sync_start: (block::Height, block::Hash),
             store: E2eHeaderStore,
             trace: ZakuraTrace,
         ) -> Result<usize, BoxError> {
@@ -621,7 +621,7 @@ mod tests {
                 .map_err(|_| std::io::Error::other("test store mutex is poisoned"))?;
             let mut startup = HeaderSyncStartup::new(
                 network,
-                anchor,
+                trusted_sync_start,
                 startup_store.frontiers(),
                 Some(startup_store.best_header_tip()),
                 ZakuraHeaderSyncConfig::default(),
@@ -964,7 +964,7 @@ mod tests {
                 }
                 HeaderSyncAction::CommitHeaderRange {
                     peer,
-                    anchor,
+                    link_hash,
                     start_height,
                     headers,
                     finalized,
@@ -975,7 +975,7 @@ mod tests {
                         .store
                         .lock()
                         .expect("test store mutex is not poisoned")
-                        .commit_headers(anchor, start_height, headers, finalized);
+                        .commit_headers(link_hash, start_height, headers, finalized);
                     match result {
                         Ok((tip_height, tip_hash)) => {
                             let frontiers = local
@@ -1019,7 +1019,7 @@ mod tests {
                         .handle
                         .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
                             best_header_tip,
-                            reanchor: None,
+                            rebase: None,
                             history_tree: Some(Arc::new(
                                 zebra_chain::history_tree::HistoryTree::default(),
                             )),
@@ -1042,7 +1042,7 @@ mod tests {
                     local.observed_gaps.lock().await.push((from, to));
                 }
                 HeaderSyncAction::HeaderAdvanced { .. } => {}
-                HeaderSyncAction::HeaderReanchored { .. } => {}
+                HeaderSyncAction::HeaderRebased { .. } => {}
                 HeaderSyncAction::NewBlockReceived {
                     peer,
                     height,
@@ -1214,7 +1214,7 @@ mod tests {
         HeaderSyncMessage::Status(HeaderSyncStatus {
             tip_height: block::Height(height),
             tip_hash,
-            anchor_height: block::Height(0),
+            sync_start_height: block::Height(0),
             max_headers_per_response,
             max_inflight_requests,
         })
@@ -1282,18 +1282,18 @@ mod tests {
         network: Network,
         trace: &mut TraceCapture,
     ) -> super::super::ZakuraTestNodeBuilder {
-        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let trusted_sync_start = (block::Height(0), mainnet_genesis_hash());
         ZakuraTestNode::builder(seed)
             .tracer(trace.tracer_for_node(seed))
             .header_sync_driver(
                 network,
-                anchor,
+                trusted_sync_start,
                 HeaderSyncFrontiers {
                     finalized_height: block::Height(0),
                     verified_block_tip: block::Height(0),
-                    verified_block_hash: anchor.1,
+                    verified_block_hash: trusted_sync_start.1,
                 },
-                Some(anchor),
+                Some(trusted_sync_start),
             )
     }
 
@@ -1366,7 +1366,7 @@ mod tests {
                     | HeaderSyncAction::QueryMissingBlockBodies { .. }
                     | HeaderSyncAction::BodyGaps { .. }
                     | HeaderSyncAction::HeaderAdvanced { .. }
-                    | HeaderSyncAction::HeaderReanchored { .. } => {}
+                    | HeaderSyncAction::HeaderRebased { .. } => {}
                 }
             }
         })
@@ -1598,18 +1598,18 @@ mod tests {
             ..ZakuraBlockSyncConfig::default()
         };
 
-        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let trusted_sync_start = (block::Height(0), mainnet_genesis_hash());
         let mut cluster = ZakuraTestCluster::new();
         let victim = ZakuraTestNode::builder(60)
             .limits(limits)
             .tracer(capture.tracer_for_node(60))
             .header_sync_driver(
                 e2e_network([3]),
-                anchor,
+                trusted_sync_start,
                 HeaderSyncFrontiers {
                     finalized_height: block::Height(0),
                     verified_block_tip: block::Height(0),
-                    verified_block_hash: anchor.1,
+                    verified_block_hash: trusted_sync_start.1,
                 },
                 Some((block::Height(3), blocks[2].hash())),
             )
@@ -2669,12 +2669,12 @@ mod tests {
         )?;
         let mut cluster = HeaderSyncE2eCluster::new();
         let network = e2e_network([1]);
-        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let trusted_sync_start = (block::Height(0), mainnet_genesis_hash());
 
         let target = cluster.spawn_node(
             2,
             network,
-            anchor,
+            trusted_sync_start,
             E2eHeaderStore::genesis_only(),
             ZakuraTrace::new(capture.tracer_for_node(2), "02"),
         )?;
@@ -2735,18 +2735,18 @@ mod tests {
         // tree-aux roots the test peer serves — otherwise a post-Heartwood schedule reads these real
         // mainnet vectors as `ChainHistoryRoot` and rejects the placeholder roots.
         let network = e2e_network_with_shielded_activation([4], 5);
-        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let trusted_sync_start = (block::Height(0), mainnet_genesis_hash());
         let source = cluster.spawn_node(
             1,
             network.clone(),
-            anchor,
+            trusted_sync_start,
             E2eHeaderStore::with_headers(4),
             ZakuraTrace::new(capture.tracer_for_node(1), "01"),
         )?;
         let empty = cluster.spawn_node(
             2,
             network,
-            anchor,
+            trusted_sync_start,
             E2eHeaderStore::genesis_only(),
             ZakuraTrace::new(capture.tracer_for_node(2), "02"),
         )?;
@@ -2827,16 +2827,16 @@ mod tests {
         Ok(())
     }
 
-    /// A checkpoint-anchored node syncs forward past its anchor, and below-anchor backward
-    /// backfill stays explicitly disabled: no `GetHeaders` for the bracket below the anchor is
-    /// ever sent, and the below-anchor headers stay absent (see
-    /// `backward_checkpoint_backfill_is_explicitly_disabled` for the reactor-level regression).
+    /// A node with a checkpoint trusted sync start syncs forward past it, and the
+    /// below-sync-start backfill stays disabled by default: no `GetHeaders` for the bracket
+    /// below the sync start is ever sent, and the below-sync-start headers stay absent (see
+    /// `below_sync_start_backfill_is_disabled_by_default` for the reactor-level regression).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn header_sync_e2e_checkpoint_forward_syncs_without_backward_backfill(
+    async fn header_sync_e2e_checkpoint_forward_syncs_without_below_sync_start_backfill(
     ) -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         let mut capture = TraceCapture::for_test_with_keep_override(
-            "header_sync_e2e_checkpoint_forward_syncs_without_backward_backfill",
+            "header_sync_e2e_checkpoint_forward_syncs_without_below_sync_start_backfill",
             false,
         )?;
         let (network, checkpoint_hash) = checkpoint_network(3);
@@ -2852,7 +2852,7 @@ mod tests {
             2,
             network,
             (block::Height(3), checkpoint_hash),
-            E2eHeaderStore::with_checkpoint_anchor(3),
+            E2eHeaderStore::with_checkpoint_sync_start(3),
             ZakuraTrace::new(capture.tracer_for_node(2), "02"),
         )?;
         assert_eq!(source, 0);
@@ -2880,19 +2880,19 @@ mod tests {
 
         cluster.wait_for_tip(checkpointed, block::Height(4)).await?;
 
-        // Give the scheduler time to (incorrectly) emit a backward bracket if it were still
-        // enabled, then assert nothing below the anchor was requested or stored.
+        // Give the scheduler time to (incorrectly) emit a backfill bracket if it were
+        // enabled, then assert nothing below the sync start was requested or stored.
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(
             !cluster.has_headers(checkpointed, 1..=3),
-            "below-anchor headers must not be backfilled while backward backfill is disabled"
+            "below-sync-start headers must not be backfilled while backfill is disabled"
         );
 
         capture.flush().await;
         let reader = capture.reader()?;
         let target_trace = reader.node("02").table("header_sync");
         target_trace.assert_header_range_request(4, 1);
-        let backward_requests = target_trace
+        let backfill_requests = target_trace
             .rows()
             .iter()
             .filter(|row| {
@@ -2905,8 +2905,9 @@ mod tests {
             })
             .count();
         assert_eq!(
-            backward_requests, 0,
-            "backward checkpoint backfill is disabled: no below-anchor GetHeaders may be sent"
+            backfill_requests, 0,
+            "below-sync-start backfill is disabled by default: no below-sync-start GetHeaders \
+             may be sent"
         );
         assert_eq!(
             cluster.finalized_height(checkpointed).await,
@@ -2928,12 +2929,12 @@ mod tests {
         )?;
         let mut cluster = HeaderSyncE2eCluster::new();
         let network = e2e_network([]);
-        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let trusted_sync_start = (block::Height(0), mainnet_genesis_hash());
         for seed in 1..=3 {
             cluster.spawn_node(
                 seed,
                 network.clone(),
-                anchor,
+                trusted_sync_start,
                 E2eHeaderStore::genesis_only(),
                 ZakuraTrace::new(
                     capture.tracer_for_node(u64::from(seed)),
@@ -2998,12 +2999,12 @@ mod tests {
         )?;
         let mut cluster = HeaderSyncE2eCluster::new();
         let network = e2e_network([]);
-        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let trusted_sync_start = (block::Height(0), mainnet_genesis_hash());
         for seed in 1..=3 {
             cluster.spawn_node(
                 seed,
                 network.clone(),
-                anchor,
+                trusted_sync_start,
                 E2eHeaderStore::genesis_only(),
                 ZakuraTrace::new(
                     capture.tracer_for_node(u64::from(seed)),
@@ -3055,11 +3056,11 @@ mod tests {
         )?;
         let mut cluster = HeaderSyncE2eCluster::new();
         let network = e2e_network([]);
-        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let trusted_sync_start = (block::Height(0), mainnet_genesis_hash());
         let victim = cluster.spawn_node(
             1,
             network.clone(),
-            anchor,
+            trusted_sync_start,
             E2eHeaderStore::genesis_only(),
             ZakuraTrace::new(capture.tracer_for_node(1), "01"),
         )?;
@@ -3167,7 +3168,7 @@ mod tests {
         let bad_continuity_victim = cluster.spawn_node(
             3,
             network.clone(),
-            anchor,
+            trusted_sync_start,
             E2eHeaderStore::genesis_only(),
             ZakuraTrace::new(capture.tracer_for_node(3), "03"),
         )?;
@@ -3205,7 +3206,7 @@ mod tests {
         let bad_pow_victim = cluster.spawn_node(
             4,
             network.clone(),
-            anchor,
+            trusted_sync_start,
             E2eHeaderStore::genesis_only(),
             ZakuraTrace::new(capture.tracer_for_node(4), "04"),
         )?;
@@ -3234,7 +3235,7 @@ mod tests {
         let bad_daa_victim = cluster.spawn_node(
             5,
             network,
-            anchor,
+            trusted_sync_start,
             E2eHeaderStore::genesis_only(),
             ZakuraTrace::new(capture.tracer_for_node(5), "05"),
         )?;
@@ -3270,9 +3271,9 @@ mod tests {
             .await?;
 
         // Checkpoint-hash-mismatch backfill responses are covered at the reactor level by
-        // `checkpoint_backfill_rejects_checkpoint_hash_mismatch_before_commit` (via the forward
-        // genesis-backfill path); the backward below-anchor bracket that used to drive it here
-        // is explicitly disabled.
+        // `checkpoint_backfill_rejects_checkpoint_hash_mismatch_before_commit` (forward genesis
+        // sync) and `backfill_checkpoint_end_hash_mismatch_is_misbehavior` (the below-sync-start
+        // backfill cursor, disabled by default).
 
         let over_cap = e2e_peer(91);
         cluster.connect_peer(victim, over_cap.clone()).await;
@@ -3385,7 +3386,7 @@ mod tests {
             false,
         )?;
         let network = e2e_network([4]);
-        let anchor = (block::Height(0), mainnet_genesis_hash());
+        let trusted_sync_start = (block::Height(0), mainnet_genesis_hash());
 
         // The genesis sync path is covered above. Start from its durable header state
         // so this test only exercises restart reload and scheduler rebuild.
@@ -3396,14 +3397,14 @@ mod tests {
         restarted.spawn_node(
             1,
             network.clone(),
-            anchor,
+            trusted_sync_start,
             E2eHeaderStore::with_headers(5),
             ZakuraTrace::new(capture.tracer_for_node(1), "01"),
         )?;
         let restarted_idx = restarted.spawn_node(
             2,
             network,
-            anchor,
+            trusted_sync_start,
             restart_store,
             ZakuraTrace::new(capture.tracer_for_node(2), "02"),
         )?;

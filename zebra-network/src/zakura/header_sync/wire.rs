@@ -68,7 +68,7 @@ const _: () = assert!(
 /// Native stream-5 header-sync message.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeaderSyncMessage {
-    /// Peer tip, anchor, and served-range advertisement.
+    /// Peer tip, sync start, and served-range advertisement.
     Status(HeaderSyncStatus),
     /// Request `count` headers starting at `start_height`.
     GetHeaders {

@@ -457,9 +457,9 @@ other peers are already header-authenticated, and so a restart never trusts an u
   otherwise the base read returns `None` and the rebuild degrades to a network-paced no-progress loop.
   And the reload carries the confirmed frontier `(height, hash)` the fold actually reached, not just the
   tree: when durable roots have a gap the fold stops _below_ `best_header_tip - 1`, so the rebuilt tree
-  never reaches the current tip's parent. The reactor then reanchors its header tip down onto that
-  frontier — resuming one block above it, anchored on the frontier hash, exactly as the startup
-  reconstruction does (`sync.header.history_tree.reanchor`) — instead of keeping the stale higher tip,
+  never reaches the current tip's parent. The reactor then rebases its header tip down onto that
+  frontier — resuming one block above it, linked on the frontier hash, exactly as the startup
+  reconstruction does (`sync.header.history_tree.rebase`) — instead of keeping the stale higher tip,
   where every forward range would re-detect the behind tree and re-trigger the identical deterministic
   rebuild forever.
 - **Verify before persisting.** When a below-checkpoint header range arrives, the reactor folds its
@@ -475,19 +475,33 @@ other peers are already header-authenticated, and so a restart never trusts an u
   real-tree roots there; only header-only heights fall back to provisional roots.
 - **Persist only the confirmed prefix.** A block's commitment binds the history tree as of its
   parent, so a range `[start..=end]` authenticates the roots for `[start..=end-1]`; the tip's own
-  root is only confirmed once the next range delivers `end+1`. Forward ranges therefore overlap by
-  one block — the next request re-anchors at the tip's parent — and `CommitHeaderRange` persists
-  only the header-authenticated confirmed prefix; the range tip's root is never written. The state
-  writes exactly the roots it is handed (`prepare_header_range_batch_with_roots` accepts a prefix one
-  shorter than the headers, or none — see the checkpoint-backfill note below), so the "one root per
-  header" wire invariant (§5.4) and the persisted set are deliberately distinct.
-- **Checkpoint backfill skips this gate.** Only _forward_ ranges carry a frontier tree that can be
-  folded and checked. _Backward_ checkpoint-backfill ranges (headers below the sync anchor) are
-  authenticated by the checkpoint hash and fold onto the previous checkpoint's tree, not the forward
-  frontier the reactor caches, so they are committed without header-commitment validation and
-  persist no provisional roots. `prepare_header_range_batch_with_roots` accepts an empty roots vector
-  for exactly this shape; a full-length (tip-included) vector is still rejected, so the trust
-  boundary is unchanged — nothing unauthenticated is ever written.
+  root is only confirmed once the next range delivers `end+1`. Root-carrying ranges therefore
+  overlap by one block — the next request links at the tip's parent — and `CommitHeaderRange`
+  persists only the header-authenticated confirmed prefix; the range tip's root is never written.
+  The state writes exactly the roots it is handed (`prepare_header_range_batch_with_roots` accepts
+  a prefix one shorter than the headers, or none for plain above-checkpoint ranges), so the "one
+  root per header" wire invariant (§5.4) and the persisted set are deliberately distinct.
+- **Below-sync-start backfill uses the same gate.** A node whose trusted sync start is a
+  checkpoint above genesis can backfill the headers and roots below it with a second forward
+  cursor: checkpoint-bounded finalized ranges starting at genesis, folding a dedicated backfill
+  history tree seeded empty (the natural pre-Heartwood value) and advancing bracket by bracket up
+  to the sync start, with the same one-block overlap and the same
+  `verify_supplied_roots_from_parts` verification the forward frontier uses — so backfilled roots
+  are header-authenticated and fill the `commitment_roots_by_height` serving index (the §10
+  serving-availability backfill). The sync-start height's own root has no confirming successor
+  inside the backfill region (the forward path starts above it and never persists it), so a final
+  non-finalized stitch range `[sync_start ..= sync_start + 1]` re-fetches the sync-start header —
+  authenticated in-span against the trusted hash — plus its successor to confirm and persist that
+  last root; the redelivered successor re-commits idempotently. Backfill progress is tracked by
+  its own frontier rather than the forward covered set (the stitch deliberately overlaps
+  forward-covered heights), backfill commits never move `best_header_tip` or the shared
+  sync-exchange frontier, and a backfill tree that mismatches its range parent is retried without
+  dispatching the forward tree rebuild (`sync.header.backfill.tree_mismatch`). The whole mechanism
+  is dormant behind `BELOW_SYNC_START_BACKFILL_ENABLED` (per-startup `backfill_enabled`, opted
+  into by tests) until the node wiring consumes backfilled data; v1 restarts reseed the cursor at
+  genesis (identical re-commits are idempotent), and a follow-up startup read — a
+  genesis-based analogue of `BestHeaderHistoryTree` folding the durable below-sync-start roots up
+  to the first gap — can resume it from the highest contiguous backfilled frontier instead.
 - **Reconstruct at startup.** The durable roots CF therefore holds a contiguous run of confirmed
   roots above the verified body tip, but never the header tip's own root. On startup
   `ReadRequest::BestHeaderHistoryTree` folds the durable confirmed roots onto the verified-tip
@@ -663,7 +677,8 @@ corrupting state. Two mechanisms address it, in order of cost:
   cost. A background
   task can backfill missing lower ranges by fetching _roots_ (not bodies), so even a
   snapshot-started node becomes a full-range roots server cheaply. This is the targeted fix for
-  the §10 serving-availability gap.
+  the §10 serving-availability gap; its transport already exists as the dormant below-sync-start
+  forward backfill (§6.4, increment 6f).
 - **Indexing-follower resync (heavyweight, opt-in).** Rebuild the per-height trees off the
   consensus critical path (re-downloading bodies if pruned), turning a fast node into a full
   archive node. This pays back the cost fast-sync avoided, so it is the archive/RPC path
@@ -735,9 +750,16 @@ commitment before it influences the anchor set or the history MMR.** Consequence
   gossip-free, the normal Zakura path advances the tree by fold-on-commit. The
   `QueryBestHeaderHistoryTree` / `BestHeaderHistoryTreeLoaded` reload path remains as a guarded
   fallback when checkpoint, legacy, or gossip-driven commits move the durable body frontier ahead of
-  the header-frontier tree below the checkpoint; it rebuilds from durable roots, reanchors if the
+  the header-frontier tree below the checkpoint; it rebuilds from durable roots, rebases if the
   rebuilt frontier stops at a gap, and stays idle during ordinary header-leading sync. The
-  reanchor/follow-verified-tip scheduling is kept but gated to fire only at/above the checkpoint.
+  rebase/follow-verified-tip scheduling is kept but gated to fire only at/above the checkpoint.
+- **Increment 6f — below-sync-start forward backfill (dormant).** The old backward
+  checkpoint-backfill (which could not verify roots — backward ranges would fold onto the
+  previous checkpoint's tree, which the reactor never tracks) is reworked into a second forward
+  cursor from genesis with its own backfill history tree, reusing the forward verification path
+  end to end and persisting header-authenticated roots below the trusted sync start (§6.4). It
+  ships dormant behind `BELOW_SYNC_START_BACKFILL_ENABLED` until the node wiring consumes
+  backfilled data — the targeted consumer is the §10 roots-index serving backfill.
 - **Increment 7 — indexing follower lane (archive only).** Relocate `tx_by_loc` + address
   indexes and the per-height trees + subtree CFs onto an async follower, so archive mode regains
   historical RPC without re-adding the frontier recompute to the consensus path.
@@ -772,7 +794,8 @@ Live commit-path counters distinguish the fast and legacy paths and the failure 
 | `state.vct.fast_path.miss` | a finalized commit did not take the fast path |
 | `state.vct.root.stalled.height` (gauge) | a height stuck on a retryable stall past the warn threshold |
 | `sync.header.history_tree.rebuild` | header-frontier history tree lazily rebuilt (§6.4) because a non-Zakura commit ran ahead of it below the checkpoint; **stays 0 in the normal header-leading path**, so a nonzero value flags fallback/catch-up |
-| `sync.header.history_tree.reanchor` | a lazy rebuild (§6.4) folded to a frontier _below_ `best_header_tip - 1` (durable roots had a gap), so the reactor reanchored its header tip down onto the rebuilt tree; a subset of `rebuild`, and likewise 0 in the normal path |
+| `sync.header.history_tree.rebase` | a lazy rebuild (§6.4) folded to a frontier _below_ `best_header_tip - 1` (durable roots had a gap), so the reactor rebased its header tip down onto the rebuilt tree; a subset of `rebuild`, and likewise 0 in the normal path |
+| `sync.header.backfill.tree_mismatch` | a below-sync-start backfill delivery found the backfill tree mismatched its range parent (§6.4); nothing else moves the backfill region, so a nonzero value flags an internal bug (recovery: restart reseeds the cursor at genesis) |
 
 The header-sync `headers_received` / `headers_served` / commit-state trace rows also carry
 `want_tree_aux_roots` and `tree_aux_roots_len`, so root delivery is visible per range. The
@@ -805,6 +828,16 @@ asserts to prove roots actually came over the wire rather than a silent legacy s
   exercise serving and committing finalized ranges with roots end-to-end, including the
   all-or-nothing serving helper (roots attached only on complete coverage, otherwise rootless
   headers) and routing received roots into `CommitHeaderRange`.
+- **Below-sync-start backfill (reactor):** default-off regression
+  (`below_sync_start_backfill_is_disabled_by_default`); checkpoint-bounded bracket scheduling and
+  whole-delivery enforcement; checkpoint-end hash mismatch rejection; root verification against
+  the backfill tree (commit carries the confirmed prefix with `backfill: true`; a wrong root is
+  misbehavior); frontier advance and stitch completion without moving the forward frontier or
+  emitting body gaps; forward-before-backfill assignment ordering; a late fanout duplicate of a
+  committed bracket dropped without the forward tree rebuild. Driver side: a `backfill: true`
+  commit does not publish the exchange header frontier. State side: intermediate-anchor and
+  identical re-commit acceptance
+  (`header_range_commit_accepts_intermediate_anchor_and_identical_recommit`).
 - **State persistence:** `CommitHeaderRange` persists provisional roots into
   `commitment_roots_by_height`, rejects count/height mismatches, refuses to overwrite the
   verified row of an already-committed height

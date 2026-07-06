@@ -310,7 +310,7 @@ pub(crate) async fn drive_header_sync_actions(
             | HeaderSyncAction::QueryMissingBlockBodies { .. }
             | HeaderSyncAction::BodyGaps { .. }
             | HeaderSyncAction::HeaderAdvanced { .. }
-            | HeaderSyncAction::HeaderReanchored { .. } => {}
+            | HeaderSyncAction::HeaderRebased { .. } => {}
         }
     }
 }

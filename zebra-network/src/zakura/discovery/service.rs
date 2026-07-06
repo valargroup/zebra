@@ -822,16 +822,16 @@ mod tests {
         crate::BoxError,
     > {
         let network = Network::new_regtest(Default::default());
-        let anchor = (block::Height(0), network.genesis_hash());
+        let trusted_sync_start = (block::Height(0), network.genesis_hash());
         let mut startup = HeaderSyncStartup::new(
             network,
-            anchor,
+            trusted_sync_start,
             HeaderSyncFrontiers {
-                finalized_height: anchor.0,
-                verified_block_tip: anchor.0,
-                verified_block_hash: anchor.1,
+                finalized_height: trusted_sync_start.0,
+                verified_block_tip: trusted_sync_start.0,
+                verified_block_hash: trusted_sync_start.1,
             },
-            Some(anchor),
+            Some(trusted_sync_start),
             ZakuraHeaderSyncConfig::default(),
             LOCAL_MAX_MESSAGE_BYTES,
         );
@@ -1039,7 +1039,7 @@ mod tests {
                 msg: HeaderSyncMessage::Status(HeaderSyncStatus {
                     tip_height: block::Height(1),
                     tip_hash: block::Hash([9; 32]),
-                    anchor_height: block::Height(0),
+                    sync_start_height: block::Height(0),
                     max_headers_per_response: 1,
                     max_inflight_requests: 1,
                 }),

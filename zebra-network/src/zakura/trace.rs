@@ -347,8 +347,8 @@ pub mod header_sync_trace {
     pub const HEIGHT: &str = "height";
     /// Hash field.
     pub const HASH: &str = "hash";
-    /// Header anchor hash field.
-    pub const ANCHOR_HASH: &str = "anchor_hash";
+    /// Header link hash field.
+    pub const LINK_HASH: &str = "link_hash";
     /// Range start height field.
     pub const RANGE_START: &str = "range_start";
     /// Range count field.
@@ -367,7 +367,7 @@ pub mod header_sync_trace {
     pub const WANT_TREE_AUX_ROOTS: &str = "want_tree_aux_roots";
     /// Whether the range is expected to terminate at a checkpoint.
     pub const FINALIZED: &str = "finalized";
-    /// Header scheduler priority label (`forward` or `backward`).
+    /// Header scheduler priority label (`forward` or `backfill`).
     pub const RANGE_PRIORITY: &str = "range_priority";
     /// Highest verified full-block/body height observed by the header scheduler.
     pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
@@ -412,8 +412,8 @@ pub mod header_sync_trace {
     pub const HEADER_PEER_DISCONNECT_REQUESTED: &str = "header_peer_disconnect_requested";
     /// Header frontier advanced.
     pub const HEADER_FRONTIER_ADVANCED: &str = "header_frontier_advanced";
-    /// Header frontier re-anchored down to the verified block frontier.
-    pub const HEADER_FRONTIER_REANCHORED: &str = "header_frontier_reanchored";
+    /// Header frontier rebased down to the verified block frontier.
+    pub const HEADER_FRONTIER_REANCHORED: &str = "header_frontier_rebased";
     /// Missing block bodies reported.
     pub const HEADER_MISSING_BODIES_REPORTED: &str = "header_missing_bodies_reported";
 }

@@ -41,7 +41,7 @@ pub(super) struct CoveredRange {
 #[derive(Clone, Debug)]
 pub(super) struct RangeScheduler {
     pub(super) forward: VecDeque<RangeRequest>,
-    pub(super) backward: VecDeque<RangeRequest>,
+    pub(super) backfill: VecDeque<RangeRequest>,
     pub(super) assigned: HashMap<RangeRequest, HashSet<ZakuraPeerId>>,
     pub(super) covered: Vec<CoveredRange>,
 }
@@ -50,7 +50,7 @@ impl RangeScheduler {
     pub(super) fn new() -> Self {
         Self {
             forward: VecDeque::new(),
-            backward: VecDeque::new(),
+            backfill: VecDeque::new(),
             assigned: HashMap::new(),
             covered: Vec::new(),
         }
@@ -60,12 +60,15 @@ impl RangeScheduler {
         self.ensure(range, RangePriority::Forward);
     }
 
-    pub(super) fn ensure_backward(&mut self, range: RangeRequest) {
-        self.ensure(range, RangePriority::Backward);
+    pub(super) fn ensure_backfill(&mut self, range: RangeRequest) {
+        self.ensure(range, RangePriority::Backfill);
     }
 
     pub(super) fn ensure(&mut self, range: RangeRequest, priority: RangePriority) {
-        if self.is_covered(range)
+        // Covered intervals track the forward frontier's committed spans; backfill progress is
+        // tracked by the backfill frontier instead, and the sync-start stitch range deliberately
+        // overlaps forward-covered heights, so backfill ranges bypass the covered check.
+        if (priority == RangePriority::Forward && self.is_covered(range))
             || self.assigned.contains_key(&range)
             || self.assigned.keys().any(|assigned| {
                 assigned.start_height == range.start_height && assigned.priority == priority
@@ -75,7 +78,7 @@ impl RangeScheduler {
         }
         let queue = match priority {
             RangePriority::Forward => &mut self.forward,
-            RangePriority::Backward => &mut self.backward,
+            RangePriority::Backfill => &mut self.backfill,
         };
         if !queue.contains(&range)
             && !queue.iter().any(|queued| {
@@ -92,7 +95,7 @@ impl RangeScheduler {
         peer: &PeerHeaderState,
     ) -> Option<RangeRequest> {
         Self::pop_assignable(&mut self.forward, &self.assigned, peer_id, peer)
-            .or_else(|| Self::pop_assignable(&mut self.backward, &self.assigned, peer_id, peer))
+            .or_else(|| Self::pop_assignable(&mut self.backfill, &self.assigned, peer_id, peer))
     }
 
     pub(super) fn pop_assignable(
@@ -128,7 +131,7 @@ impl RangeScheduler {
 
         let queue = match original.priority {
             RangePriority::Forward => &mut self.forward,
-            RangePriority::Backward => &mut self.backward,
+            RangePriority::Backfill => &mut self.backfill,
         };
         for queued in queue {
             if *queued == original {
@@ -142,12 +145,15 @@ impl RangeScheduler {
     }
 
     pub(super) fn retry(&mut self, range: RangeRequest) {
-        if self.is_covered(range) {
-            return;
-        }
         match range.priority {
-            RangePriority::Forward => self.forward.push_front(range),
-            RangePriority::Backward => self.backward.push_front(range),
+            RangePriority::Forward => {
+                if self.is_covered(range) {
+                    return;
+                }
+                self.forward.push_front(range);
+            }
+            // Backfill ranges are exempt from covered checks (see `ensure`).
+            RangePriority::Backfill => self.backfill.push_front(range),
         }
     }
 
@@ -165,7 +171,7 @@ impl RangeScheduler {
     pub(super) fn retire_request(&mut self, range: RangeRequest) {
         match range.priority {
             RangePriority::Forward => self.forward.retain(|queued| *queued != range),
-            RangePriority::Backward => self.backward.retain(|queued| *queued != range),
+            RangePriority::Backfill => self.backfill.retain(|queued| *queued != range),
         }
         self.clear_assignment(range);
     }
@@ -174,6 +180,20 @@ impl RangeScheduler {
         self.forward.clear();
         self.assigned
             .retain(|range, _| range.priority != RangePriority::Forward);
+    }
+
+    /// Drops queued and assigned backfill ranges that ended at or below the backfill frontier.
+    ///
+    /// Backfill ranges are exempt from the forward covered machinery (see `ensure`), so this is
+    /// their staleness rule: once the frontier passed a range's end (a fanout duplicate or a
+    /// timed-out retry of an already-committed bracket), redelivering it can only mismatch the
+    /// advanced backfill tree.
+    pub(super) fn retire_stale_backfill(&mut self, backfill_tip: block::Height) {
+        self.backfill
+            .retain(|range| range.end_height() > backfill_tip);
+        self.assigned.retain(|range, _| {
+            range.priority != RangePriority::Backfill || range.end_height() > backfill_tip
+        });
     }
 
     pub(super) fn mark_height_covered(&mut self, height: block::Height) {
@@ -231,9 +251,10 @@ impl RangeScheduler {
                 .iter()
                 .any(|covered| covered.start <= range.start_height && covered.end >= end)
         };
+        // Backfill ranges are exempt from covered pruning (see `ensure`).
         self.forward.retain(|range| !is_covered(range));
-        self.backward.retain(|range| !is_covered(range));
-        self.assigned.retain(|range, _| !is_covered(range));
+        self.assigned
+            .retain(|range, _| range.priority == RangePriority::Backfill || !is_covered(range));
     }
 }
 

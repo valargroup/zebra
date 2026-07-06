@@ -443,16 +443,16 @@ fn checkpoint_regtest_with_hash(
 
 fn startup_for(
     network: Network,
-    anchor: (block::Height, block::Hash),
+    trusted_sync_start: (block::Height, block::Hash),
     best_header_tip: Option<(block::Height, block::Hash)>,
 ) -> HeaderSyncStartup {
     let mut startup = HeaderSyncStartup::new(
         network,
-        anchor,
+        trusted_sync_start,
         HeaderSyncFrontiers {
-            finalized_height: anchor.0,
-            verified_block_tip: anchor.0,
-            verified_block_hash: anchor.1,
+            finalized_height: trusted_sync_start.0,
+            verified_block_tip: trusted_sync_start.0,
+            verified_block_hash: trusted_sync_start.1,
         },
         best_header_tip,
         ZakuraHeaderSyncConfig::default(),
@@ -472,16 +472,16 @@ fn startup_for(
 #[test]
 fn startup_new_is_passive_until_local_hooks_are_wired() {
     let network = Network::Mainnet;
-    let anchor = (block::Height(0), network.genesis_hash());
+    let trusted_sync_start = (block::Height(0), network.genesis_hash());
     let startup = HeaderSyncStartup::new(
         network,
-        anchor,
+        trusted_sync_start,
         HeaderSyncFrontiers {
-            finalized_height: anchor.0,
-            verified_block_tip: anchor.0,
-            verified_block_hash: anchor.1,
+            finalized_height: trusted_sync_start.0,
+            verified_block_tip: trusted_sync_start.0,
+            verified_block_hash: trusted_sync_start.1,
         },
-        Some(anchor),
+        Some(trusted_sync_start),
         ZakuraHeaderSyncConfig::default(),
         LOCAL_MAX_MESSAGE_BYTES,
     );
@@ -492,10 +492,10 @@ fn startup_new_is_passive_until_local_hooks_are_wired() {
 
 fn startup_with_timeout(
     network: Network,
-    anchor: (block::Height, block::Hash),
+    trusted_sync_start: (block::Height, block::Hash),
     request_timeout: std::time::Duration,
 ) -> HeaderSyncStartup {
-    let mut startup = startup_for(network, anchor, None);
+    let mut startup = startup_for(network, trusted_sync_start, None);
     startup.request_timeout = request_timeout;
     startup
 }
@@ -503,16 +503,16 @@ fn startup_with_timeout(
 #[tokio::test]
 async fn peer_caps_reject_full_without_status_or_misbehavior_and_free_on_remove() {
     let network = Network::Mainnet;
-    let anchor = (block::Height(0), network.genesis_hash());
+    let trusted_sync_start = (block::Height(0), network.genesis_hash());
     let mut startup = HeaderSyncStartup::new(
         network,
-        anchor,
+        trusted_sync_start,
         HeaderSyncFrontiers {
-            finalized_height: anchor.0,
-            verified_block_tip: anchor.0,
-            verified_block_hash: anchor.1,
+            finalized_height: trusted_sync_start.0,
+            verified_block_tip: trusted_sync_start.0,
+            verified_block_hash: trusted_sync_start.1,
         },
-        Some(anchor),
+        Some(trusted_sync_start),
         ZakuraHeaderSyncConfig {
             peer_limits: ServicePeerLimits {
                 max_inbound_peers: 1,
@@ -597,8 +597,8 @@ async fn peer_caps_reject_full_without_status_or_misbehavior_and_free_on_remove(
 #[tokio::test]
 async fn stale_disconnect_from_displaced_connection_keeps_live_session() {
     let network = Network::Mainnet;
-    let anchor = (block::Height(0), network.genesis_hash());
-    let mut startup = startup_for(network, anchor, Some(anchor));
+    let trusted_sync_start = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, trusted_sync_start, Some(trusted_sync_start));
     startup.range_state_actions_enabled = false;
     let fixture = spawn_test_reactor(startup);
     let peer_id = peer(33);
@@ -654,8 +654,8 @@ async fn stale_disconnect_from_displaced_connection_keeps_live_session() {
 #[tokio::test]
 async fn stale_disconnect_before_winner_connect_still_converges() {
     let network = Network::Mainnet;
-    let anchor = (block::Height(0), network.genesis_hash());
-    let mut startup = startup_for(network, anchor, Some(anchor));
+    let trusted_sync_start = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, trusted_sync_start, Some(trusted_sync_start));
     startup.range_state_actions_enabled = false;
     let fixture = spawn_test_reactor(startup);
     let peer_id = peer(34);
@@ -695,8 +695,8 @@ async fn stale_disconnect_before_winner_connect_still_converges() {
 #[tokio::test]
 async fn unscoped_disconnect_removes_session_with_any_registration_id() {
     let network = Network::Mainnet;
-    let anchor = (block::Height(0), network.genesis_hash());
-    let mut startup = startup_for(network, anchor, Some(anchor));
+    let trusted_sync_start = (block::Height(0), network.genesis_hash());
+    let mut startup = startup_for(network, trusted_sync_start, Some(trusted_sync_start));
     startup.range_state_actions_enabled = false;
     let fixture = spawn_test_reactor(startup);
     let peer_id = peer(35);
@@ -894,16 +894,16 @@ async fn advisory_backoff_is_pruned_on_peer_disconnected() {
 #[tokio::test(flavor = "current_thread")]
 async fn admission_failure_after_advisory_selection_creates_no_outstanding_range() {
     let network = regtest_network();
-    let anchor = (block::Height(0), network.genesis_hash());
+    let trusted_sync_start = (block::Height(0), network.genesis_hash());
     let mut startup = HeaderSyncStartup::new(
         network,
-        anchor,
+        trusted_sync_start,
         HeaderSyncFrontiers {
-            finalized_height: anchor.0,
-            verified_block_tip: anchor.0,
-            verified_block_hash: anchor.1,
+            finalized_height: trusted_sync_start.0,
+            verified_block_tip: trusted_sync_start.0,
+            verified_block_hash: trusted_sync_start.1,
         },
-        Some(anchor),
+        Some(trusted_sync_start),
         ZakuraHeaderSyncConfig {
             peer_limits: ServicePeerLimits {
                 max_inbound_peers: 0,
@@ -1186,7 +1186,7 @@ async fn stale_header_sync_teardown_keeps_replacement_session() {
 async fn advertise_tip(
     fixture: &ReactorFixture,
     peer_id: ZakuraPeerId,
-    anchor_height: block::Height,
+    sync_start_height: block::Height,
     tip_height: block::Height,
     max_headers_per_response: u32,
     max_inflight_requests: u16,
@@ -1194,7 +1194,7 @@ async fn advertise_tip(
     advertise_tip_with_hash(
         fixture,
         peer_id,
-        anchor_height,
+        sync_start_height,
         tip_height,
         block::Hash([9; 32]),
         max_headers_per_response,
@@ -1206,7 +1206,7 @@ async fn advertise_tip(
 async fn advertise_tip_with_hash(
     fixture: &ReactorFixture,
     peer_id: ZakuraPeerId,
-    anchor_height: block::Height,
+    sync_start_height: block::Height,
     tip_height: block::Height,
     tip_hash: block::Hash,
     max_headers_per_response: u32,
@@ -1219,7 +1219,7 @@ async fn advertise_tip_with_hash(
             msg: HeaderSyncMessage::Status(HeaderSyncStatus {
                 tip_height,
                 tip_hash,
-                anchor_height,
+                sync_start_height,
                 max_headers_per_response,
                 max_inflight_requests,
             }),
@@ -1233,7 +1233,7 @@ fn codec_round_trips_status() {
     let status = HeaderSyncStatus {
         tip_height: block::Height(10),
         tip_hash: block::Hash([9; 32]),
-        anchor_height: block::Height(1),
+        sync_start_height: block::Height(1),
         max_headers_per_response: DEFAULT_HS_RANGE,
         max_inflight_requests: DEFAULT_HS_MAX_INFLIGHT,
     };
@@ -1928,27 +1928,34 @@ async fn scheduler_narrows_large_ranges_before_tracking_fanout() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
+async fn forward_ranges_are_assigned_before_backfill() {
     let (network, checkpoint_hash) = checkpoint_regtest(block::Height(3));
-    let mut fixture = spawn_test_reactor(startup_for(
+    let mut startup = startup_for(
         network,
         (block::Height(3), checkpoint_hash),
         Some((block::Height(3), checkpoint_hash)),
-    ));
-    let peer_id = peer(6);
+    );
+    startup.backfill_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
 
-    connect_peer(&fixture, peer_id.clone()).await;
-    advertise_tip(
-        &fixture,
-        peer_id,
-        block::Height(0),
-        block::Height(8),
-        DEFAULT_HS_RANGE,
-        10,
-    )
-    .await;
+    // One outbound request per peer: the forward range's full fanout (3 peers) is assigned
+    // before the backfill bracket gets its first peer.
+    for seed in 1..=4 {
+        let peer_id = peer(seed);
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            block::Height(0),
+            block::Height(8),
+            DEFAULT_HS_RANGE,
+            10,
+        )
+        .await;
+    }
 
-    loop {
+    let mut requests = Vec::new();
+    while requests.len() < 4 {
         if let HeaderSyncAction::SendMessage {
             msg:
                 HeaderSyncMessage::GetHeaders {
@@ -1959,11 +1966,19 @@ async fn scheduler_creates_checkpoint_forward_before_backward_ranges() {
             ..
         } = next_non_query_action(&mut fixture.actions).await
         {
-            assert_eq!(start_height, block::Height(4));
-            assert_eq!(count, 5);
-            break;
+            requests.push((start_height, count));
         }
     }
+    assert_eq!(
+        &requests[..3],
+        &[(block::Height(4), 5); 3],
+        "the forward range exhausts its fanout first"
+    );
+    assert_eq!(
+        requests[3],
+        (block::Height(1), 3),
+        "the backfill bracket is assigned only after forward work"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2525,7 +2540,7 @@ async fn covered_hedged_outstanding_ranges_do_not_commit_twice() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
+async fn late_covered_response_does_not_rebase_newer_outstanding_range() {
     let network = regtest_network();
     let mut fixture = spawn_test_reactor(startup_for(
         network.clone(),
@@ -2607,7 +2622,7 @@ async fn late_covered_response_does_not_reanchor_newer_outstanding_range() {
                 msg: HeaderSyncMessage::GetHeaders { .. },
                 ..
             }
-            | HeaderSyncAction::HeaderReanchored { .. }
+            | HeaderSyncAction::HeaderRebased { .. }
             | HeaderSyncAction::Misbehavior { .. } => {
                 panic!("late covered response must not trigger a new action: {action:?}")
             }
@@ -3946,11 +3961,11 @@ async fn inbound_get_headers_over_cap_disconnects_without_state_read() {
 #[tokio::test(flavor = "current_thread")]
 async fn rejected_non_linking_range_traces_link_stage_and_error_kind() {
     let network = regtest_network();
-    let anchor = (block::Height(0), network.genesis_hash());
+    let trusted_sync_start = (block::Height(0), network.genesis_hash());
     let mut capture =
         TraceCapture::for_test("rejected_non_linking_range_traces_link_stage_and_error_kind")
             .unwrap();
-    let mut startup = startup_for(network, anchor, Some(anchor));
+    let mut startup = startup_for(network, trusted_sync_start, Some(trusted_sync_start));
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let mut fixture = spawn_test_reactor(startup);
     let peer_id = peer(64);
@@ -3959,7 +3974,7 @@ async fn rejected_non_linking_range_traces_link_stage_and_error_kind() {
     advertise_tip(
         &fixture,
         peer_id.clone(),
-        anchor.0,
+        trusted_sync_start.0,
         block::Height(1),
         DEFAULT_HS_RANGE,
         1,
@@ -3993,13 +4008,13 @@ async fn rejected_non_linking_range_traces_link_stage_and_error_kind() {
     capture.flush().await;
     let reader = capture.reader().unwrap();
     let header_sync = reader.table(HEADER_SYNC_TABLE.table());
-    let anchor_hash = format!("{}", anchor.1);
+    let link_hash = format!("{}", trusted_sync_start.1);
     header_sync.assert_row(
         hs_trace::HEADER_RANGE_REJECTED,
         &[
             (hs_trace::RANGE_START, TraceValue::U64(1)),
             (hs_trace::RANGE_COUNT, TraceValue::U64(1)),
-            (hs_trace::ANCHOR_HASH, TraceValue::Str(&anchor_hash)),
+            (hs_trace::LINK_HASH, TraceValue::Str(&link_hash)),
             (hs_trace::VALIDATION_STAGE, TraceValue::Str("link")),
             (
                 hs_trace::ERROR_KIND,
@@ -4581,7 +4596,7 @@ async fn failed_rebuild_clears_guard_and_retriggers() {
             .handle
             .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
                 best_header_tip: block::Height(4),
-                reanchor: None,
+                rebase: None,
                 history_tree: None,
             })
             .await
@@ -4718,7 +4733,7 @@ async fn forward_ranges_request_roots_through_the_last_checkpoint() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
+async fn forward_link_wedge_rebases_to_verified_tip_without_banning() {
     let network = regtest_network();
     let verified = (block::Height(0), network.genesis_hash());
     let stranded_tip = (block::Height(3), block::Hash([3; 32]));
@@ -4778,25 +4793,25 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
     assert_eq!(fixture.handle.best_header_tip(), verified);
 
     let expected_start = verified.0.next().expect("genesis has a successor");
-    let mut saw_reanchor_action = false;
+    let mut saw_rebase_action = false;
     for _ in 0..8 {
         match next_non_query_action(&mut fixture.actions).await {
-            HeaderSyncAction::HeaderReanchored { old, new } => {
+            HeaderSyncAction::HeaderRebased { old, new } => {
                 assert_eq!(old, stranded_tip);
                 assert_eq!(new, verified);
-                saw_reanchor_action = true;
+                saw_rebase_action = true;
             }
             HeaderSyncAction::SendMessage {
                 msg:
                     HeaderSyncMessage::GetHeaders {
                         start_height,
-                        // This test exercises reanchor-and-resume, not the root regime; accept either
+                        // This test exercises rebase-and-resume, not the root regime; accept either
                         // flag (regtest's genesis-only `max_height` makes the resumed range's root
                         // flag a degenerate edge).
                         ..
                     },
                 ..
-            } if saw_reanchor_action && start_height == expected_start => {
+            } if saw_rebase_action && start_height == expected_start => {
                 assert_no_commit_or_misbehavior(&mut fixture.actions).await;
                 return;
             }
@@ -4806,11 +4821,11 @@ async fn forward_link_wedge_reanchors_to_verified_tip_without_banning() {
             _ => {}
         }
     }
-    panic!("after re-anchor, header sync did not emit the reanchor action and request forward from the verified tip");
+    panic!("after rebase, header sync did not emit the rebase action and request forward from the verified tip");
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn single_peer_forward_link_failures_do_not_reanchor_globally() {
+async fn single_peer_forward_link_failures_do_not_rebase_globally() {
     let network = regtest_network();
     let verified = (block::Height(0), network.genesis_hash());
     let stranded_tip = (block::Height(3), block::Hash([3; 32]));
@@ -5003,9 +5018,9 @@ async fn truncated_finalized_backfill_is_rejected_before_commit() {
     assert_no_commit_or_misbehavior(&mut fixture.actions).await;
 }
 
-// Backward (below-anchor) checkpoint backfill is explicitly disabled (see
-// `backward_checkpoint_backfill_is_explicitly_disabled`), so finalized checkpoint-range
-// validation is exercised through the forward genesis-backfill path below.
+// Finalized checkpoint-range validation is exercised through the forward genesis-sync path below
+// (a genesis sync start whose first forward range ends at the first checkpoint); the
+// below-sync-start backfill cursor exercises the same validation in the `backfill_*` tests.
 
 #[tokio::test(flavor = "current_thread")]
 async fn checkpoint_backfill_rejects_non_contiguous_run_before_commit() {
@@ -5065,11 +5080,15 @@ async fn checkpoint_backfill_rejects_non_contiguous_run_before_commit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn header_response_that_does_not_link_to_anchor_is_misbehavior_before_commit() {
+async fn header_response_that_does_not_link_is_misbehavior_before_commit() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
-    let anchor = (block::Height(0), network.genesis_hash());
-    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(anchor)));
+    let trusted_sync_start = (block::Height(0), network.genesis_hash());
+    let mut fixture = spawn_test_reactor(startup_for(
+        network,
+        trusted_sync_start,
+        Some(trusted_sync_start),
+    ));
     let peer_id = peer(46);
 
     connect_peer(&fixture, peer_id.clone()).await;
@@ -5447,16 +5466,16 @@ fn hostile_vectors_are_rejected_for_allocation_and_unsolicited_headers() {
 #[tokio::test]
 async fn misbehavior_is_recorded_without_disconnecting_the_peer() {
     let network = Network::Mainnet;
-    let anchor = (block::Height(0), network.genesis_hash());
+    let trusted_sync_start = (block::Height(0), network.genesis_hash());
     let mut startup = HeaderSyncStartup::new(
         network,
-        anchor,
+        trusted_sync_start,
         HeaderSyncFrontiers {
-            finalized_height: anchor.0,
-            verified_block_tip: anchor.0,
-            verified_block_hash: anchor.1,
+            finalized_height: trusted_sync_start.0,
+            verified_block_tip: trusted_sync_start.0,
+            verified_block_hash: trusted_sync_start.1,
         },
-        Some(anchor),
+        Some(trusted_sync_start),
         ZakuraHeaderSyncConfig::default(),
         LOCAL_MAX_MESSAGE_BYTES,
     );
@@ -5471,11 +5490,11 @@ async fn misbehavior_is_recorded_without_disconnecting_the_peer() {
     let probe_cancel =
         connect_peer_with_direction(&fixture, probe.clone(), ServicePeerDirection::Inbound).await;
 
-    // `anchor_height > tip_height` is an `InvalidStatus` misbehavior.
+    // `sync_start_height > tip_height` is an `InvalidStatus` misbehavior.
     let invalid_status = HeaderSyncMessage::Status(HeaderSyncStatus {
         tip_height: block::Height(0),
         tip_hash: block::Hash([0; 32]),
-        anchor_height: block::Height(1),
+        sync_start_height: block::Height(1),
         max_headers_per_response: 1,
         max_inflight_requests: 1,
     });
@@ -5804,7 +5823,7 @@ async fn short_served_forward_range_must_install_the_delivered_frontier_tree() {
         .await
         .unwrap();
 
-    // The next forward range overlaps the committed tip: heights 3..=4 anchored on header 2.
+    // The next forward range overlaps the committed tip: heights 3..=4 linked on header 2.
     let (served_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
     assert_eq!(served_peer, peer_id);
     assert_eq!(start_height, block::Height(3));
@@ -5848,15 +5867,15 @@ async fn short_served_forward_range_must_install_the_delivered_frontier_tree() {
     }
 }
 
-/// Regression test for the runtime lazy-rebuild reanchor. A non-Zakura path (checkpoint/legacy sync)
+/// Regression test for the runtime lazy-rebuild rebase. A non-Zakura path (checkpoint/legacy sync)
 /// runs the header tip ahead of the folded tree, so the forward range that needs the tree triggers a
 /// `QueryBestHeaderHistoryTree` rebuild. When durable roots have a gap the rebuilt tree lands *below*
-/// `best_header_tip - 1`, so the answer carries a [`HeaderFrontierReanchor`]. The reactor must drop its
-/// tip onto the rebuilt tree (emitting `HeaderReanchored`) and then verify the resumed forward range
+/// `best_header_tip - 1`, so the answer carries a [`HeaderFrontierRebase`]. The reactor must drop its
+/// tip onto the rebuilt tree (emitting `HeaderRebased`) and then verify the resumed forward range
 /// against it — instead of keeping the stale higher tip and re-triggering the identical deterministic
 /// rebuild forever (the pre-fix loop, where the frontier was discarded before reaching the reactor).
 #[tokio::test(flavor = "current_thread")]
-async fn lazy_rebuild_reanchors_tip_onto_lower_frontier_tree() {
+async fn lazy_rebuild_rebases_tip_onto_lower_frontier_tree() {
     let genesis_hash = regtest_network().genesis_hash();
 
     // A synthetic post-Heartwood chain 1..=4 with real ZIP-221 commitments, so the resumed range can
@@ -5928,12 +5947,12 @@ async fn lazy_rebuild_reanchors_tip_onto_lower_frontier_tree() {
     }
 
     // Answer the rebuild with a tree that folded only to the confirmed frontier at height 1 — below
-    // `best_header_tip - 1` (2), a durable-root gap — plus the reanchor onto it.
+    // `best_header_tip - 1` (2), a durable-root gap — plus the rebase onto it.
     fixture
         .handle
         .send(HeaderSyncEvent::BestHeaderHistoryTreeLoaded {
             best_header_tip: block::Height(3),
-            reanchor: Some(HeaderFrontierReanchor {
+            rebase: Some(HeaderFrontierRebase {
                 tip: block::Height(2),
                 tip_hash: h2_hash,
                 parent_hash: h1_hash,
@@ -5943,14 +5962,14 @@ async fn lazy_rebuild_reanchors_tip_onto_lower_frontier_tree() {
         .await
         .unwrap();
 
-    // The reactor drops the tip onto the rebuilt tree and resumes the forward range from the reanchor,
+    // The reactor drops the tip onto the rebuilt tree and resumes the forward range from the rebase,
     // verifying it against the reinstalled tree — never a second rebuild.
-    let mut saw_reanchor = false;
+    let mut saw_rebase = false;
     loop {
         match next_non_query_action(&mut fixture.actions).await {
-            HeaderSyncAction::HeaderReanchored { new, .. } => {
-                assert_eq!(new.0, block::Height(2), "tip reanchored onto the frontier");
-                saw_reanchor = true;
+            HeaderSyncAction::HeaderRebased { new, .. } => {
+                assert_eq!(new.0, block::Height(2), "tip rebased onto the frontier");
+                saw_rebase = true;
             }
             HeaderSyncAction::SendMessage {
                 msg:
@@ -5961,8 +5980,8 @@ async fn lazy_rebuild_reanchors_tip_onto_lower_frontier_tree() {
                     },
                 ..
             } => {
-                // Ignore the pre-reanchor retry of the stale [4..] range; only serve the range the
-                // reactor resumes from the reanchor at height 2.
+                // Ignore the pre-rebase retry of the stale [4..] range; only serve the range the
+                // reactor resumes from the rebase at height 2.
                 if start_height != block::Height(2) {
                     continue;
                 }
@@ -5982,7 +6001,7 @@ async fn lazy_rebuild_reanchors_tip_onto_lower_frontier_tree() {
                 break;
             }
             HeaderSyncAction::QueryBestHeaderHistoryTree { .. } => panic!(
-                "the reanchored tree was ignored: the resumed range re-triggered a durable-state \
+                "the rebased tree was ignored: the resumed range re-triggered a durable-state \
                  rebuild instead of verifying against the reinstalled tree"
             ),
             HeaderSyncAction::Misbehavior { peer, reason } => {
@@ -5992,21 +6011,20 @@ async fn lazy_rebuild_reanchors_tip_onto_lower_frontier_tree() {
         }
     }
     assert!(
-        saw_reanchor,
-        "the tip must be reanchored down onto the rebuilt frontier tree"
+        saw_rebase,
+        "the tip must be rebased down onto the rebuilt frontier tree"
     );
 }
 
-/// Regression test: backward (below-anchor) checkpoint backfill is unused by the current sync
-/// wiring and does not work with root verification (backward ranges fold onto the previous
-/// checkpoint's tree, which this reactor never tracks), so it must be explicitly disabled rather
-/// than left scheduling silently.
+/// Regression test: the below-sync-start backfill is dormant by default
+/// (`BELOW_SYNC_START_BACKFILL_ENABLED = false`), because the current node wiring never consumes
+/// backfilled headers or roots. Fixtures opt in per startup via `backfill_enabled`.
 ///
-/// A node anchored at a checkpoint above genesis whose forward frontier already matches the
-/// peer's tip has no forward work; any `GetHeaders` it emits is the backward backfill bracket.
-/// It must emit none.
+/// A node whose trusted sync start is a checkpoint above genesis and whose forward frontier
+/// already matches the peer's tip has no forward work; any `GetHeaders` it emits is the backfill
+/// bracket. It must emit none by default.
 #[tokio::test(flavor = "current_thread")]
-async fn backward_checkpoint_backfill_is_explicitly_disabled() {
+async fn below_sync_start_backfill_is_disabled_by_default() {
     let checkpoint_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
     let (network, _) = checkpoint_testnet_with_hash(block::Height(3), checkpoint_hash);
     let mut fixture = spawn_test_reactor(startup_for(
@@ -6027,7 +6045,7 @@ async fn backward_checkpoint_backfill_is_explicitly_disabled() {
     )
     .await;
 
-    // Drain actions for a bounded window: no backward `GetHeaders` may be scheduled.
+    // Drain actions for a bounded window: no backfill `GetHeaders` may be scheduled.
     while let Ok(Some(action)) = tokio::time::timeout(
         std::time::Duration::from_millis(250),
         fixture.actions.recv(),
@@ -6045,9 +6063,569 @@ async fn backward_checkpoint_backfill_is_explicitly_disabled() {
         } = action
         {
             panic!(
-                "backward checkpoint backfill must be explicitly disabled, but a below-anchor \
+                "below-sync-start backfill must be disabled by default, but a below-sync-start \
                  range was requested: start {start_height:?} count {count}"
             );
+        }
+    }
+}
+
+/// A custom network with real-mainnet-header checkpoints at genesis and height 3, and every
+/// fixture height pre-Heartwood so supplied roots verify with the direct Sapling checks against
+/// the empty backfill history tree.
+fn backfill_fixture_network() -> (Network, (block::Height, block::Hash)) {
+    let sync_start_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_3_BYTES).as_ref());
+    let mainnet = Network::Mainnet;
+    let network = Parameters::build()
+        .with_network_name("HeadersyncBackfillTest")
+        .expect("custom network name is valid")
+        .with_genesis_hash(mainnet.genesis_hash())
+        .expect("mainnet genesis hash is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(2),
+            blossom: Some(3),
+            heartwood: Some(5),
+            canopy: Some(5),
+            ..Default::default()
+        })
+        .expect("custom activation heights are in order")
+        .clear_funding_streams()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), mainnet.genesis_hash()),
+            (block::Height(3), sync_start_hash),
+            (
+                block::Height(4),
+                block::Hash::from(mainnet_header(&BLOCK_MAINNET_4_BYTES).as_ref()),
+            ),
+        ]))
+        .expect("custom checkpoints are valid")
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    (network, (block::Height(3), sync_start_hash))
+}
+
+/// Backfill-enabled startup whose forward frontier already matches the peers' advertised tip
+/// (height 4), so the reactor's only outstanding work is the below-sync-start backfill.
+fn backfill_enabled_startup(
+    network: &Network,
+    sync_start: (block::Height, block::Hash),
+) -> HeaderSyncStartup {
+    let best_tip = (
+        block::Height(4),
+        block::Hash::from(mainnet_header(&BLOCK_MAINNET_4_BYTES).as_ref()),
+    );
+    let mut startup = startup_for(network.clone(), sync_start, Some(best_tip));
+    startup.backfill_enabled = true;
+    startup
+}
+
+/// Waits for the next backfill `GetHeaders` and returns its `(start_height, count)`.
+async fn next_get_headers(actions: &mut mpsc::Receiver<HeaderSyncAction>) -> (block::Height, u32) {
+    loop {
+        if let HeaderSyncAction::SendMessage {
+            msg:
+                HeaderSyncMessage::GetHeaders {
+                    start_height,
+                    count,
+                    want_tree_aux_roots,
+                },
+            ..
+        } = next_non_query_action(actions).await
+        {
+            assert!(
+                want_tree_aux_roots,
+                "backfill ranges are always root-carrying"
+            );
+            return (start_height, count);
+        }
+    }
+}
+
+/// The backfill cursor schedules one checkpoint-bounded root-carrying bracket from genesis, and a
+/// short (truncated) response to the finalized bracket is rejected before commit.
+#[tokio::test(flavor = "current_thread")]
+async fn backfill_schedules_checkpoint_bounded_range_from_genesis() {
+    let (network, sync_start) = backfill_fixture_network();
+    let mut fixture = spawn_test_reactor(backfill_enabled_startup(&network, sync_start));
+    let peer_id = peer(93);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        10,
+    )
+    .await;
+
+    assert_eq!(
+        next_get_headers(&mut fixture.actions).await,
+        (block::Height(1), 3),
+        "backfill bracket spans genesis to the first checkpoint"
+    );
+
+    // Finalized brackets require whole delivery: a truncated response is rejected.
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+    ];
+    let matching_roots = header_matching_roots(&network, block::Height(1), &headers);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: roots_message_from(block::Height(1), headers.to_vec(), matching_roots),
+        })
+        .await
+        .unwrap();
+
+    match next_non_query_action(&mut fixture.actions).await {
+        HeaderSyncAction::Misbehavior { peer, reason } => {
+            assert_eq!(peer, peer_id);
+            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+        }
+        action => panic!("unexpected action: {action:?}"),
+    }
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+}
+
+/// A backfill bracket whose last header does not hash-match the checkpoint is misbehavior.
+#[tokio::test(flavor = "current_thread")]
+async fn backfill_checkpoint_end_hash_mismatch_is_misbehavior() {
+    // The network's height-3 checkpoint (and trusted sync start) diverge from the real chain, so
+    // a linked run of the real headers must fail the finalized checkpoint-end check.
+    let divergent_hash = block::Hash::from(mainnet_header(&BLOCK_MAINNET_1_BYTES).as_ref());
+    let mainnet = Network::Mainnet;
+    let network = Parameters::build()
+        .with_network_name("HeadersyncBackfillDivergent")
+        .expect("custom network name is valid")
+        .with_genesis_hash(mainnet.genesis_hash())
+        .expect("mainnet genesis hash is valid")
+        .with_activation_heights(ConfiguredActivationHeights {
+            overwinter: Some(1),
+            sapling: Some(2),
+            blossom: Some(3),
+            heartwood: Some(5),
+            canopy: Some(5),
+            ..Default::default()
+        })
+        .expect("custom activation heights are in order")
+        .clear_funding_streams()
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (block::Height(0), mainnet.genesis_hash()),
+            (block::Height(3), divergent_hash),
+            (
+                block::Height(4),
+                block::Hash::from(mainnet_header(&BLOCK_MAINNET_4_BYTES).as_ref()),
+            ),
+        ]))
+        .expect("custom checkpoints are valid")
+        .to_network()
+        .expect("custom testnet parameters are valid");
+    let mut fixture = spawn_test_reactor(backfill_enabled_startup(
+        &network,
+        (block::Height(3), divergent_hash),
+    ));
+    let peer_id = peer(94);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        10,
+    )
+    .await;
+    assert_eq!(
+        next_get_headers(&mut fixture.actions).await,
+        (block::Height(1), 3),
+    );
+
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+    ];
+    let matching_roots = header_matching_roots(&network, block::Height(1), &headers);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: roots_message_from(block::Height(1), headers.to_vec(), matching_roots),
+        })
+        .await
+        .unwrap();
+
+    match next_non_query_action(&mut fixture.actions).await {
+        HeaderSyncAction::Misbehavior { peer, reason } => {
+            assert_eq!(peer, peer_id);
+            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+        }
+        action => panic!("unexpected action: {action:?}"),
+    }
+    assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+}
+
+/// Backfill deliveries are root-verified against the backfill history tree: matching roots commit
+/// with the confirmed prefix and `backfill: true`; a wrong root is misbehavior with no commit.
+#[tokio::test(flavor = "current_thread")]
+async fn backfill_verifies_roots_against_backfill_tree() {
+    let (network, sync_start) = backfill_fixture_network();
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+    ];
+
+    // Wrong root: corrupt the Sapling root for height 3 (Sapling is active there, so the direct
+    // below-Heartwood check pins it to the header's own commitment).
+    {
+        let mut fixture = spawn_test_reactor(backfill_enabled_startup(&network, sync_start));
+        let peer_id = peer(95);
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id.clone(),
+            block::Height(0),
+            block::Height(4),
+            DEFAULT_HS_RANGE,
+            10,
+        )
+        .await;
+        assert_eq!(
+            next_get_headers(&mut fixture.actions).await,
+            (block::Height(1), 3),
+        );
+
+        let mut wrong_roots = header_matching_roots(&network, block::Height(1), &headers);
+        wrong_roots[2].sapling_root = sapling::tree::NoteCommitmentTree::default().root();
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireMessage {
+                peer: peer_id.clone(),
+                msg: roots_message_from(block::Height(1), headers.to_vec(), wrong_roots),
+            })
+            .await
+            .unwrap();
+
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+            }
+            action => panic!("unexpected action: {action:?}"),
+        }
+        assert_no_commit_or_misbehavior(&mut fixture.actions).await;
+    }
+
+    // Matching roots: the bracket commits with the confirmed prefix (one shorter than the
+    // headers) and is flagged as a backfill commit.
+    let mut fixture = spawn_test_reactor(backfill_enabled_startup(&network, sync_start));
+    let peer_id = peer(96);
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        10,
+    )
+    .await;
+    assert_eq!(
+        next_get_headers(&mut fixture.actions).await,
+        (block::Height(1), 3),
+    );
+
+    let matching_roots = header_matching_roots(&network, block::Height(1), &headers);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: roots_message_from(block::Height(1), headers.to_vec(), matching_roots),
+        })
+        .await
+        .unwrap();
+
+    match next_non_query_action(&mut fixture.actions).await {
+        HeaderSyncAction::CommitHeaderRange {
+            peer,
+            start_height,
+            headers,
+            finalized,
+            backfill,
+            verified_roots,
+            ..
+        } => {
+            assert_eq!(peer, peer_id);
+            assert_eq!(start_height, block::Height(1));
+            assert_eq!(headers.len(), 3);
+            assert!(finalized);
+            assert!(backfill);
+            let verified_roots = verified_roots.expect("backfill ranges carry verified roots");
+            assert_eq!(verified_roots.confirmed_roots().len(), 2);
+        }
+        action => panic!("unexpected action: {action:?}"),
+    }
+}
+
+/// A committed backfill bracket advances the backfill frontier (scheduling the sync-start
+/// stitch next) without moving the forward frontier or producing body gaps; completing the
+/// stitch confirms the sync-start root and ends the backfill.
+#[tokio::test(flavor = "current_thread")]
+async fn backfill_commit_advances_backfill_frontier_and_stitch_completes() {
+    let (network, sync_start) = backfill_fixture_network();
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+        mainnet_header(&BLOCK_MAINNET_4_BYTES),
+    ];
+    let mut fixture = spawn_test_reactor(backfill_enabled_startup(&network, sync_start));
+    let peer_id = peer(97);
+
+    connect_peer(&fixture, peer_id.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_id.clone(),
+        block::Height(0),
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        10,
+    )
+    .await;
+    assert_eq!(
+        next_get_headers(&mut fixture.actions).await,
+        (block::Height(1), 3),
+    );
+
+    // Deliver and commit the genesis bracket.
+    let matching_roots = header_matching_roots(&network, block::Height(1), &headers[..3]);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: roots_message_from(block::Height(1), headers[..3].to_vec(), matching_roots),
+        })
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            next_non_query_action(&mut fixture.actions).await,
+            HeaderSyncAction::CommitHeaderRange { .. }
+        ) {
+            break;
+        }
+    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(1),
+            tip_height: block::Height(3),
+            tip_hash: block::Hash::from(headers[2].as_ref()),
+            tip_parent_hash: Some(block::Hash::from(headers[1].as_ref())),
+        })
+        .await
+        .unwrap();
+
+    // The frontier advance schedules the stitch next; the backfill commit must not move the
+    // forward frontier or produce body gaps.
+    loop {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots,
+                    },
+                ..
+            } => {
+                assert_eq!(
+                    start_height,
+                    block::Height(3),
+                    "stitch starts at sync start"
+                );
+                assert_eq!(count, 2, "stitch spans the sync start and its successor");
+                assert!(want_tree_aux_roots);
+                break;
+            }
+            HeaderSyncAction::HeaderAdvanced { .. } | HeaderSyncAction::BodyGaps { .. } => {
+                panic!("backfill commits must not move the forward frontier or emit body gaps")
+            }
+            _ => {}
+        }
+    }
+
+    // Deliver the stitch: the sync-start root is the sole confirmed root.
+    let stitch_roots = header_matching_roots(&network, block::Height(3), &headers[2..]);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_id.clone(),
+            msg: roots_message_from(block::Height(3), headers[2..].to_vec(), stitch_roots),
+        })
+        .await
+        .unwrap();
+    loop {
+        if let HeaderSyncAction::CommitHeaderRange {
+            start_height,
+            headers,
+            finalized,
+            backfill,
+            verified_roots,
+            ..
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(start_height, block::Height(3));
+            assert_eq!(headers.len(), 2);
+            assert!(!finalized, "the stitch end is not a checkpoint");
+            assert!(backfill);
+            let verified_roots = verified_roots.expect("the stitch carries verified roots");
+            assert_eq!(
+                verified_roots.confirmed_roots().len(),
+                1,
+                "exactly the sync-start root is confirmed"
+            );
+            assert_eq!(verified_roots.confirmed_roots()[0].height, block::Height(3));
+            break;
+        }
+    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(3),
+            tip_height: block::Height(4),
+            tip_hash: block::Hash::from(headers[3].as_ref()),
+            tip_parent_hash: Some(block::Hash::from(headers[2].as_ref())),
+        })
+        .await
+        .unwrap();
+
+    // The backfill is complete: no further below-sync-start `GetHeaders` may be scheduled.
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        if let HeaderSyncAction::SendMessage {
+            msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+            ..
+        } = action
+        {
+            panic!("backfill is complete, but a range was requested at {start_height:?}");
+        }
+    }
+}
+
+/// A late fanout delivery of an already-committed backfill bracket is dropped without dispatching
+/// the forward tree rebuild and without misbehavior.
+#[tokio::test(flavor = "current_thread")]
+async fn late_backfill_fanout_delivery_is_dropped_without_rebuild() {
+    let (network, sync_start) = backfill_fixture_network();
+    let headers = [
+        mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        mainnet_header(&BLOCK_MAINNET_2_BYTES),
+        mainnet_header(&BLOCK_MAINNET_3_BYTES),
+    ];
+    let mut fixture = spawn_test_reactor(backfill_enabled_startup(&network, sync_start));
+    let peer_a = peer(98);
+    let peer_b = peer(99);
+
+    // Peer B advertises a tip at the sync start, so it is eligible for the bracket but never for
+    // the stitch range (whose end is one above the sync start): its only in-flight work is the
+    // bracket this test makes late.
+    for (peer_id, tip) in [
+        (peer_a.clone(), block::Height(4)),
+        (peer_b.clone(), block::Height(3)),
+    ] {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            block::Height(0),
+            tip,
+            DEFAULT_HS_RANGE,
+            10,
+        )
+        .await;
+    }
+
+    // Wait until the bracket is in flight to both peers (request fanout).
+    let mut requested = std::collections::HashSet::new();
+    while requested.len() < 2 {
+        if let HeaderSyncAction::SendMessage {
+            peer,
+            msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+        } = next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(start_height, block::Height(1));
+            requested.insert(peer);
+        }
+    }
+
+    // Peer A answers and the bracket commits, advancing the backfill frontier.
+    let matching_roots = header_matching_roots(&network, block::Height(1), &headers);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_a,
+            msg: roots_message_from(block::Height(1), headers.to_vec(), matching_roots.clone()),
+        })
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            next_non_query_action(&mut fixture.actions).await,
+            HeaderSyncAction::CommitHeaderRange { .. }
+        ) {
+            break;
+        }
+    }
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(1),
+            tip_height: block::Height(3),
+            tip_hash: block::Hash::from(headers[2].as_ref()),
+            tip_parent_hash: Some(block::Hash::from(headers[1].as_ref())),
+        })
+        .await
+        .unwrap();
+
+    // Peer B's late delivery of the same bracket is dropped: no forward tree rebuild
+    // (`QueryBestHeaderHistoryTree`), no misbehavior, and no duplicate commit.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::WireMessage {
+            peer: peer_b,
+            msg: roots_message_from(block::Height(1), headers.to_vec(), matching_roots),
+        })
+        .await
+        .unwrap();
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        match action {
+            HeaderSyncAction::QueryBestHeaderHistoryTree { .. } => {
+                panic!("a late backfill delivery must not dispatch the forward tree rebuild")
+            }
+            HeaderSyncAction::Misbehavior { .. } => {
+                panic!("a late backfill fanout delivery is not misbehavior")
+            }
+            HeaderSyncAction::CommitHeaderRange { .. } => {
+                panic!("a late backfill fanout delivery must not re-commit")
+            }
+            _ => {}
         }
     }
 }

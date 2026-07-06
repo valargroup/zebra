@@ -161,7 +161,7 @@ async fn fuzz_one_slow_peer_hol() {
 /// Ignored in Phase 1: a faithful *mid-sync* `VerifiedReset` needs the real
 /// `Committer`'s epoch / lowest-reset-wins rollback semantics (re-verifying every
 /// height above the reset). `MockApplyFrontier` only mirrors part of that, so the
-/// re-sync stalls. The header-reanchor "large → small" path through the same
+/// re-sync stalls. The header-rebase "large → small" path through the same
 /// `handle_chain_tip_reset` IS covered by `fuzz_large_to_small`. This scenario is the
 /// validation target for the high-fidelity `Committer<MockVerifier>` tier.
 #[ignore = "needs high-fidelity Committer<MockVerifier> for mid-sync reorg epoch/reset semantics"]
@@ -677,8 +677,8 @@ async fn fuzz_churn_storm() {
     run_checked("fuzz_churn_storm", scenario, 32).await;
 }
 
-/// Large → small: the header target grows in steps, reanchors down below the current
-/// verified tip, then grows again to the full chain. Exercises header advance/reanchor
+/// Large → small: the header target grows in steps, rebases down below the current
+/// verified tip, then grows again to the full chain. Exercises header advance/rebase
 /// handling and uniform serve jitter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_large_to_small() {
@@ -716,7 +716,7 @@ async fn fuzz_large_to_small() {
         },
         TipEvent {
             at: Duration::from_millis(200),
-            kind: TipEventKind::HeaderReanchor(block::Height(250)),
+            kind: TipEventKind::HeaderRebase(block::Height(250)),
         },
         TipEvent {
             at: Duration::from_millis(280),

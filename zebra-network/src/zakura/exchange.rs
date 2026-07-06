@@ -53,8 +53,8 @@ pub enum FrontierChange {
     VerifiedReset,
     /// Best header target advanced.
     HeaderAdvanced,
-    /// Best header target was reanchored, possibly lower.
-    HeaderReanchored,
+    /// Best header target was rebased, possibly lower.
+    HeaderRebased,
 }
 
 /// Latest shared frontier plus the transition cause.
@@ -208,7 +208,7 @@ pub trait HeaderSyncStatePortImpl: Send + Sync + 'static {
     fn commit_header_range(
         &self,
         peer: ZakuraPeerId,
-        anchor: block::Hash,
+        link_hash: block::Hash,
         start_height: block::Height,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
@@ -218,8 +218,8 @@ pub trait HeaderSyncStatePortImpl: Send + Sync + 'static {
     /// Publish a locally accepted best-header advance.
     fn publish_best_header(&self, tip: Frontier) -> BoxFuture<'static, ()>;
 
-    /// Publish a best-header reanchor.
-    fn publish_header_reanchor(&self, old: Frontier, new: Frontier) -> BoxFuture<'static, ()>;
+    /// Publish a best-header rebase.
+    fn publish_header_rebase(&self, old: Frontier, new: Frontier) -> BoxFuture<'static, ()>;
 }
 
 /// Block-sync view of shared Zakura state.
@@ -284,14 +284,20 @@ impl HeaderSyncStatePort {
     pub fn commit_header_range(
         &self,
         peer: ZakuraPeerId,
-        anchor: block::Hash,
+        link_hash: block::Hash,
         start_height: block::Height,
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
         finalized: bool,
     ) -> BoxFuture<'static, Result<HeaderRangeCommit, HeaderSyncCommitFailureKind>> {
-        self.inner
-            .commit_header_range(peer, anchor, start_height, headers, body_sizes, finalized)
+        self.inner.commit_header_range(
+            peer,
+            link_hash,
+            start_height,
+            headers,
+            body_sizes,
+            finalized,
+        )
     }
 
     /// Publish a locally accepted best-header advance.
@@ -299,9 +305,9 @@ impl HeaderSyncStatePort {
         self.inner.publish_best_header(tip)
     }
 
-    /// Publish a best-header reanchor.
-    pub fn publish_header_reanchor(&self, old: Frontier, new: Frontier) -> BoxFuture<'static, ()> {
-        self.inner.publish_header_reanchor(old, new)
+    /// Publish a best-header rebase.
+    pub fn publish_header_rebase(&self, old: Frontier, new: Frontier) -> BoxFuture<'static, ()> {
+        self.inner.publish_header_rebase(old, new)
     }
 }
 
@@ -436,7 +442,7 @@ pub fn apply_frontier_update(
             }
             frontier.best_header = requested.frontier.best_header;
         }
-        FrontierChange::HeaderReanchored => {
+        FrontierChange::HeaderRebased => {
             if requested.frontier.best_header == current.frontier.best_header {
                 return None;
             }
@@ -464,7 +470,7 @@ fn frontier_change_label(change: FrontierChange) -> &'static str {
         FrontierChange::VerifiedGrow => "verified_grow",
         FrontierChange::VerifiedReset => "verified_reset",
         FrontierChange::HeaderAdvanced => "header_advanced",
-        FrontierChange::HeaderReanchored => "header_reanchored",
+        FrontierChange::HeaderRebased => "header_rebased",
     }
 }
 
@@ -687,7 +693,7 @@ mod tests {
                 frontier(3, 3),
                 frontier(3, 3),
                 frontier(13, 13),
-                FrontierChange::HeaderReanchored,
+                FrontierChange::HeaderRebased,
             ),
         ] {
             if let Some(updated) = apply_frontier_update(current, requested) {
@@ -719,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn header_reanchor_lowers_only_best_header() {
+    fn header_rebase_lowers_only_best_header() {
         let current = update(
             frontier(5, 5),
             frontier(8, 8),
@@ -730,10 +736,10 @@ mod tests {
             frontier(1, 1),
             frontier(2, 2),
             frontier(9, 9),
-            FrontierChange::HeaderReanchored,
+            FrontierChange::HeaderRebased,
         );
 
-        let updated = apply_frontier_update(current, requested).expect("reanchor is accepted");
+        let updated = apply_frontier_update(current, requested).expect("rebase is accepted");
 
         assert_eq!(updated.frontier.finalized, frontier(5, 5));
         assert_eq!(updated.frontier.verified_body, frontier(8, 8));

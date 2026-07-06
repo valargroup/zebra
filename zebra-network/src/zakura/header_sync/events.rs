@@ -21,7 +21,7 @@ pub struct HeaderSyncFrontiers {
     pub verified_block_hash: block::Hash,
 }
 
-/// Where to reanchor the header frontier after a lazy history-tree rebuild whose durable header-root
+/// Where to rebase the header frontier after a lazy history-tree rebuild whose durable header-root
 /// frontier folded *below* `best_header_tip - 1` (a gap left by a non-Zakura commit racing ahead).
 ///
 /// Mirrors the startup resume: the rebuilt tree sits at `parent_hash` (the confirmed frontier), and
@@ -29,13 +29,13 @@ pub struct HeaderSyncFrontiers {
 /// Without this the header tip would stay above the tree and every forward range would re-trigger the
 /// identical rebuild forever.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct HeaderFrontierReanchor {
+pub struct HeaderFrontierRebase {
     /// Height to resume the header frontier at — one above the confirmed frontier (`frontier + 1`).
     pub tip: block::Height,
     /// Hash of the resume header at `tip`.
     pub tip_hash: block::Hash,
     /// Hash of the confirmed header-root frontier at `tip - 1`; the rebuilt tree sits here, and it is
-    /// the overlap anchor for the resumed forward range.
+    /// the overlap link target for the resumed forward range.
     pub parent_hash: block::Hash,
 }
 
@@ -44,8 +44,8 @@ pub struct HeaderFrontierReanchor {
 pub struct HeaderSyncStartup {
     /// Active network.
     pub network: Network,
-    /// Trusted anchor height and hash.
-    pub anchor: (block::Height, block::Hash),
+    /// Trusted sync-start height and hash.
+    pub trusted_sync_start: (block::Height, block::Hash),
     /// Cached state frontiers at startup.
     pub frontiers: HeaderSyncFrontiers,
     /// Durable best header tip loaded from storage at startup.
@@ -82,13 +82,16 @@ pub struct HeaderSyncStartup {
     pub range_state_actions_enabled: bool,
     /// Enables relaying inbound `NewBlock` messages after local block acceptance is wired.
     pub inbound_new_block_acceptance_enabled: bool,
+    /// Enables the below-sync-start forward backfill (headers + verified roots below the trusted
+    /// sync start). Defaults to the dormant production constant; tests opt in per fixture.
+    pub backfill_enabled: bool,
 }
 
 impl HeaderSyncStartup {
     /// Build a startup config from the active network and durable/frontier facts.
     pub fn new(
         network: Network,
-        anchor: (block::Height, block::Hash),
+        trusted_sync_start: (block::Height, block::Hash),
         frontiers: HeaderSyncFrontiers,
         best_header_tip: Option<(block::Height, block::Hash)>,
         config: ZakuraHeaderSyncConfig,
@@ -97,7 +100,7 @@ impl HeaderSyncStartup {
         let last_checkpoint_height = network.checkpoint_list().max_height();
         Self {
             network,
-            anchor,
+            trusted_sync_start,
             frontiers,
             best_header_tip,
             best_header_parent_hash: None,
@@ -112,6 +115,7 @@ impl HeaderSyncStartup {
             shutdown: CancellationToken::new(),
             range_state_actions_enabled: false,
             inbound_new_block_acceptance_enabled: false,
+            backfill_enabled: super::state::BELOW_SYNC_START_BACKFILL_ENABLED,
         }
     }
 }
@@ -283,11 +287,11 @@ pub enum HeaderSyncEvent {
         /// Best header tip the reload was requested against, used as a staleness guard: the tree is
         /// only installed if the reactor tip has not moved since the query was dispatched.
         best_header_tip: block::Height,
-        /// Where to reanchor the header frontier, or `None` when no reanchor is needed (the tree
+        /// Where to rebase the header frontier, or `None` when no rebase is needed (the tree
         /// folded to `best_header_tip - 1`, the common no-gap case) or the rebuild failed. `Some` when
         /// the durable header-root frontier folded *below* `best_header_tip - 1` — a gap left by a
         /// non-Zakura commit — so the tip must drop onto the rebuilt tree to make progress.
-        reanchor: Option<HeaderFrontierReanchor>,
+        rebase: Option<HeaderFrontierRebase>,
         /// History tree reconstructed by state; `None` on failure.
         history_tree: Option<Arc<HistoryTree>>,
     },
@@ -382,8 +386,8 @@ pub enum HeaderSyncAction {
     CommitHeaderRange {
         /// Peer that supplied the range.
         peer: ZakuraPeerId,
-        /// Parent anchor hash for the first header.
-        anchor: block::Hash,
+        /// Hash the first header must link to (the parent of `start_height`).
+        link_hash: block::Hash,
         /// First header height.
         start_height: block::Height,
         /// Headers to commit. This is an output payload, not reactor state.
@@ -392,14 +396,18 @@ pub enum HeaderSyncAction {
         body_sizes: Vec<u32>,
         /// Header-layer verified commitment roots for the confirmed prefix of `headers`.
         ///
-        /// `Some` only for below-checkpoint forward ranges (the confirmed prefix is persisted).
-        /// `None` for checkpoint-authenticated backward backfill ranges (they fold onto the previous
-        /// checkpoint's tree, not the forward frontier) and for above-checkpoint forward ranges (past
-        /// the VCT handoff boundary, where roots are neither requested nor needed). Both persist no
-        /// roots.
+        /// `Some` for every root-carrying range — below-checkpoint forward and below-sync-start
+        /// backfill alike (the confirmed prefix is persisted). `None` only for plain
+        /// above-checkpoint forward ranges (past the VCT handoff boundary, where roots are
+        /// neither requested nor needed), which persist no roots.
         verified_roots: Option<Box<VerifiedHeaderCommitmentRoots>>,
         /// Whether the range is expected to be finalized by checkpoint policy.
         finalized: bool,
+        /// Whether the range was issued by the below-sync-start backfill cursor.
+        ///
+        /// Backfill commits persist headers and roots like forward commits, but must not move
+        /// the shared sync-exchange header frontier below the trusted sync start.
+        backfill: bool,
     },
     /// Ask state to rebuild the header-frontier history tree at the current best header tip.
     ///
@@ -451,8 +459,8 @@ pub enum HeaderSyncAction {
         /// New best-header target hash.
         hash: block::Hash,
     },
-    /// Notify production wiring that header sync re-anchored its best header target.
-    HeaderReanchored {
+    /// Notify production wiring that header sync rebased its best header target.
+    HeaderRebased {
         /// Previous best-header target.
         old: (block::Height, block::Hash),
         /// New best-header target.

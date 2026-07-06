@@ -463,7 +463,7 @@ impl SequencerTask {
             && reset_tip_matches_local_work
             && self
                 .has_active_successor_after(frontiers.verified_block_tip, peer_has_successor_after)
-            && self.active_successor_links_to_anchor(
+            && self.active_successor_links_to_hash(
                 frontiers.verified_block_tip,
                 frontiers.verified_block_hash,
             )
@@ -701,10 +701,10 @@ impl SequencerTask {
         self.sequencer.has_buffered_at_or_above(next) || peer_has_successor_after
     }
 
-    fn active_successor_links_to_anchor(
+    fn active_successor_links_to_hash(
         &self,
         height: block::Height,
-        anchor_hash: block::Hash,
+        link_hash: block::Hash,
     ) -> bool {
         let Some(next) = next_height(height) else {
             return true;
@@ -712,7 +712,7 @@ impl SequencerTask {
 
         self.sequencer
             .applying_previous_block_hash(next)
-            .map(|previous_block_hash| previous_block_hash == anchor_hash)
+            .map(|previous_block_hash| previous_block_hash == link_hash)
             .unwrap_or(true)
     }
 

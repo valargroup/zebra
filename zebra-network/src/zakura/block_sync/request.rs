@@ -27,7 +27,7 @@ pub enum BlockSizeEstimate {
 pub(super) struct BlockRangeRequest {
     pub(super) start_height: block::Height,
     pub(super) count: u32,
-    pub(super) anchor_hash: block::Hash,
+    pub(super) link_hash: block::Hash,
     /// The reserved byte total for this request (released on
     /// timeout/disconnect/send-failure). Equal to the sum of the per-height size
     /// estimates in `expected_blocks`.

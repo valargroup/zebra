@@ -317,7 +317,7 @@ fn spawn_action_driver(
     })
 }
 
-/// Publishes the scenario's timed frontier changes (header growth / reanchor /
+/// Publishes the scenario's timed frontier changes (header growth / rebase /
 /// verified reset) into the shared sync exchange, driving the node's download target.
 fn spawn_timeline_driver(
     exchange: ZakuraSyncExchange,
@@ -370,9 +370,9 @@ fn apply_tip_event(
             frontier.best_header = Frontier::new(height, corpus_hash(corpus, height));
             (frontier, FrontierChange::HeaderAdvanced)
         }
-        TipEventKind::HeaderReanchor(height) => {
+        TipEventKind::HeaderRebase(height) => {
             frontier.best_header = Frontier::new(height, corpus_hash(corpus, height));
-            (frontier, FrontierChange::HeaderReanchored)
+            (frontier, FrontierChange::HeaderRebased)
         }
         TipEventKind::VerifiedReset(height) => {
             frontier.verified_body = Frontier::new(height, corpus_hash(corpus, height));

@@ -2799,18 +2799,21 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         config.zakura.bootstrap_peers.len(),
         supervisor.subscribe(),
     )?;
-    let anchor = config.zakura.header_sync.anchor(&config.network)?;
+    let trusted_sync_start = config
+        .zakura
+        .header_sync
+        .trusted_sync_start(&config.network)?;
     let frontiers = header_sync_driver_startup.as_ref().map_or(
         HeaderSyncFrontiers {
-            finalized_height: anchor.0,
-            verified_block_tip: anchor.0,
-            verified_block_hash: anchor.1,
+            finalized_height: trusted_sync_start.0,
+            verified_block_tip: trusted_sync_start.0,
+            verified_block_hash: trusted_sync_start.1,
         },
         |startup| startup.frontiers,
     );
     let best_header_tip = header_sync_driver_startup
         .as_ref()
-        .map_or(Some(anchor), |startup| startup.best_header_tip);
+        .map_or(Some(trusted_sync_start), |startup| startup.best_header_tip);
     let best_header_parent_hash = header_sync_driver_startup
         .as_ref()
         .and_then(|startup| startup.best_header_parent_hash);
@@ -2819,7 +2822,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
         .map(|startup| startup.best_header_history_tree.clone())
         .unwrap_or_else(|| Arc::new(HistoryTree::default()));
     let sync_frontier = header_sync_driver_startup.as_ref().map(|driver_startup| {
-        let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+        let best_header_tip = driver_startup.best_header_tip.unwrap_or(trusted_sync_start);
         let initial = FrontierUpdate {
             frontier: crate::zakura::chain_frontier_from_parts(
                 driver_startup.frontiers.finalized_height,
@@ -2835,7 +2838,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     });
     let mut startup = HeaderSyncStartup::new(
         config.network.clone(),
-        anchor,
+        trusted_sync_start,
         frontiers,
         best_header_tip,
         config.zakura.header_sync.clone(),
@@ -2858,7 +2861,7 @@ pub async fn spawn_zakura_endpoint_with_header_sync_driver(
     let block_sync_driver_enabled = header_sync_driver_startup.is_some();
     let (block_sync, block_sync_actions, block_sync_task) =
         if let Some(driver_startup) = header_sync_driver_startup.as_ref() {
-            let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+            let best_header_tip = driver_startup.best_header_tip.unwrap_or(trusted_sync_start);
             let frontier_updates = sync_frontier
                 .as_ref()
                 .expect("sync frontier is initialized when block sync driver is enabled")
@@ -5428,16 +5431,16 @@ mod tests {
 
     fn header_sync_startup(shutdown: CancellationToken) -> HeaderSyncStartup {
         let network = Network::Mainnet;
-        let anchor = (block::Height(0), network.genesis_hash());
+        let trusted_sync_start = (block::Height(0), network.genesis_hash());
         let mut startup = HeaderSyncStartup::new(
             network,
-            anchor,
+            trusted_sync_start,
             HeaderSyncFrontiers {
-                finalized_height: anchor.0,
-                verified_block_tip: anchor.0,
-                verified_block_hash: anchor.1,
+                finalized_height: trusted_sync_start.0,
+                verified_block_tip: trusted_sync_start.0,
+                verified_block_hash: trusted_sync_start.1,
             },
-            Some(anchor),
+            Some(trusted_sync_start),
             ZakuraHeaderSyncConfig::default(),
             LOCAL_MAX_MESSAGE_BYTES,
         );
@@ -5458,7 +5461,7 @@ mod tests {
         HeaderSyncStatus {
             tip_height: block::Height(0),
             tip_hash: network.genesis_hash(),
-            anchor_height: block::Height(0),
+            sync_start_height: block::Height(0),
             ..HeaderSyncStatus::default()
         }
     }

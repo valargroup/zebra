@@ -1033,7 +1033,7 @@ mod bbr_tests {
                 request: BlockRangeRequest {
                     start_height: block::Height(0),
                     count: 1,
-                    anchor_hash: block::Hash([0; 32]),
+                    link_hash: block::Hash([0; 32]),
                     estimated_bytes: 0,
                     expected_blocks: Vec::new(),
                 },
@@ -1137,7 +1137,7 @@ mod bbr_tests {
                 request: BlockRangeRequest {
                     start_height: height,
                     count: 1,
-                    anchor_hash: block::Hash([0; 32]),
+                    link_hash: block::Hash([0; 32]),
                     estimated_bytes: bytes_each,
                     expected_blocks: vec![ExpectedBlock {
                         height,
