@@ -457,6 +457,44 @@ async fn mempool_service_stays_enabled_when_legacy_sync_status_falls_behind() ->
     Ok(())
 }
 
+/// Check that a disabled mempool does not consume the latest tip action until
+/// legacy sync status says Zebra is close enough to activate it.
+///
+/// Regression test: `poll_ready()` used to call `last_tip_change()` before
+/// checking the initial-activation gate. If Zebra was still far from tip, that
+/// consumed the only available tip action and left the disabled mempool unable
+/// to activate when sync status later caught up without another tip change.
+#[tokio::test]
+async fn disabled_mempool_keeps_tip_action_until_legacy_sync_catches_up() -> Result<(), Report> {
+    let network = Network::Mainnet;
+
+    let (
+        mut service,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+
+    assert!(!service.is_enabled());
+
+    // Poll while legacy sync discovery says Zebra is far from tip. The mempool
+    // must remain disabled, but it must not consume the latest chain-tip action.
+    SyncStatus::sync_far_from_tip(&mut recent_syncs);
+    service.dummy_call().await;
+    assert!(!service.is_enabled());
+
+    // Now catch up without committing another block. The same tip action should
+    // still be available for initial activation.
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    service.dummy_call().await;
+    assert!(service.is_enabled());
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mempool_cancel_mined() -> Result<(), Report> {
     let block1: Arc<Block> = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
