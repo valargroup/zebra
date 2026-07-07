@@ -39,6 +39,8 @@ use crate::service::{
     non_finalized_state::Chain,
 };
 
+#[cfg(test)]
+mod switch_orchestration_tests;
 mod vct_write;
 
 use vct_write::VctWriteManager;

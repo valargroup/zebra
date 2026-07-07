@@ -172,6 +172,72 @@ pub(crate) fn fabricate_body(fab: &FabHeader) -> Arc<Block> {
     Arc::new(block)
 }
 
+/// Like [`fabricate_body`], but with the coinbase rebuilt as a V4 transaction,
+/// since the non-finalized state rejects pre-Sapling transaction versions
+/// ("older transaction versions only exist in finalized blocks").
+pub(crate) fn fabricate_v4_body(fab: &FabHeader) -> Arc<Block> {
+    let template = fabricate_body(fab);
+    let mut block = Block::clone(&template);
+
+    let old_tx = block.transactions.remove(0);
+    let (inputs, outputs, lock_time) = match &*old_tx {
+        zebra_chain::transaction::Transaction::V1 {
+            inputs,
+            outputs,
+            lock_time,
+        } => (inputs.clone(), outputs.clone(), *lock_time),
+        _ => panic!("template coinbase is V1"),
+    };
+    block.transactions.insert(
+        0,
+        Arc::new(zebra_chain::transaction::Transaction::V4 {
+            inputs,
+            outputs,
+            lock_time,
+            expiry_height: Height(0),
+            joinsplit_data: None,
+            sapling_shielded_data: None,
+        }),
+    );
+
+    Arc::new(block)
+}
+
+/// A test network whose upgrades all activate far above the fabricated heights.
+///
+/// Non-finalized commits then run in the pre-Heartwood regime: the history
+/// tree stays empty, the header commitment field parses as
+/// `PreSaplingReserved`, and no chain-history check runs — fabricated bodies
+/// pass the non-finalized contextual validation. The header store side is
+/// unaffected: its checkpoint handling is per-height hash equality, so the
+/// unreachable high checkpoint (which satisfies the builder's
+/// mandatory-checkpoint coverage) changes nothing at test heights.
+pub(crate) fn pre_heartwood_test_network(genesis_hash: block::Hash) -> Network {
+    use zebra_chain::parameters::{testnet, Network::Mainnet};
+
+    testnet::Parameters::build()
+        .with_network_name("HeaderReorgNfTest")
+        .expect("test network name is valid")
+        .with_genesis_hash(genesis_hash)
+        .expect("test genesis hash is valid")
+        .with_target_difficulty_limit(Mainnet.target_difficulty_limit())
+        .expect("mainnet difficulty limit is valid for test network")
+        .with_activation_heights(testnet::ConfiguredActivationHeights {
+            canopy: Some(200_000),
+            ..Default::default()
+        })
+        .expect("test activation heights are valid")
+        .clear_funding_streams()
+        .with_checkpoints(testnet::ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (Height(0), genesis_hash),
+            // Covers the canopy mandatory checkpoint; never reached by tests.
+            (Height(199_999), block::Hash([0xCC; 32])),
+        ]))
+        .expect("high dummy checkpoint coverage is valid")
+        .to_network()
+        .expect("test network is valid")
+}
+
 /// Sums the work of a fabricated header run.
 pub(crate) fn total_work(headers: &[FabHeader]) -> PartialCumulativeWork {
     let mut total = PartialCumulativeWork::zero();

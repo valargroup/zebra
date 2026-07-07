@@ -3,7 +3,11 @@
 //! These helpers are used by both the fixed test vectors (`vectors.rs`) and the
 //! header-store coherence harness (`header_store_coherence`).
 
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use zebra_chain::{
     block::{self, Block, Height},
@@ -24,7 +28,7 @@ use crate::{
 };
 
 /// Returns an ephemeral or configured state database with `genesis` committed as a full block.
-pub(super) fn state_with_genesis_config(
+pub(crate) fn state_with_genesis_config(
     network: &Network,
     genesis: Arc<Block>,
     config: Config,
@@ -47,7 +51,7 @@ pub(super) fn state_with_genesis_config(
 }
 
 /// Returns a persistent state config rooted at `cache_dir`, for close-and-reopen tests.
-pub(super) fn persistent_config(cache_dir: &Path) -> Config {
+pub(crate) fn persistent_config(cache_dir: &Path) -> Config {
     Config {
         cache_dir: cache_dir.to_owned(),
         ephemeral: false,
@@ -57,7 +61,7 @@ pub(super) fn persistent_config(cache_dir: &Path) -> Config {
 }
 
 /// Opens (or reopens) a persistent state database from `config`.
-pub(super) fn persistent_state(config: &Config, network: &Network) -> ZebraDb {
+pub(crate) fn persistent_state(config: &Config, network: &Network) -> ZebraDb {
     ZebraDb::new(
         config,
         STATE_DATABASE_KIND,
@@ -73,7 +77,7 @@ pub(super) fn persistent_state(config: &Config, network: &Network) -> ZebraDb {
 
 /// Returns a configured testnet with only the implicit genesis checkpoint, so header
 /// commits above genesis take the contextual validation path.
-pub(super) fn no_extra_checkpoint_test_network(genesis_hash: block::Hash) -> Network {
+pub(crate) fn no_extra_checkpoint_test_network(genesis_hash: block::Hash) -> Network {
     testnet::Parameters::build()
         .with_network_name("HeaderReorgTest")
         .expect("test network name is valid")
@@ -94,7 +98,7 @@ pub(super) fn no_extra_checkpoint_test_network(genesis_hash: block::Hash) -> Net
 }
 
 /// Deserializes the mainnet test vector block at `height`.
-pub(super) fn mainnet_block(height: u32) -> Arc<Block> {
+pub(crate) fn mainnet_block(height: u32) -> Arc<Block> {
     MAINNET_BLOCKS
         .get(&height)
         .expect("test vector exists")
@@ -104,7 +108,7 @@ pub(super) fn mainnet_block(height: u32) -> Arc<Block> {
 
 /// Fabricates provisional commitment roots for `height`, with the zeroed
 /// auth-data root marking them as unverified.
-pub(super) fn root_at(height: Height) -> BlockCommitmentRoots {
+pub(crate) fn root_at(height: Height) -> BlockCommitmentRoots {
     BlockCommitmentRoots {
         height,
         sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
@@ -118,7 +122,7 @@ pub(super) fn root_at(height: Height) -> BlockCommitmentRoots {
 }
 
 /// Commits a header range through the production write path, panicking on rejection.
-pub(super) fn commit_header_range(
+pub(crate) fn commit_header_range(
     state: &ZebraDb,
     anchor: block::Hash,
     headers: &[Arc<block::Header>],
@@ -136,7 +140,7 @@ pub(super) fn commit_header_range(
 
 /// Commits `block`'s header and transaction data (the body-commit batch shape),
 /// without treestates or value pools.
-pub(super) fn write_full_block_header_and_transactions(state: &ZebraDb, block: Arc<Block>) {
+pub(crate) fn write_full_block_header_and_transactions(state: &ZebraDb, block: Arc<Block>) {
     let checkpoint_verified = CheckpointVerifiedBlock::from(block);
     let finalized =
         FinalizedBlock::from_checkpoint_verified(checkpoint_verified, Treestate::default());
@@ -146,4 +150,87 @@ pub(super) fn write_full_block_header_and_transactions(state: &ZebraDb, block: A
         .prepare_block_header_and_transaction_data_batch(state, &finalized, true, None)
         .expect("full block header and transaction batch is valid");
     state.db.write(batch).expect("full block batch writes");
+}
+
+/// A minimal local metrics recorder capturing counter increments by name.
+#[derive(Clone, Default)]
+pub(crate) struct CounterCapture(Arc<Mutex<HashMap<String, u64>>>);
+
+impl CounterCapture {
+    pub(crate) fn get(&self, name: &str) -> u64 {
+        self.0
+            .lock()
+            .expect("counter capture lock is never poisoned")
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+struct CaptureHandle {
+    name: String,
+    store: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl metrics::CounterFn for CaptureHandle {
+    fn increment(&self, value: u64) {
+        *self
+            .store
+            .lock()
+            .expect("counter capture lock is never poisoned")
+            .entry(self.name.clone())
+            .or_insert(0) += value;
+    }
+
+    fn absolute(&self, value: u64) {
+        self.store
+            .lock()
+            .expect("counter capture lock is never poisoned")
+            .insert(self.name.clone(), value);
+    }
+}
+
+impl metrics::Recorder for CounterCapture {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        metrics::Counter::from_arc(Arc::new(CaptureHandle {
+            name: key.name().to_string(),
+            store: self.0.clone(),
+        }))
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
 }

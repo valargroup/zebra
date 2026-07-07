@@ -27,8 +27,8 @@
 //! (`insert_zakura_header_commitment_roots`), `rollback_finalized_state`, and
 //! pruning.
 
-mod audit;
-mod fabricate;
+pub(crate) mod audit;
+pub(crate) mod fabricate;
 mod ops;
 mod oracle;
 mod primitive;

@@ -18,11 +18,6 @@
 //! - the `state.zakura.header_store.incoherent` metric is emitted exactly
 //!   when a repair runs.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
-
 use zebra_chain::block::Height;
 
 use super::super::super::startup_audit::ZakuraStoreViolation;
@@ -31,6 +26,7 @@ use super::super::super::{
 };
 use super::super::common::{
     commit_header_range, persistent_config, persistent_state, state_with_genesis_config,
+    CounterCapture,
 };
 use super::{
     audit::{audit_store, dump_store, StoreDump},
@@ -418,89 +414,6 @@ fn startup_heal_unblocks_linkage_verified_reads() {
     commit_header_range(&state, universe.trunk_at(29).hash, &redelivered);
     assert_eq!(dump_store(&state), original);
     assert_clean(&state);
-}
-
-/// A minimal local metrics recorder capturing counter increments by name.
-#[derive(Clone, Default)]
-struct CounterCapture(Arc<Mutex<HashMap<String, u64>>>);
-
-impl CounterCapture {
-    fn get(&self, name: &str) -> u64 {
-        self.0
-            .lock()
-            .expect("counter capture lock is never poisoned")
-            .get(name)
-            .copied()
-            .unwrap_or(0)
-    }
-}
-
-struct CaptureHandle {
-    name: String,
-    store: Arc<Mutex<HashMap<String, u64>>>,
-}
-
-impl metrics::CounterFn for CaptureHandle {
-    fn increment(&self, value: u64) {
-        *self
-            .store
-            .lock()
-            .expect("counter capture lock is never poisoned")
-            .entry(self.name.clone())
-            .or_insert(0) += value;
-    }
-
-    fn absolute(&self, value: u64) {
-        self.store
-            .lock()
-            .expect("counter capture lock is never poisoned")
-            .insert(self.name.clone(), value);
-    }
-}
-
-impl metrics::Recorder for CounterCapture {
-    fn describe_counter(
-        &self,
-        _: metrics::KeyName,
-        _: Option<metrics::Unit>,
-        _: metrics::SharedString,
-    ) {
-    }
-
-    fn describe_gauge(
-        &self,
-        _: metrics::KeyName,
-        _: Option<metrics::Unit>,
-        _: metrics::SharedString,
-    ) {
-    }
-
-    fn describe_histogram(
-        &self,
-        _: metrics::KeyName,
-        _: Option<metrics::Unit>,
-        _: metrics::SharedString,
-    ) {
-    }
-
-    fn register_counter(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
-        metrics::Counter::from_arc(Arc::new(CaptureHandle {
-            name: key.name().to_string(),
-            store: self.0.clone(),
-        }))
-    }
-
-    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
-        metrics::Gauge::noop()
-    }
-
-    fn register_histogram(
-        &self,
-        _: &metrics::Key,
-        _: &metrics::Metadata<'_>,
-    ) -> metrics::Histogram {
-        metrics::Histogram::noop()
-    }
 }
 
 /// The `state.zakura.header_store.incoherent` metric fires exactly when a
