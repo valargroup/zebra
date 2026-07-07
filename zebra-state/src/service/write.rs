@@ -146,10 +146,16 @@ fn commit_header_range(
             &tree_aux_roots,
         )
         .and_then(|hash| {
+            let zakura_replaced_rows = batch.zakura_suffix_replaced_rows();
             finalized_state
                 .db
                 .write_batch(batch)
-                .map(|()| hash)
+                .map(|()| {
+                    finalized_state
+                        .db
+                        .audit_zakura_header_store_after_reorg(zakura_replaced_rows);
+                    hash
+                })
                 .map_err(|error| {
                     tracing::error!(?error, "failed to write validated header range");
 

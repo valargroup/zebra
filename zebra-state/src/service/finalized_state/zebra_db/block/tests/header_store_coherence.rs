@@ -31,6 +31,7 @@ mod audit;
 mod fabricate;
 mod ops;
 mod oracle;
+mod primitive;
 mod prop;
 mod reads;
 mod scenarios;
