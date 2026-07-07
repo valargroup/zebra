@@ -238,6 +238,12 @@ impl ZebraDb {
             && body_size_heights.is_empty()
             && provisional_root_heights.is_empty()
         {
+            // Log the pass so operators can verify the audit ran on this boot.
+            tracing::info!(
+                ?finalized_tip,
+                frontier_rows = 0,
+                "zakura header store passed its startup coherence audit (empty frontier)"
+            );
             return Ok(None);
         }
 
@@ -403,6 +409,14 @@ impl ZebraDb {
         }
 
         if violations.is_empty() {
+            // Log the pass so operators can verify the audit ran on this boot
+            // (the fleet soak requires observing it finding nothing).
+            tracing::info!(
+                ?finalized_tip,
+                ?last_coherent,
+                frontier_rows = hashes.len(),
+                "zakura header store passed its startup coherence audit"
+            );
             return Ok(None);
         }
 
