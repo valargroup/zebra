@@ -175,13 +175,12 @@ impl ZebraDb {
             )
         }
 
-        // Audit the zakura header store's on-disk invariants and truncate any
-        // incoherent suffix, so a store corrupted by an earlier binary
-        // self-heals at startup instead of wedging header sync (headers are
-        // re-fetchable, so correctness beats preserved rows). Read-only
-        // instances cannot repair; their reads surface any corruption as
-        // explicit `StoreIncoherentError`s instead.
-        if !read_only {
+        // Optionally audit the zakura header store's on-disk invariants and
+        // truncate any incoherent suffix. This can scan a large header frontier
+        // while syncing from genesis, so operators opt in when they need a
+        // startup repair. Read-only instances cannot repair; their reads surface
+        // any corruption as explicit `StoreIncoherentError`s instead.
+        if !read_only && config.repair_zakura_header_store_on_startup {
             db.audit_and_repair_zakura_header_store()
                 .expect("startup header-store repair write failed: RocksDB is unavailable");
         }
