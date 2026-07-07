@@ -252,18 +252,19 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .await
                 {
                     Ok(committed_hash) if committed_hash == hash => {
-                        // A contextually valid block also commits when it lands
-                        // on a side chain, but only a best-chain block may
-                        // advance the header/verified frontiers or be forwarded
-                        // to peers: gossiping side-chain blocks makes the whole
-                        // Zakura layer follow a losing branch while the node's
-                        // own chain stays honest, stranding zakura-only peers.
+                        // A contextually valid block also commits when it does
+                        // not land on the best chain, but only a best-chain
+                        // block may advance the header/verified frontiers or be
+                        // forwarded to peers: gossiping non-best-chain blocks
+                        // makes the whole Zakura layer follow a losing branch
+                        // while the node's own chain stays honest, stranding
+                        // zakura-only peers.
                         let on_best_chain =
                             new_block_is_on_best_chain(read_state.clone(), hash).await;
                         let result_label = if on_best_chain {
                             "accepted"
                         } else {
-                            "accepted_side_chain"
+                            "accepted_non_best_chain"
                         };
                         trace_header_commit_finish(
                             &trace,
@@ -279,7 +280,7 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                             if on_best_chain {
                                 "new_block_accepted"
                             } else {
-                                "new_block_accepted_side_chain"
+                                "new_block_accepted_non_best_chain"
                             },
                             Some(&peer),
                             height,
@@ -298,10 +299,10 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                 ?peer,
                                 ?height,
                                 ?hash,
-                                "Zakura NewBlock committed to a side chain; \
+                                "Zakura NewBlock did not land on the best chain; \
                                  not advancing frontiers or forwarding"
                             );
-                            HeaderSyncEvent::NewBlockAcceptedSideChain { peer, height, hash }
+                            HeaderSyncEvent::NewBlockAcceptedNonBestChain { peer, height, hash }
                         };
                         let _ = handles.header_sync.send(event).await;
                     }

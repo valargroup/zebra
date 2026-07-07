@@ -186,17 +186,17 @@ pub enum HeaderSyncEvent {
         hash: block::Hash,
     },
     /// The node's block pipeline accepted an inbound `NewBlock` body, but it
-    /// committed to a side chain instead of the best chain. The block is
-    /// remembered for dedup only: a side-chain block must not advance the
-    /// header or verified frontiers and must not be forwarded to peers, or
-    /// the whole Zakura layer gossips a losing branch while the node's own
-    /// chain stays on the best one.
-    NewBlockAcceptedSideChain {
+    /// did not land on the best chain. The block is remembered for dedup only:
+    /// a non-best-chain block must not advance the header or verified
+    /// frontiers and must not be forwarded to peers, or the whole Zakura layer
+    /// gossips a losing branch while the node's own chain stays on the best
+    /// one.
+    NewBlockAcceptedNonBestChain {
         /// Source peer.
         peer: ZakuraPeerId,
-        /// Accepted side-chain block height.
+        /// Accepted non-best-chain block height.
         height: block::Height,
-        /// Accepted side-chain block hash.
+        /// Accepted non-best-chain block hash.
         hash: block::Hash,
     },
     /// The node's block pipeline rejected an inbound `NewBlock` body.
@@ -291,7 +291,7 @@ impl HeaderSyncEvent {
             Self::FullBlockCommitted { .. } => "full_block_committed",
             Self::NewBlockAccepted { .. } => "new_block_accepted",
             Self::NewBlockDuplicate { .. } => "new_block_duplicate",
-            Self::NewBlockAcceptedSideChain { .. } => "new_block_accepted_side_chain",
+            Self::NewBlockAcceptedNonBestChain { .. } => "new_block_accepted_non_best_chain",
             Self::NewBlockRejected { .. } => "new_block_rejected",
             Self::WireMessage { .. } => "wire_message",
             Self::WireDecodeFailed { .. } => "wire_decode_failed",

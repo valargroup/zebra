@@ -2904,7 +2904,7 @@ async fn inbound_unseen_valid_new_block_is_seen_and_forwarded_to_eligible_peers(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn accepted_side_chain_new_block_is_deduped_without_advancing_or_forwarding() {
+async fn accepted_non_best_chain_new_block_is_deduped_without_advancing_or_forwarding() {
     let network = Network::Mainnet;
     let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let hash = block.hash();
@@ -2932,7 +2932,7 @@ async fn accepted_side_chain_new_block_is_deduped_without_advancing_or_forwardin
 
     fixture
         .handle
-        .send(HeaderSyncEvent::NewBlockAcceptedSideChain {
+        .send(HeaderSyncEvent::NewBlockAcceptedNonBestChain {
             peer: source.clone(),
             height,
             hash,
@@ -2940,7 +2940,7 @@ async fn accepted_side_chain_new_block_is_deduped_without_advancing_or_forwardin
         .await
         .unwrap();
 
-    // A side-chain accept advances no frontier and forwards nothing.
+    // A non-best-chain accept advances no frontier and forwards nothing.
     while let Ok(Some(action)) = tokio::time::timeout(
         std::time::Duration::from_millis(200),
         fixture.actions.recv(),
@@ -2953,7 +2953,7 @@ async fn accepted_side_chain_new_block_is_deduped_without_advancing_or_forwardin
                 | HeaderSyncAction::HeaderAdvanced { .. }
                 | HeaderSyncAction::HeaderReanchored { .. }
         ) {
-            panic!("side-chain accept must not advance frontiers or forward: {action:?}");
+            panic!("non-best-chain accept must not advance frontiers or forward: {action:?}");
         }
     }
     assert_eq!(fixture.handle.best_header_tip(), anchor);
@@ -2961,7 +2961,7 @@ async fn accepted_side_chain_new_block_is_deduped_without_advancing_or_forwardin
         tokio::time::timeout(std::time::Duration::from_millis(50), tip.changed())
             .await
             .is_err(),
-        "side-chain accept must not publish a new best header tip"
+        "non-best-chain accept must not publish a new best header tip"
     );
 
     // The hash is remembered: a later wire NewBlock for it dedups without
@@ -2986,7 +2986,7 @@ async fn accepted_side_chain_new_block_is_deduped_without_advancing_or_forwardin
                 | HeaderSyncAction::ForwardNewBlock { .. }
                 | HeaderSyncAction::Misbehavior { .. }
         ) {
-            panic!("seen side-chain block must be cheap-deduped without scoring: {action:?}");
+            panic!("seen non-best-chain block must be cheap-deduped without scoring: {action:?}");
         }
     }
 }

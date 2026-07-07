@@ -171,8 +171,8 @@ impl HeaderSyncReactor {
             HeaderSyncEvent::NewBlockDuplicate { peer, height, hash } => {
                 self.handle_new_block_duplicate(peer, height, hash)
             }
-            HeaderSyncEvent::NewBlockAcceptedSideChain { peer, height, hash } => {
-                self.handle_new_block_accepted_side_chain(peer, height, hash)
+            HeaderSyncEvent::NewBlockAcceptedNonBestChain { peer, height, hash } => {
+                self.handle_new_block_accepted_non_best_chain(peer, height, hash)
             }
             HeaderSyncEvent::NewBlockRejected { peer, hash } => {
                 self.handle_new_block_rejected(peer, hash).await
@@ -556,10 +556,10 @@ impl HeaderSyncReactor {
         self.trace_new_block_deduped(&peer, height, hash, "already_in_chain");
     }
 
-    /// Remembers an accepted side-chain `NewBlock` for dedup without advancing
-    /// any frontier or forwarding it. See
-    /// [`HeaderSyncEvent::NewBlockAcceptedSideChain`].
-    fn handle_new_block_accepted_side_chain(
+    /// Remembers an accepted non-best-chain `NewBlock` for dedup without
+    /// advancing any frontier or forwarding it. See
+    /// [`HeaderSyncEvent::NewBlockAcceptedNonBestChain`].
+    fn handle_new_block_accepted_non_best_chain(
         &mut self,
         peer: ZakuraPeerId,
         height: block::Height,
@@ -567,8 +567,8 @@ impl HeaderSyncReactor {
     ) {
         self.state.pending_new_blocks.remove(&hash);
         let _ = self.state.seen.insert(hash);
-        metrics::counter!("sync.header.tip.new_block.side_chain").increment(1);
-        self.trace_new_block_deduped(&peer, height, hash, "side_chain");
+        metrics::counter!("sync.header.tip.new_block.non_best_chain").increment(1);
+        self.trace_new_block_deduped(&peer, height, hash, "non_best_chain");
     }
 
     async fn handle_new_block_rejected(&mut self, peer: ZakuraPeerId, hash: block::Hash) {
@@ -1665,8 +1665,12 @@ impl HeaderSyncReactor {
                 insert_height(row, hs_trace::HEIGHT, *height);
                 insert_hash(row, hs_trace::HASH, *hash);
             }
-            HeaderSyncEvent::NewBlockAcceptedSideChain { peer, height, hash } => {
-                insert_optional_str(row, hs_trace::KIND, Some("new_block_accepted_side_chain"));
+            HeaderSyncEvent::NewBlockAcceptedNonBestChain { peer, height, hash } => {
+                insert_optional_str(
+                    row,
+                    hs_trace::KIND,
+                    Some("new_block_accepted_non_best_chain"),
+                );
                 insert_peer(row, hs_trace::PEER, peer);
                 insert_height(row, hs_trace::HEIGHT, *height);
                 insert_hash(row, hs_trace::HASH, *hash);

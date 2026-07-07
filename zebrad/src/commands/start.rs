@@ -2944,11 +2944,11 @@ mod zakura_header_sync_driver_tests {
         endpoint.shutdown().await;
     }
 
-    /// End-to-end driver + reactor: an accepted `NewBlock` that committed to a
-    /// side chain (state `Depth` = `None`) must not advance the header
+    /// End-to-end driver + reactor: an accepted `NewBlock` that did not land on
+    /// the best chain (state `Depth` = `None`) must not advance the header
     /// frontier, while a best-chain accept (`Depth` = `Some`) must.
     #[tokio::test]
-    async fn new_block_side_chain_commit_does_not_advance_header_frontier() {
+    async fn new_block_non_best_chain_accept_does_not_advance_header_frontier() {
         let network = zebra_chain::parameters::Network::Mainnet;
         let genesis_hash = network.genesis_hash();
         let mut config = zebra_network::Config {
@@ -2976,9 +2976,9 @@ mod zakura_header_sync_driver_tests {
             .header_sync()
             .expect("driver startup starts header sync");
 
-        // Block 2 plays the side-chain commit; block 1 plays the best-chain one.
-        let side_chain_block = mainnet_block(&BLOCK_MAINNET_2_BYTES);
-        let side_chain_hash = side_chain_block.hash();
+        // Block 2 plays the non-best-chain commit; block 1 plays the best-chain one.
+        let non_best_chain_block = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let non_best_chain_hash = non_best_chain_block.hash();
         let best_chain_block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let best_chain_hash = best_chain_block.hash();
 
@@ -2995,7 +2995,7 @@ mod zakura_header_sync_driver_tests {
         });
         let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
             match request {
-                zebra_state::ReadRequest::Depth(hash) if hash == side_chain_hash => {
+                zebra_state::ReadRequest::Depth(hash) if hash == non_best_chain_hash => {
                     Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::Depth(None))
                 }
                 zebra_state::ReadRequest::Depth(hash) if hash == best_chain_hash => {
@@ -3031,23 +3031,23 @@ mod zakura_header_sync_driver_tests {
         action_tx
             .send(zebra_network::zakura::HeaderSyncAction::NewBlockReceived {
                 peer: source.clone(),
-                height: side_chain_block
+                height: non_best_chain_block
                     .coinbase_height()
                     .expect("test block has height"),
-                hash: side_chain_hash,
-                block: side_chain_block,
+                hash: non_best_chain_hash,
+                block: non_best_chain_block,
             })
             .await
             .expect("driver action channel stays open");
 
-        // The side-chain accept must not move the reactor's best header tip.
+        // The non-best-chain accept must not move the reactor's best header tip.
         // Give the driver + reactor time to (incorrectly) advance before
         // checking; the follow-up best-chain accept below proves liveness.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             header_sync.best_header_tip(),
             (block::Height(0), genesis_hash),
-            "a side-chain NewBlock commit must not advance the header frontier"
+            "a non-best-chain NewBlock accept must not advance the header frontier"
         );
 
         let best_height = best_chain_block
