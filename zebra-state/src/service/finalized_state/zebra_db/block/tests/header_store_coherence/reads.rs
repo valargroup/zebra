@@ -1,10 +1,7 @@
-//! Read-path coherence: consensus readers verify store invariants as they
-//! walk, surfacing corruption as an explicit [`StoreIncoherentError`] instead
-//! of feeding stale rows into difficulty validation (REORG_PLAN Pillar 2).
+//! Read-path coherence tests for finalized header storage.
 //!
-//! The write path refuses to create incoherent stores (the Phase-1.5 guards),
-//! so these tests corrupt the column families directly — the same hand-made
-//! corruption technique as the audit's own tests — and assert that:
+//! The write path rejects incoherent stores, so these tests corrupt column
+//! families directly and assert that:
 //!
 //! - `recent_header_context` returns `BrokenLinkage`/`Gap` instead of a
 //!   poisoned or silently shortened difficulty window, and
