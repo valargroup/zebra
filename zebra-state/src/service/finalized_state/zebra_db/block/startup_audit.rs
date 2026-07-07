@@ -210,8 +210,9 @@ impl ZebraDb {
                 .zs_forward_range_iter::<_, Height, CommitmentRootsByHeight, _>(&roots_cf, start..)
                 .next()
                 .is_none(),
-            // No finalized tip: every roots row is provisional.
-            (None, _) => self.db.zs_is_empty(&roots_cf),
+            // No finalized tip: roots rows can be committed history whose
+            // tip index is missing, and header sync cannot restore them.
+            (None, _) => true,
         };
 
         if self.db.zs_is_empty(&header_cf)
@@ -392,10 +393,12 @@ impl ZebraDb {
         )?;
 
         // Provisional roots above the window are part of the stranded suffix.
+        // If the finalized tip is missing, roots rows are not auditable: they
+        // might be committed history whose tip index was damaged.
         if let Some(start) = match (finalized_tip, provisional_roots_start) {
             (Some(_), None) => None,
             (Some(_), Some(start)) => Some(start),
-            (None, _) => Some(Height(0)),
+            (None, _) => None,
         } {
             audit_height_keyed_rows::<CommitmentRootsByHeight>(
                 &self.db,
