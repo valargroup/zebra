@@ -58,6 +58,8 @@ use crate::{
 #[cfg(feature = "indexer")]
 use crate::request::Spend;
 
+mod startup_audit;
+
 #[cfg(test)]
 mod tests;
 
