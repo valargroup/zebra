@@ -2326,8 +2326,10 @@ mod zakura_header_sync_driver_tests {
 
     #[test]
     fn zakura_block_sync_replaces_chain_sync_when_v2_p2p_is_enabled() {
-        let mut config = zebra_network::Config::default();
-        config.v2_p2p = true;
+        let mut config = zebra_network::Config {
+            v2_p2p: true,
+            ..Default::default()
+        };
 
         assert!(use_zakura_block_sync(&config));
 
