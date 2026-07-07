@@ -34,7 +34,7 @@ use super::{
     fabricate::{Universe, BRANCH_A, FORK_HEIGHT},
 };
 use crate::{
-    error::{CommitHeaderRangeError, StoreIncoherentError},
+    error::CommitHeaderRangeError,
     service::finalized_state::{
         disk_db::{DiskWriteBatch, WriteDisk},
         ZebraDb,
@@ -165,11 +165,15 @@ fn startup_heals_broken_linkage_then_resync_converges() {
     batch.zs_insert(&hash_cf, Height(20), foreign.hash);
     state.db.write(batch).expect("raw insert writes");
 
-    // The corruption is visible to the Pillar-2 reads before the heal.
-    let error = state
-        .recent_header_context(Height(30))
-        .expect_err("the walk crosses the corrupted row");
-    assert!(matches!(error, StoreIncoherentError::BrokenLinkage { .. }));
+    // The corruption is visible to the audit before the heal.
+    let violations = audit_store(&state);
+    assert!(
+        violations.iter().any(|violation| matches!(
+            violation,
+            super::audit::Violation::BrokenLinkage { height, .. } if *height == Height(20)
+        )),
+        "expected BrokenLinkage at the splice before repair: {violations:?}"
+    );
 
     let repair = state
         .audit_and_repair_zakura_header_store()
@@ -192,9 +196,10 @@ fn startup_heals_broken_linkage_then_resync_converges() {
     // Everything above the last coherent height is gone, in all five CFs.
     assert_eq!(dump_store(&state), truncated(&original, Height(19)));
     assert_clean(&state);
-    state
-        .recent_header_context(Height(19))
-        .expect("the healed store walks cleanly");
+    assert!(
+        !state.recent_header_context(Height(19)).is_empty(),
+        "the healed store supplies recent header context"
+    );
 
     // The heal persists: a reopen through the startup path changes nothing.
     let state = reopen(state, &config, &universe);
@@ -386,9 +391,9 @@ fn startup_removes_stale_rows_at_committed_heights() {
 }
 
 /// The reads.rs anchor-corruption shape (a hash row overwritten with a foreign
-/// hash) makes the Pillar-2 range writer reject with `StoreIncoherent`; after
-/// the heal the same delivery commits. This pins the Pillar-2 interaction: any
-/// store those reads refuse is healed by this audit.
+/// hash) makes the Pillar-2 range writer reject the anchor; after the heal the
+/// same delivery commits. This pins the Pillar-2 interaction: any store whose
+/// indexes prevent anchored writes is healed by this audit.
 #[test]
 fn startup_heal_unblocks_linkage_verified_reads() {
     let _init_guard = zebra_test::init();
@@ -418,7 +423,8 @@ fn startup_heal_unblocks_linkage_verified_reads() {
         .expect_err("the anchor round-trip fails on the corrupted index");
     assert!(matches!(
         error,
-        CommitHeaderRangeError::StoreIncoherent(StoreIncoherentError::BijectionMismatch { .. })
+        CommitHeaderRangeError::UnknownAnchor { anchor: rejected_anchor }
+            if rejected_anchor == anchor
     ));
 
     let repair = state

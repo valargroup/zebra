@@ -5,10 +5,8 @@
 //! invariants (hash↔height bijection, parent linkage anchored at the finalized
 //! tip, no gaps or stranded rows below the header tip) are enforced by the
 //! writers, but a store corrupted by an earlier binary stays corrupted on disk
-//! and wedges header sync: consensus reads surface the damage as
-//! [`StoreIncoherentError`](crate::error::StoreIncoherentError) and refuse to
-//! feed stale rows into validation, so the node can no longer make progress
-//! past the poisoned window.
+//! and wedges header sync: consensus writes can no longer anchor cleanly in the
+//! poisoned window, so the node can no longer make progress past it.
 //!
 //! This module runs the store audit once at [`ZebraDb`] startup and repairs
 //! any violation by truncating the zakura column families to the last
@@ -162,10 +160,9 @@ impl ZebraDb {
     /// and a warning, then truncates the zakura column families to the last
     /// coherent height (and removes stale rows below the finalized tip and
     /// orphaned reverse-index entries). Header sync re-downloads the
-    /// truncated suffix. A store that would fail the linkage-verified
-    /// consensus reads ([`StoreIncoherentError`](crate::error::StoreIncoherentError))
-    /// is always repaired by this audit, because the audit checks are a
-    /// superset of the read-path checks over the same rows.
+    /// truncated suffix. A store whose corrupted indexes prevent anchored
+    /// header writes is repaired by this audit, because the audit checks are a
+    /// superset of the writer's anchor checks over the same rows.
     ///
     /// Returns `Ok(None)` if the store is coherent (nothing is written), or
     /// the repair summary after a successful repair write.
