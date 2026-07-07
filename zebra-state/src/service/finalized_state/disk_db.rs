@@ -122,6 +122,11 @@ pub struct DiskDb {
 pub struct DiskWriteBatch {
     /// The inner RocksDB write batch.
     batch: rocksdb::WriteBatch,
+
+    /// Rows deleted by zakura header-store suffix replacements staged in this
+    /// batch. Nonzero means the batch performs a header reorg; the write site
+    /// uses this to run the post-reorg store audit after committing.
+    zakura_replaced_rows: usize,
 }
 
 impl Debug for DiskWriteBatch {
@@ -548,7 +553,21 @@ impl DiskWriteBatch {
     pub fn new() -> Self {
         DiskWriteBatch {
             batch: rocksdb::WriteBatch::default(),
+            zakura_replaced_rows: 0,
         }
+    }
+
+    /// Records that a zakura suffix replacement staged in this batch deleted
+    /// `deleted_rows` rows.
+    pub(crate) fn note_zakura_suffix_replacement(&mut self, deleted_rows: usize) {
+        self.zakura_replaced_rows += deleted_rows;
+    }
+
+    /// Returns the number of rows deleted by zakura suffix replacements
+    /// staged in this batch. Nonzero means this batch performs a header
+    /// reorg, and the write site should audit the store after committing it.
+    pub(crate) fn zakura_suffix_replaced_rows(&self) -> usize {
+        self.zakura_replaced_rows
     }
 }
 
