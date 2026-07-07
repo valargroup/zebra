@@ -40,12 +40,11 @@ write instead.
 
 ## Fixed corruption bugs gated by this suite
 
-Phase 1 of this suite proved three write-path corruption bug classes, each
-pinned by a `corruption_repro_*` test that deterministically demonstrated the
-violation. The write-path fixes (`REORG_PLAN.md` Phase 1.5) closed all three;
-the repro tests were removed with the fixes, and their
-`<name>_upholds_invariants` twins now assert the fixed behavior over the same
-op sequences as permanent regression gates:
+This suite found and closed three write-path corruption bug classes. Each was
+first pinned by a `corruption_repro_*` test that deterministically demonstrated
+the violation; once the writer was fixed, the repro test was removed and its
+`<name>_upholds_invariants` twin now asserts the fixed behavior over the same
+op sequence as a permanent regression gate:
 
 1. **Unlinked-anchor commit** (`unlinked_anchor_commit_upholds_invariants`).
    `prepare_header_range_batch_with_roots` used to accept ranges without
