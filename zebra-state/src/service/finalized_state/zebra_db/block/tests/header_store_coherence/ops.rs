@@ -10,6 +10,8 @@
 //!   (the non-finalized best-chain commit hook);
 //! - [`Op::Finalize`] → sequential body commits along the expected canonical
 //!   chain;
+//! - [`Op::Prune`] → `DiskWriteBatch::prepare_prune_batch` (online pruning of
+//!   raw transactions below the body tip; no chain-membership change);
 //! - [`Op::Reopen`] → close and reopen the database (restart survival).
 //!
 //! After every op the harness cross-checks the oracle's prediction against the
@@ -79,6 +81,11 @@ pub(crate) enum Op {
     },
     Finalize {
         count: usize,
+    },
+    /// Prunes raw transactions from the last pruning marker up to (but not
+    /// including) `min(until, body tip)`, through the production prune batch.
+    Prune {
+        until: u32,
     },
     Reopen,
 }
@@ -374,6 +381,50 @@ impl Harness {
                         mismatches,
                     );
                 }
+            }
+
+            Op::Prune { until } => {
+                // Pruning applies below the finalized body tip and never
+                // re-prunes below the existing marker (the marker is
+                // monotone in production).
+                let Some(tip) = self.state().finalized_tip_height() else {
+                    return self.finish(OpOutcome::Skipped("no finalized tip"), mismatches);
+                };
+                let from = self
+                    .state()
+                    .lowest_retained_height()
+                    .unwrap_or(block::Height(1));
+                let until = block::Height((*until).min(tip.0));
+                if until <= from {
+                    return self.finish(OpOutcome::Skipped("empty prune range"), mismatches);
+                }
+
+                let dump_before = dump_store(self.state());
+                let mut batch = DiskWriteBatch::new();
+                batch.prepare_prune_batch(self.state(), from, until);
+                self.state()
+                    .write_batch(batch)
+                    .expect("prune batch writes successfully");
+
+                // Pruning removes raw transactions and advances the marker;
+                // chain membership and the zakura header store must be
+                // untouched (the oracle's predictions are unchanged).
+                if dump_store(self.state()) != dump_before {
+                    mismatches.push(format!("pruning mutated the zakura header store: {op:?}"));
+                }
+                for height in from.0..until.0 {
+                    let height = block::Height(height);
+                    if self.state().contains_body_at_height(height) {
+                        mismatches
+                            .push(format!("pruned height {height:?} still has a body: {op:?}"));
+                    }
+                    if !self.state().contains_height(height) {
+                        mismatches.push(format!(
+                            "pruning removed the consensus hash row at {height:?}: {op:?}"
+                        ));
+                    }
+                }
+                OpOutcome::Accepted
             }
 
             Op::Reopen => {

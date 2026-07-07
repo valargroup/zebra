@@ -274,7 +274,10 @@ pub(crate) fn audit_store(state: &ZebraDb) -> Vec<Violation> {
     }
 
     // A3: body-size rows require a backing zakura header row; roots rows
-    // require a zakura header row or a committed body.
+    // require a zakura header row or a committed height. The committed
+    // predicate is `contains_height` (the consensus hash row, which pruning
+    // retains), not body presence: verified roots rows at committed heights
+    // survive pruning and are legitimate, body or no body.
     for &height in dump.body_sizes.keys() {
         if !dump.hashes.contains_key(&height) {
             violations.push(Violation::AuxRowWithoutHeader {
@@ -284,7 +287,7 @@ pub(crate) fn audit_store(state: &ZebraDb) -> Vec<Violation> {
         }
     }
     for &height in dump.roots.keys() {
-        if !dump.hashes.contains_key(&height) && !state.contains_body_at_height(height) {
+        if !dump.hashes.contains_key(&height) && !state.contains_height(height) {
             violations.push(Violation::AuxRowWithoutHeader {
                 cf: COMMITMENT_ROOTS_BY_HEIGHT,
                 height,
