@@ -662,9 +662,6 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     },
                 );
                 let started = Instant::now();
-                // Kept so a reorging commit can name the new-branch hash at the
-                // first replaced height without re-reading state (`Arc` clones).
-                let committed_headers = headers.clone();
                 match state
                     .clone()
                     .oneshot(zebra_state::Request::CommitHeaderRange {
@@ -678,20 +675,15 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     Ok(zebra_state::Response::CommittedHeaderRange(outcome)) => {
                         let tip_hash = outcome.tip_hash;
                         if let Some(reorged_at) = outcome.reorged_at {
-                            // The offset fits usize: it is bounded by the
-                            // committed range length, which is far below
-                            // u32::MAX and platform usize on all targets.
-                            let new_hash = committed_headers
-                                .get(reorged_at.0.saturating_sub(start_height.0) as usize)
-                                .map(|header| block::Hash::from(header.as_ref()));
-                            invalidate_reorged_body_suffix(
-                                state.clone(),
-                                read_state.clone(),
-                                reorged_at,
-                                new_hash,
-                                &trace,
-                            )
-                            .await;
+                            // The stranded body suffix (if any) was already
+                            // rolled back by the state's switch orchestration,
+                            // before the header rewrite reached disk.
+                            metrics::counter!("sync.header.reorg_commits").increment(1);
+                            info!(
+                                ?reorged_at,
+                                ?tip_hash,
+                                "header range commit reorged the stored header chain"
+                            );
                         }
                         emit_commit_state(
                             &trace,
@@ -1353,10 +1345,13 @@ pub(crate) async fn reconcile_stranded_body_suffix<State, ReadState>(
     .await;
 }
 
-/// Drops the committed body suffix stranded by a header-chain reorg.
+/// Drops a committed body suffix found stranded off the header chain.
 ///
-/// `reorged_at` is the first height where a committed header range replaced a
-/// conflicting stored header; `new_hash` is the new branch's hash there. If
+/// Commit-time stranding is rolled back inside the state's switch
+/// orchestration (before the header rewrite reaches disk); this driver-side
+/// path serves the startup/periodic reconciliation sweep, which repairs
+/// stranding left behind by older binaries or missed events. `reorged_at` is
+/// the first stranded height; `new_hash` is the header chain's hash there. If
 /// the best body chain still holds a different block at that height, that
 /// block and its descendants are invalidated, resetting the chain tip to the
 /// fork point. The chain-tip mirror then publishes the reset frontier

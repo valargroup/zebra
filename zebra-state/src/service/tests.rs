@@ -541,6 +541,7 @@ async fn header_only_service_requests_preserve_body_boundary() -> std::result::R
         Response::CommittedHeaderRange(HeaderRangeCommitOutcome {
             tip_hash: block2_hash,
             reorged_at: None,
+            reorged_to_hash: None,
         }),
     );
 
@@ -801,6 +802,7 @@ async fn commit_header_range_completes_while_in_finalized_write_phase(
         Response::CommittedHeaderRange(HeaderRangeCommitOutcome {
             tip_hash: block2_hash,
             reorged_at: None,
+            reorged_to_hash: None,
         })
     );
 

@@ -76,6 +76,7 @@ pub(crate) struct AdvertisedBodySize(u32);
 
 /// Builds an [`AdvertisedBodySize`] for tests that plant raw rows.
 #[cfg(test)]
+#[allow(dead_code)] // used by the coherence suite, dropped from canary picks
 pub(crate) fn test_body_size(size: u32) -> AdvertisedBodySize {
     AdvertisedBodySize(size)
 }
@@ -2289,7 +2290,6 @@ impl DiskWriteBatch {
             );
         }
 
-
         // Chain membership changes only through the suffix-replacement
         // primitive: total deletion above the fork point in all five column
         // families, then the new rows. Rows above the incoming range's end
@@ -2337,6 +2337,13 @@ impl DiskWriteBatch {
         Ok(HeaderRangeCommitOutcome {
             tip_hash: block::Hash::from(&**headers.last().expect("headers is non-empty")),
             reorged_at: first_conflicting_height,
+            reorged_to_hash: first_conflicting_height.map(|reorged_at| {
+                validated_headers
+                    .iter()
+                    .find(|(height, ..)| *height == reorged_at)
+                    .expect("the first conflicting height is inside the validated range")
+                    .1
+            }),
         })
     }
 

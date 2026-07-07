@@ -36,6 +36,10 @@ pub struct HeaderRangeCommitOutcome {
     /// conflicting header suffix, when the commit reorged the stored header
     /// chain. `None` when the range only extended or duplicated stored headers.
     pub reorged_at: Option<block::Height>,
+    /// The new branch's hash at `reorged_at`, when the commit reorged the
+    /// stored header chain. Used by the switch orchestration to recognize the
+    /// stranded old-branch body suffix without re-reading state.
+    pub reorged_to_hash: Option<block::Hash>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
