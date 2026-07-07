@@ -46,6 +46,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   provisional header rows below the body tip, and the header row seeded from
   a committed best-chain block is skipped when it does not link to the stored
   row below it (header-range sync converges the store instead).
+- Zebra can now audit the Zakura header store when the state database opens and
+  self-repair any incoherence (broken linkage, hash↔height index mismatches,
+  gaps with stranded rows above them, stale rows at committed heights) by
+  truncating the Zakura column families to the last coherent height in bounded
+  batches, then letting header sync re-download the truncated suffix. Operators
+  can opt in with `state.repair_zakura_header_store_on_startup = true`; each
+  repair emits a warning and the `state.zakura.header_store.incoherent` metric.
 - Fixed dual-stack Zakura fallback shutting down the Zakura serving layer. When
   the stall watchdog resumes legacy `ChainSync`, Zakura now keeps its header-
   and block-sync reactors alive as a serving/advertising bridge while an apply
