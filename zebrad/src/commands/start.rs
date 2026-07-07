@@ -2217,10 +2217,12 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
-    fn store_incoherent_is_local_header_sync_commit_failure() {
+    fn store_incoherent_triggers_walk_back_not_peer_scoring() {
         // A range rejected because our own header rows failed a
         // linkage/bijection check is a local storage fault; scoring peers for
-        // it recreates the disconnect-honest-peers failure mode.
+        // it recreates the disconnect-honest-peers failure mode. On this
+        // branch it routes to ContextMismatch so the walk-back re-anchors
+        // from the store below the damage.
         let error = zebra_state::CommitHeaderRangeError::StoreIncoherent(
             zebra_state::StoreIncoherentError::BrokenLinkage {
                 height: block::Height(2),
@@ -2231,7 +2233,7 @@ mod zakura_header_sync_driver_tests {
 
         assert_eq!(
             header_range_commit_failure_kind(&error),
-            HeaderSyncCommitFailureKind::Local
+            HeaderSyncCommitFailureKind::ContextMismatch
         );
     }
 

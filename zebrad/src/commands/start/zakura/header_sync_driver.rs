@@ -1490,12 +1490,6 @@ pub(crate) fn header_range_commit_failure_kind(
         // store's own linkage check failing means the local anchor/response pairing
         // went wrong, not that the peer misbehaved.
         | zebra_state::CommitHeaderRangeError::UnlinkedRange { .. }
-        // Store incoherence is by definition a local storage fault: the range was
-        // rejected because our own header rows failed a linkage/bijection check
-        // while reading validation context, not because the peer's range was shown
-        // invalid. Scoring peers for it recreates the disconnect-honest-peers
-        // failure mode from the 2026-07-06 incidents.
-        | zebra_state::CommitHeaderRangeError::StoreIncoherent(_)
         | zebra_state::CommitHeaderRangeError::CommitResponseDropped => {
             HeaderSyncCommitFailureKind::Local
         }
@@ -1525,7 +1519,13 @@ pub(crate) fn header_range_commit_failure_kind(
         // (`QueryReanchorTarget`), which is exactly the self-correction this
         // state needs.
         zebra_state::CommitHeaderRangeError::ValidateContextError(_)
-        | zebra_state::CommitHeaderRangeError::UnknownAnchor { .. } => {
+        | zebra_state::CommitHeaderRangeError::UnknownAnchor { .. }
+        // Store incoherence is a local storage fault (our own header rows failed
+        // a linkage/bijection check while reading validation context — never the
+        // peer's doing, so never scored), and the walk-back is its cure: it
+        // re-anchors from the store below the damage and re-commits through the
+        // fork point, while the startup/post-reorg audits repair the rows.
+        | zebra_state::CommitHeaderRangeError::StoreIncoherent(_) => {
             HeaderSyncCommitFailureKind::ContextMismatch
         }
         _ => HeaderSyncCommitFailureKind::Local,
