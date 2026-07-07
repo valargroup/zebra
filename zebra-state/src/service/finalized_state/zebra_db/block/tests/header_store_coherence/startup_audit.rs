@@ -62,6 +62,13 @@ fn reopen(state: ZebraDb, config: &Config, universe: &Universe) -> ZebraDb {
     persistent_state(config, &universe.network)
 }
 
+fn startup_repair_config(cache_dir: &std::path::Path) -> Config {
+    Config {
+        repair_zakura_header_store_on_startup: true,
+        ..persistent_config(cache_dir)
+    }
+}
+
 /// The expected store after truncating everything above `last` (the original
 /// coherent dump with all five column families filtered to `..= last`).
 fn truncated(dump: &StoreDump, last: Height) -> StoreDump {
@@ -114,7 +121,7 @@ fn startup_audit_is_noop_on_coherent_store() {
     let _init_guard = zebra_test::init();
     let universe = Universe::new();
     let tempdir = tempfile::tempdir().expect("test tempdir is available");
-    let config = persistent_config(tempdir.path());
+    let config = startup_repair_config(tempdir.path());
     let state = trunk_state(&universe, config.clone());
     let original = dump_store(&state);
 
@@ -144,7 +151,7 @@ fn startup_heals_broken_linkage_then_resync_converges() {
     let _init_guard = zebra_test::init();
     let universe = Universe::new();
     let tempdir = tempfile::tempdir().expect("test tempdir is available");
-    let config = persistent_config(tempdir.path());
+    let config = startup_repair_config(tempdir.path());
     let state = trunk_state(&universe, config.clone());
     let original = dump_store(&state);
 
@@ -211,7 +218,7 @@ fn startup_heals_gap_and_stranded_rows_on_reopen() {
     let _init_guard = zebra_test::init();
     let universe = Universe::new();
     let tempdir = tempfile::tempdir().expect("test tempdir is available");
-    let config = persistent_config(tempdir.path());
+    let config = startup_repair_config(tempdir.path());
     let state = trunk_state(&universe, config.clone());
     let original = dump_store(&state);
 
@@ -230,6 +237,33 @@ fn startup_heals_gap_and_stranded_rows_on_reopen() {
     assert_eq!(
         state.best_header_tip(),
         Some((Height(14), universe.trunk_at(14).hash))
+    );
+}
+
+/// Reopening with the default config does not run the potentially expensive
+/// startup scan, leaving any repair for an explicit audit or an opt-in restart.
+#[test]
+fn startup_repair_is_disabled_by_default() {
+    let _init_guard = zebra_test::init();
+    let universe = Universe::new();
+    let tempdir = tempfile::tempdir().expect("test tempdir is available");
+    let config = persistent_config(tempdir.path());
+    let state = trunk_state(&universe, config.clone());
+    let original = dump_store(&state);
+
+    let header_cf = state.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
+    let hash_cf = state.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_delete(&header_cf, Height(15));
+    batch.zs_delete(&hash_cf, Height(15));
+    state.db.write(batch).expect("raw delete writes");
+
+    let state = reopen(state, &config, &universe);
+
+    assert_ne!(
+        dump_store(&state),
+        truncated(&original, Height(14)),
+        "default reopen must not repair the corrupted store"
     );
 }
 
@@ -508,7 +542,7 @@ fn startup_repair_emits_incoherent_metric() {
     let _init_guard = zebra_test::init();
     let universe = Universe::new();
     let tempdir = tempfile::tempdir().expect("test tempdir is available");
-    let config = persistent_config(tempdir.path());
+    let config = startup_repair_config(tempdir.path());
     let state = trunk_state(&universe, config.clone());
 
     let header_cf = state.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();

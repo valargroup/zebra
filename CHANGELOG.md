@@ -35,14 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
-- Zebra now audits the Zakura header store when the state database opens and
-  self-repairs any incoherence (broken linkage, hash↔height index mismatches,
+- Zebra can now audit the Zakura header store when the state database opens and
+  self-repair any incoherence (broken linkage, hash↔height index mismatches,
   gaps with stranded rows above them, stale rows at committed heights) by
-  truncating the Zakura column families to the last coherent height in one
-  atomic batch, then letting header sync re-download the truncated suffix.
-  Stores corrupted by earlier binaries now heal on restart instead of staying
-  wedged below the network tip; each repair emits a warning and the
-  `state.zakura.header_store.incoherent` metric.
+  truncating the Zakura column families to the last coherent height in bounded
+  batches, then letting header sync re-download the truncated suffix. Operators
+  can opt in with `state.repair_zakura_header_store_on_startup = true`; each
+  repair emits a warning and the `state.zakura.header_store.incoherent` metric.
 - Zakura header-store consensus reads now verify store invariants as they
   walk: the difficulty-context walk checks that every stored header is the
   block its hash row names and links to the row below it, and the anchor
