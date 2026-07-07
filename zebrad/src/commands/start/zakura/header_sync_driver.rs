@@ -673,7 +673,19 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     })
                     .await
                 {
-                    Ok(zebra_state::Response::Committed(tip_hash)) => {
+                    Ok(zebra_state::Response::CommittedHeaderRange(outcome)) => {
+                        let tip_hash = outcome.tip_hash;
+                        if let Some(reorged_at) = outcome.reorged_at {
+                            // The stranded body suffix (if any) was already
+                            // rolled back by the state's switch orchestration,
+                            // before the header rewrite reached disk.
+                            metrics::counter!("sync.header.reorg_commits").increment(1);
+                            info!(
+                                ?reorged_at,
+                                ?tip_hash,
+                                "header range commit reorged the stored header chain"
+                            );
+                        }
                         emit_commit_state(
                             &trace,
                             cs_trace::COMMIT_FINISH,

@@ -370,21 +370,25 @@ impl NonFinalizedState {
         Ok(())
     }
 
-    /// Invalidate block with hash `block_hash` and all descendants from the non-finalized state. Insert
-    /// the new chain into the chain_set and discard the previous.
+    /// Removes the block with hash `block_hash` and all its descendants from
+    /// the non-finalized state, returning the removed blocks. Inserts the
+    /// truncated chain into the chain_set and discards the previous.
     #[allow(clippy::unwrap_in_result)]
-    pub fn invalidate_block(&mut self, block_hash: Hash) -> Result<block::Hash, InvalidateError> {
+    fn remove_block_and_descendants(
+        &mut self,
+        block_hash: Hash,
+    ) -> Result<Vec<ContextuallyVerifiedBlock>, InvalidateError> {
         let Some(chain) = self.find_chain(|chain| chain.contains_block_hash(block_hash)) else {
             return Err(InvalidateError::BlockNotFound(block_hash));
         };
 
-        let invalidated_blocks = if chain.non_finalized_root_hash() == block_hash {
+        let removed_blocks = if chain.non_finalized_root_hash() == block_hash {
             let chain_tip_hash = chain.non_finalized_tip_hash();
             self.chain_set
                 .retain(|chain| chain.non_finalized_tip_hash() != chain_tip_hash);
             chain.blocks.values().cloned().collect()
         } else {
-            let (new_chain, invalidated_blocks) = chain
+            let (new_chain, removed_blocks) = chain
                 .invalidate_block(block_hash)
                 .expect("already checked that chain contains hash");
 
@@ -394,8 +398,24 @@ impl NonFinalizedState {
                 chain_set.retain(|c| !c.contains_block_hash(block_hash))
             });
 
-            invalidated_blocks
+            removed_blocks
         };
+
+        self.update_metrics_for_chains();
+        self.update_metrics_bars();
+
+        Ok(removed_blocks)
+    }
+
+    /// Invalidate block with hash `block_hash` and all descendants from the non-finalized state. Insert
+    /// the new chain into the chain_set and discard the previous.
+    ///
+    /// The removed blocks are recorded in the invalidated list: they are
+    /// refused on re-delivery until explicitly reconsidered. For a reorg
+    /// rollback, use [`Self::rollback_block`] instead.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn invalidate_block(&mut self, block_hash: Hash) -> Result<block::Hash, InvalidateError> {
+        let invalidated_blocks = self.remove_block_and_descendants(block_hash)?;
 
         // TODO: Allow for invalidating multiple block hashes at a given height (#9552).
         self.invalidated_blocks.insert(
@@ -411,9 +431,20 @@ impl NonFinalizedState {
             self.invalidated_blocks.shift_remove_index(0);
         }
 
-        self.update_metrics_for_chains();
-        self.update_metrics_bars();
+        Ok(block_hash)
+    }
 
+    /// Rolls back the block with hash `block_hash` and all its descendants
+    /// from the non-finalized state, without recording them as invalidated.
+    ///
+    /// A branch-switch rollback is a chain-selection outcome, not a verdict
+    /// on the blocks: the rolled-back branch must revalidate and recommit
+    /// normally the moment it wins the work race again. Recording it in the
+    /// invalidated list would refuse the re-delivery
+    /// (`BlockPreviouslyInvalidated`) and strand the node if the winning
+    /// branch later evaporates.
+    pub fn rollback_block(&mut self, block_hash: Hash) -> Result<block::Hash, InvalidateError> {
+        self.remove_block_and_descendants(block_hash)?;
         Ok(block_hash)
     }
 

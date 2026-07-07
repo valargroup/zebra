@@ -59,7 +59,8 @@ use crate::{
         watch_receiver::WatchReceiver,
     },
     BoxError, CheckpointVerifiedBlock, CommitHeaderRangeError, CommitSemanticallyVerifiedError,
-    Config, KnownBlock, ReadRequest, ReadResponse, Request, Response, SemanticallyVerifiedBlock,
+    Config, HeaderRangeCommitOutcome, KnownBlock, ReadRequest, ReadResponse, Request, Response,
+    SemanticallyVerifiedBlock,
 };
 
 pub mod block_iter;
@@ -988,7 +989,7 @@ impl StateService {
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
         tree_aux_roots: Vec<BlockCommitmentRoots>,
-    ) -> oneshot::Receiver<Result<block::Hash, CommitHeaderRangeError>> {
+    ) -> oneshot::Receiver<Result<HeaderRangeCommitOutcome, CommitHeaderRangeError>> {
         let (rsp_tx, rsp_rx) = oneshot::channel();
 
         let Some(sender) = &self.block_write_sender.non_finalized else {
@@ -1255,7 +1256,7 @@ impl Service<Request> for StateService {
                         .map_err(|_recv_error| CommitHeaderRangeError::CommitResponseDropped)
                         .and_then(|result| result)
                         .map_err(BoxError::from)
-                        .map(Response::Committed)
+                        .map(Response::CommittedHeaderRange)
                 }
                 .instrument(span)
                 .boxed()

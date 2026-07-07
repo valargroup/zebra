@@ -125,13 +125,13 @@ pub(super) fn commit_header_range(
 ) -> block::Hash {
     let mut batch = DiskWriteBatch::new();
     let body_sizes = vec![0; headers.len()];
-    let committed_hash = batch
+    let outcome = batch
         .prepare_header_range_batch(state, anchor, headers, &body_sizes)
         .expect("header range is valid");
     state
         .write_batch(batch)
         .expect("header range batch writes successfully");
-    committed_hash
+    outcome.tip_hash
 }
 
 /// Commits `block`'s header and transaction data (the body-commit batch shape),

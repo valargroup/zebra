@@ -27,12 +27,31 @@ use crate::{ReadRequest, Request};
 
 use crate::{service::read::AddressUtxos, NonFinalizedState, TransactionLocation, WatchReceiver};
 
+/// The outcome of a successful [`Request::CommitHeaderRange`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HeaderRangeCommitOutcome {
+    /// Hash of the last header in the committed range.
+    pub tip_hash: block::Hash,
+    /// First height where the committed range replaced a previously stored
+    /// conflicting header suffix, when the commit reorged the stored header
+    /// chain. `None` when the range only extended or duplicated stored headers.
+    pub reorged_at: Option<block::Height>,
+    /// The new branch's hash at `reorged_at`, when the commit reorged the
+    /// stored header chain. Used by the switch orchestration to recognize the
+    /// stranded old-branch body suffix without re-reading state.
+    pub reorged_to_hash: Option<block::Hash>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
     /// Response to [`Request::CommitSemanticallyVerifiedBlock`] and [`Request::CommitCheckpointVerifiedBlock`]
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),
+
+    /// Response to [`Request::CommitHeaderRange`] indicating that a header
+    /// range was successfully committed to the state.
+    CommittedHeaderRange(HeaderRangeCommitOutcome),
 
     /// Response to [`Request::InvalidateBlock`] indicating that a block was found and
     /// invalidated in the state.

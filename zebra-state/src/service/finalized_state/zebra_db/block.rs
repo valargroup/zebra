@@ -51,7 +51,7 @@ use crate::{
         FromDisk, IntoDisk, RawBytes, COMMITMENT_ROOTS_BY_HEIGHT, PRUNING_METADATA,
         VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
     },
-    HashOrHeight,
+    HashOrHeight, HeaderRangeCommitOutcome,
 };
 
 #[cfg(feature = "indexer")]
@@ -75,6 +75,7 @@ pub(crate) struct AdvertisedBodySize(u32);
 
 /// Builds an [`AdvertisedBodySize`] for tests that plant raw rows.
 #[cfg(test)]
+#[allow(dead_code)] // used by the coherence suite, dropped from canary picks
 pub(crate) fn test_body_size(size: u32) -> AdvertisedBodySize {
     AdvertisedBodySize(size)
 }
@@ -2019,7 +2020,7 @@ impl DiskWriteBatch {
         anchor: block::Hash,
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
-    ) -> Result<block::Hash, CommitHeaderRangeError> {
+    ) -> Result<HeaderRangeCommitOutcome, CommitHeaderRangeError> {
         let roots = inferred_header_range_roots(zebra_db, anchor, headers.len())?;
         self.prepare_header_range_batch_with_roots(zebra_db, anchor, headers, body_sizes, &roots)
     }
@@ -2034,7 +2035,7 @@ impl DiskWriteBatch {
         headers: &[Arc<block::Header>],
         body_sizes: &[u32],
         tree_aux_roots: &[BlockCommitmentRoots],
-    ) -> Result<block::Hash, CommitHeaderRangeError> {
+    ) -> Result<HeaderRangeCommitOutcome, CommitHeaderRangeError> {
         if headers.is_empty() {
             return Err(CommitHeaderRangeError::EmptyRange);
         }
@@ -2328,9 +2329,17 @@ impl DiskWriteBatch {
             self.set_canonical_suffix(zebra_db, (fork_height, fork_hash), &new_rows)?;
         }
 
-        Ok(block::Hash::from(
-            &**headers.last().expect("headers is non-empty"),
-        ))
+        Ok(HeaderRangeCommitOutcome {
+            tip_hash: block::Hash::from(&**headers.last().expect("headers is non-empty")),
+            reorged_at: first_conflicting_height,
+            reorged_to_hash: first_conflicting_height.map(|reorged_at| {
+                validated_headers
+                    .iter()
+                    .find(|(height, ..)| *height == reorged_at)
+                    .expect("the first conflicting height is inside the validated range")
+                    .1
+            }),
+        })
     }
 
     /// Deletes the block header at `height`.

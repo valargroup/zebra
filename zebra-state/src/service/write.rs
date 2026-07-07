@@ -29,7 +29,7 @@ use crate::{
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
-    SemanticallyVerifiedBlock, ValidateContextError,
+    HeaderRangeCommitOutcome, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 // These types are used in doc links
@@ -128,13 +128,41 @@ fn update_latest_chain_channels(
     tip_block_height
 }
 
+/// Commits a validated header range, orchestrating the branch switch when the
+/// range reorgs the stored header chain (REORG_PLAN Pillar 1a).
+///
+/// The switch is sequenced so every crash intermediate is coherent:
+///
+/// 1. **Evaluate**: the batch preparation validates the whole candidate range
+///    in memory (linkage, checkpoints, contextual difficulty, the strictly-
+///    greater cumulative-work gate) and decides the fork point, staging disk
+///    writes only through the suffix-replacement primitive. A rejected
+///    candidate leaves every store untouched.
+/// 2. **Body rollback**: if the fork strands a committed non-finalized body
+///    suffix (the old branch's blocks above the fork), invalidate it *before*
+///    the header rewrite reaches disk, so the header store never names a
+///    branch the body store still extends past the fork. Invalidation is a
+///    rollback, not a ban: re-delivered old-branch blocks revalidate and
+///    recommit normally if that branch later wins again.
+/// 3. **Header rewrite**: write the prepared batch (one atomic suffix
+///    replacement), then run the post-reorg store audit.
+///
+/// A crash between steps 2 and 3 leaves the node "behind" on a coherent
+/// store: the non-finalized backup restores or resync re-delivers whichever
+/// branch currently wins, and the ordinary sync flow re-runs the switch —
+/// recovery is never a special code path.
+#[allow(clippy::too_many_arguments)]
 fn commit_header_range(
     finalized_state: &FinalizedState,
+    non_finalized_state: &mut NonFinalizedState,
+    chain_tip_sender: &mut ChainTipSender,
+    non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
+    backup_dir_path: Option<&Path>,
     anchor: block::Hash,
     headers: Vec<Arc<block::Header>>,
     body_sizes: Vec<u32>,
     tree_aux_roots: Vec<BlockCommitmentRoots>,
-    rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
+    rsp_tx: oneshot::Sender<Result<HeaderRangeCommitOutcome, CommitHeaderRangeError>>,
 ) {
     let mut batch = crate::service::finalized_state::DiskWriteBatch::new();
     let result = batch
@@ -145,7 +173,20 @@ fn commit_header_range(
             &body_sizes,
             &tree_aux_roots,
         )
-        .and_then(|hash| {
+        .and_then(|outcome| {
+            if let (Some(reorged_at), Some(reorged_to_hash)) =
+                (outcome.reorged_at, outcome.reorged_to_hash)
+            {
+                invalidate_stranded_body_suffix(
+                    non_finalized_state,
+                    chain_tip_sender,
+                    non_finalized_state_sender,
+                    backup_dir_path,
+                    reorged_at,
+                    reorged_to_hash,
+                );
+            }
+
             let zakura_replaced_rows = batch.zakura_suffix_replaced_rows();
             finalized_state
                 .db
@@ -154,7 +195,7 @@ fn commit_header_range(
                     finalized_state
                         .db
                         .audit_zakura_header_store_after_reorg(zakura_replaced_rows);
-                    hash
+                    outcome
                 })
                 .map_err(|error| {
                     tracing::error!(?error, "failed to write validated header range");
@@ -166,6 +207,82 @@ fn commit_header_range(
         });
 
     let _ = rsp_tx.send(result);
+}
+
+/// Rolls back the non-finalized body suffix stranded by a header-chain reorg
+/// (step 2 of the switch orchestration in [`commit_header_range`]).
+///
+/// `reorged_at` is the first height where the winning header range replaces a
+/// conflicting stored header; `reorged_to_hash` is the new branch's hash
+/// there. If the best body chain still holds a different block at that
+/// height, that block and its descendants are invalidated and the truncated
+/// chain is published, so block-gap discovery reanchors at the fork and
+/// re-downloads the new branch's bodies. Without this, body sync keeps
+/// extending the stale branch above a header store that no longer names it.
+fn invalidate_stranded_body_suffix(
+    non_finalized_state: &mut NonFinalizedState,
+    chain_tip_sender: &mut ChainTipSender,
+    non_finalized_state_sender: &watch::Sender<NonFinalizedState>,
+    backup_dir_path: Option<&Path>,
+    reorged_at: block::Height,
+    reorged_to_hash: block::Hash,
+) {
+    let Some(old_hash) = non_finalized_state.best_hash(reorged_at) else {
+        // No committed body at the reorged height; nothing to roll back.
+        return;
+    };
+    if old_hash == reorged_to_hash {
+        // The body chain is already on the new branch.
+        return;
+    }
+
+    tracing::warn!(
+        ?reorged_at,
+        ?old_hash,
+        new_hash = ?reorged_to_hash,
+        "header reorg crossed the committed body suffix;          rolling back the stranded branch so block sync re-downloads the new one"
+    );
+
+    match non_finalized_state.rollback_block(old_hash) {
+        Ok(hash) => {
+            metrics::counter!("sync.header.fork_recovery.body_suffix_invalidated").increment(1);
+            tracing::info!(
+                ?reorged_at,
+                ?hash,
+                "rolled back the stranded body suffix before the header rewrite"
+            );
+        }
+        Err(error) => {
+            // Leave the header commit to proceed: the stranded suffix is
+            // rediscovered on the next reorging commit or at restart, and the
+            // ordinary flow re-runs this rollback.
+            tracing::warn!(
+                ?reorged_at,
+                ?old_hash,
+                ?error,
+                "failed to roll back the stranded body suffix after a header reorg"
+            );
+            return;
+        }
+    }
+
+    // Publish the truncated chain so the tip watchers see the rollback.
+    // Invalidating the non-finalized root can empty the chain set entirely;
+    // `update_latest_chain_channels` expects a best chain, so skip the
+    // publish in that case (the tip watch keeps the stale tip until the new
+    // branch's bodies commit — block sync follows the header store, not the
+    // tip watch, so re-download still reanchors correctly).
+    if non_finalized_state.best_chain().is_some() {
+        update_latest_chain_channels(
+            non_finalized_state,
+            chain_tip_sender,
+            non_finalized_state_sender,
+            backup_dir_path,
+        );
+    } else {
+        let _ = non_finalized_state_sender.send(non_finalized_state.clone());
+        let _ = chain_tip_sender;
+    }
 }
 
 /// A worker task that reads, validates, and writes blocks to the
@@ -204,7 +321,7 @@ pub enum NonFinalizedWriteMessage {
         headers: Vec<Arc<block::Header>>,
         body_sizes: Vec<u32>,
         tree_aux_roots: Vec<BlockCommitmentRoots>,
-        rsp_tx: oneshot::Sender<Result<block::Hash, CommitHeaderRangeError>>,
+        rsp_tx: oneshot::Sender<Result<HeaderRangeCommitOutcome, CommitHeaderRangeError>>,
     },
     /// The hash of a block that should be invalidated and removed from
     /// the non-finalized state, if present.
@@ -358,6 +475,10 @@ impl WriteBlockWorkerTask {
                 }) => {
                     commit_header_range(
                         finalized_state,
+                        non_finalized_state,
+                        chain_tip_sender,
+                        non_finalized_state_sender,
+                        backup_dir_path.as_deref(),
                         anchor,
                         headers,
                         body_sizes,
@@ -551,6 +672,10 @@ impl WriteBlockWorkerTask {
                 } => {
                     commit_header_range(
                         finalized_state,
+                        non_finalized_state,
+                        chain_tip_sender,
+                        non_finalized_state_sender,
+                        backup_dir_path.as_deref(),
                         anchor,
                         headers,
                         body_sizes,
@@ -836,6 +961,230 @@ mod tests {
         assert_eq!(
             finalized_state.db.headers_by_height_range(best_height, 1),
             vec![(best_height, best_block.hash(), best_block.header.clone())],
+        );
+    }
+
+    /// Builds a three-block non-finalized chain plus the channel plumbing the
+    /// switch orchestration needs.
+    fn orchestration_fixture(
+        network: &Network,
+    ) -> (
+        NonFinalizedState,
+        FinalizedState,
+        Vec<Arc<zebra_chain::block::Block>>,
+        crate::service::ChainTipSender,
+        crate::LatestChainTip,
+        crate::ChainTipChange,
+        tokio::sync::watch::Sender<NonFinalizedState>,
+        tokio::sync::watch::Receiver<NonFinalizedState>,
+    ) {
+        let block1: Arc<zebra_chain::block::Block> = Arc::new(
+            network
+                .test_block(653599, 583999)
+                .expect("test block exists"),
+        );
+        let block2 = block1.make_fake_child().set_work(10);
+        let block3 = block2.make_fake_child().set_work(1);
+
+        let mut non_finalized_state = NonFinalizedState::new(network);
+        let finalized_state = FinalizedState::new(
+            &Config::ephemeral(),
+            network,
+            #[cfg(feature = "elasticsearch")]
+            false,
+        );
+        finalized_state.set_finalized_value_pool(ValueBalance::fake_populated_pool());
+
+        non_finalized_state
+            .commit_new_chain(block1.clone().prepare(), &finalized_state)
+            .expect("chain root commits");
+        non_finalized_state
+            .commit_block(block2.clone().prepare(), &finalized_state)
+            .expect("child commits");
+        non_finalized_state
+            .commit_block(block3.clone().prepare(), &finalized_state)
+            .expect("grandchild commits");
+
+        let (chain_tip_sender, latest_chain_tip, chain_tip_change) =
+            crate::service::ChainTipSender::new(None, network);
+        let (nf_sender, nf_receiver) = tokio::sync::watch::channel(NonFinalizedState::new(network));
+
+        (
+            non_finalized_state,
+            finalized_state,
+            vec![block1, block2, block3],
+            chain_tip_sender,
+            latest_chain_tip,
+            chain_tip_change,
+            nf_sender,
+            nf_receiver,
+        )
+    }
+
+    /// A stranded suffix is rolled back from the reorged height up, keeping
+    /// the shared prefix, and the truncated chain is published.
+    #[test]
+    fn stranded_body_suffix_rolls_back_from_the_fork() {
+        let _init_guard = zebra_test::init();
+        let network = Network::Mainnet;
+        let (
+            mut non_finalized_state,
+            _finalized_state,
+            blocks,
+            mut chain_tip_sender,
+            _latest_chain_tip,
+            _chain_tip_change,
+            nf_sender,
+            nf_receiver,
+        ) = orchestration_fixture(&network);
+
+        let reorged_at = blocks[1].coinbase_height().expect("fake child has height");
+        super::invalidate_stranded_body_suffix(
+            &mut non_finalized_state,
+            &mut chain_tip_sender,
+            &nf_sender,
+            None,
+            reorged_at,
+            zebra_chain::block::Hash([0xAB; 32]),
+        );
+
+        let best_chain = non_finalized_state
+            .best_chain()
+            .expect("the shared prefix survives");
+        assert!(best_chain.contains_block_hash(blocks[0].hash()));
+        assert!(!best_chain.contains_block_hash(blocks[1].hash()));
+        assert!(!best_chain.contains_block_hash(blocks[2].hash()));
+
+        // The truncated chain was published to the watch channel.
+        assert!(nf_receiver
+            .borrow()
+            .best_chain()
+            .is_some_and(|chain| !chain.contains_block_hash(blocks[1].hash())));
+    }
+
+    /// Invalidation is a rollback, not a ban: the rolled-back block
+    /// revalidates and recommits if its branch wins again later.
+    #[test]
+    fn stranded_suffix_rollback_is_not_a_ban() {
+        let _init_guard = zebra_test::init();
+        let network = Network::Mainnet;
+        let (
+            mut non_finalized_state,
+            finalized_state,
+            blocks,
+            mut chain_tip_sender,
+            _latest_chain_tip,
+            _chain_tip_change,
+            nf_sender,
+            _nf_receiver,
+        ) = orchestration_fixture(&network);
+
+        let reorged_at = blocks[1].coinbase_height().expect("fake child has height");
+        super::invalidate_stranded_body_suffix(
+            &mut non_finalized_state,
+            &mut chain_tip_sender,
+            &nf_sender,
+            None,
+            reorged_at,
+            zebra_chain::block::Hash([0xAB; 32]),
+        );
+
+        non_finalized_state
+            .commit_block(blocks[1].clone().prepare(), &finalized_state)
+            .expect("a rolled-back block recommits when its branch wins again");
+        assert!(non_finalized_state
+            .best_chain()
+            .expect("chain is non-empty")
+            .contains_block_hash(blocks[1].hash()));
+    }
+
+    /// Rolling back from the non-finalized root empties the chain set: the
+    /// orchestration must skip the tip publish instead of panicking on the
+    /// empty state.
+    #[test]
+    fn whole_suffix_rollback_skips_publish_without_panicking() {
+        let _init_guard = zebra_test::init();
+        let network = Network::Mainnet;
+        let (
+            mut non_finalized_state,
+            _finalized_state,
+            blocks,
+            mut chain_tip_sender,
+            _latest_chain_tip,
+            _chain_tip_change,
+            nf_sender,
+            nf_receiver,
+        ) = orchestration_fixture(&network);
+
+        let reorged_at = blocks[0].coinbase_height().expect("root has height");
+        super::invalidate_stranded_body_suffix(
+            &mut non_finalized_state,
+            &mut chain_tip_sender,
+            &nf_sender,
+            None,
+            reorged_at,
+            zebra_chain::block::Hash([0xAB; 32]),
+        );
+
+        assert!(non_finalized_state.best_chain().is_none());
+        // The emptied state was still published to the watch channel.
+        assert!(nf_receiver.borrow().best_chain().is_none());
+    }
+
+    /// Heights the body chain does not reach, and heights where the body
+    /// chain already matches the new branch, are left untouched.
+    #[test]
+    fn rollback_is_a_noop_when_bodies_match_or_are_absent() {
+        let _init_guard = zebra_test::init();
+        let network = Network::Mainnet;
+        let (
+            mut non_finalized_state,
+            _finalized_state,
+            blocks,
+            mut chain_tip_sender,
+            _latest_chain_tip,
+            _chain_tip_change,
+            nf_sender,
+            _nf_receiver,
+        ) = orchestration_fixture(&network);
+
+        // The body chain already holds the "new" hash at the reorged height.
+        let reorged_at = blocks[1].coinbase_height().expect("fake child has height");
+        super::invalidate_stranded_body_suffix(
+            &mut non_finalized_state,
+            &mut chain_tip_sender,
+            &nf_sender,
+            None,
+            reorged_at,
+            blocks[1].hash(),
+        );
+        assert_eq!(
+            non_finalized_state
+                .best_chain()
+                .expect("chain untouched")
+                .blocks
+                .len(),
+            3
+        );
+
+        // A reorg entirely above the body tip has nothing to roll back.
+        let above_tip =
+            (blocks[2].coinbase_height().expect("has height") + 100).expect("height in range");
+        super::invalidate_stranded_body_suffix(
+            &mut non_finalized_state,
+            &mut chain_tip_sender,
+            &nf_sender,
+            None,
+            above_tip,
+            zebra_chain::block::Hash([0xAB; 32]),
+        );
+        assert_eq!(
+            non_finalized_state
+                .best_chain()
+                .expect("chain untouched")
+                .blocks
+                .len(),
+            3
         );
     }
 }
