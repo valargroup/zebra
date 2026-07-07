@@ -4991,3 +4991,498 @@ async fn misbehavior_is_recorded_without_disconnecting_the_peer() {
         "misbehavior is record-only: an InvalidStatus peer must NOT be disconnected",
     );
 }
+
+// === Header-sync reorg suite ===
+//
+// Scenario-matrix tests for reorg handling across the reactor's chain-selection
+// surface: equal-height reorg commits, tip forks on a fully synced node, and
+// post-reanchor recovery across a dead branch. Companion driver-level scenarios
+// live in `zebrad/src/commands/start.rs` (`zakura_header_sync_driver_tests`).
+
+/// A conflicting-but-heavier range can commit at the SAME tip height (the
+/// store adjudicates cumulative work, not length). The reactor only advances
+/// its best tip on strictly higher heights, so after an equal-height reorg it
+/// keeps advertising the reorged-away hash until the next full block on the
+/// winning branch reaches it through the chain-tip mirror.
+#[tokio::test(flavor = "current_thread")]
+async fn equal_height_reorg_commit_heals_via_next_full_block_commit() {
+    let network = regtest_network();
+    let stale_tip = (block::Height(3), block::Hash([0xAA; 32]));
+    let fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some(stale_tip),
+    ));
+    let mut tip = fixture.handle.subscribe_tip();
+
+    let reorged_hash = block::Hash([0xBB; 32]);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(1),
+            tip_height: block::Height(3),
+            tip_hash: reorged_hash,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), tip.changed())
+            .await
+            .is_err(),
+        "an equal-height reorg commit does not move the best-tip watch",
+    );
+    assert_eq!(
+        fixture.handle.best_header_tip(),
+        stale_tip,
+        "documented gap: the reactor still holds the reorged-away hash at the same height",
+    );
+
+    // The winning branch's next full block advances both height and hash.
+    let heal_hash = block::Hash([0xBC; 32]);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(4),
+            hash: heal_hash,
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+    tip.changed().await.unwrap();
+    assert_eq!(
+        fixture.handle.best_header_tip(),
+        (block::Height(4), heal_hash),
+    );
+}
+
+/// The `NewBlock` variant of the equal-height reorg: a best-chain accept at
+/// the current best height (a tip reorg the block just won) does not replace
+/// the best header hash; the next strictly higher accept does.
+#[tokio::test(flavor = "current_thread")]
+async fn equal_height_best_chain_new_block_heals_via_next_higher_accept() {
+    let network = regtest_network();
+    let stale_tip = (block::Height(1), block::Hash([0xAA; 32]));
+    let fixture = spawn_test_reactor(startup_for(
+        network.clone(),
+        (block::Height(0), network.genesis_hash()),
+        Some(stale_tip),
+    ));
+    let mut tip = fixture.handle.subscribe_tip();
+
+    let reorged_hash = block::Hash([0xBB; 32]);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::NewBlockAccepted {
+            peer: peer(21),
+            height: block::Height(1),
+            hash: reorged_hash,
+            block: mainnet_block(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), tip.changed())
+            .await
+            .is_err(),
+        "an equal-height best-chain NewBlock does not move the best-tip watch",
+    );
+    assert_eq!(
+        fixture.handle.best_header_tip(),
+        stale_tip,
+        "documented gap: the reactor still holds the reorged-away hash at the same height",
+    );
+
+    let heal_hash = block::Hash([0xBC; 32]);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::NewBlockAccepted {
+            peer: peer(21),
+            height: block::Height(2),
+            hash: heal_hash,
+            block: mainnet_block(&BLOCK_MAINNET_2_BYTES),
+        })
+        .await
+        .unwrap();
+    tip.changed().await.unwrap();
+    assert_eq!(
+        fixture.handle.best_header_tip(),
+        (block::Height(2), heal_hash),
+    );
+}
+
+/// A fully synced node (best header tip == verified block tip) that sees a tip
+/// fork cannot use the stale-anchor reanchor: the walk-back gate requires
+/// `best_header_tip > verified_block_tip`. Link failures are recorded as
+/// (record-only) `InvalidRange` misbehavior against honest peers and the range
+/// stalls once every peer holds an assignment; the body-sync path's
+/// `FullBlockCommitted` is what heals the reactor. The fleet lineage's
+/// walk-back (#476) resolves this at the header layer instead.
+#[tokio::test(flavor = "current_thread")]
+async fn synced_tip_fork_records_misbehavior_without_reanchor_until_body_heal() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let synced_tip = (block::Height(3), block::Hash([0xA3; 32]));
+    let mut startup = HeaderSyncStartup::new(
+        network.clone(),
+        anchor,
+        HeaderSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: synced_tip.0,
+            verified_block_hash: synced_tip.1,
+        },
+        Some(synced_tip),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+    let peers = [peer(71), peer(72)];
+
+    for peer_id in peers.iter().cloned() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            anchor.0,
+            block::Height(4),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+
+    // Both peers get the forward range above the fork and both responses fail
+    // to link (their branch's block 4 does not extend our dead tip). With the
+    // reanchor gated off, each failure is a record-only InvalidRange and the
+    // assignments are never cleared, so requests stop after one per peer.
+    let mut get_headers_seen = 0;
+    let mut misbehavior_seen = 0;
+    while get_headers_seen < 2 || misbehavior_seen < 2 {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::SendMessage {
+                peer: served_peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots: true,
+                    },
+            } => {
+                assert_eq!(start_height, block::Height(4));
+                assert_eq!(count, 1);
+                get_headers_seen += 1;
+                fixture
+                    .handle
+                    .send(HeaderSyncEvent::WireMessage {
+                        peer: served_peer,
+                        msg: headers_message_from(
+                            start_height,
+                            vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+                        ),
+                    })
+                    .await
+                    .unwrap();
+            }
+            HeaderSyncAction::Misbehavior { reason, .. } => {
+                assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+                misbehavior_seen += 1;
+            }
+            HeaderSyncAction::HeaderReanchored { .. } => {
+                panic!("a synced node must not reanchor below its verified tip")
+            }
+            _ => {}
+        }
+    }
+
+    // The range wedges: no further requests, no reanchor, tip unchanged.
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        assert!(
+            !matches!(
+                action,
+                HeaderSyncAction::SendMessage {
+                    msg: HeaderSyncMessage::GetHeaders { .. },
+                    ..
+                } | HeaderSyncAction::HeaderReanchored { .. }
+            ),
+            "wedged tip fork must not keep requesting or reanchor: {action:?}",
+        );
+    }
+    assert_eq!(fixture.handle.best_header_tip(), synced_tip);
+
+    // The body path (chain-tip mirror) heals the reactor once the winning
+    // branch's next block commits.
+    let heal_hash = block::Hash([0xB4; 32]);
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(4),
+            hash: heal_hash,
+            header: mainnet_header(&BLOCK_MAINNET_1_BYTES),
+        })
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fixture.handle.best_header_tip() != (block::Height(4), heal_hash) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "FullBlockCommitted heals the wedged tip fork",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// After a stale-anchor reanchor, the recovery range must span the dead branch
+/// (start at verified+1 and reach the taller peer tip) even when this session
+/// already marked the dead branch's heights covered: the covered watermark
+/// only suppresses fully contained ranges.
+#[tokio::test(flavor = "current_thread")]
+async fn post_reanchor_recovery_range_spans_dead_branch_despite_covered_watermark() {
+    let network = regtest_network();
+    let verified = (block::Height(0), network.genesis_hash());
+    let stranded_tip = (block::Height(3), block::Hash([3; 32]));
+    let mut startup = HeaderSyncStartup::new(
+        network.clone(),
+        verified,
+        HeaderSyncFrontiers {
+            finalized_height: verified.0,
+            verified_block_tip: verified.0,
+            verified_block_hash: verified.1,
+        },
+        Some(stranded_tip),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+
+    // A prior commit this session marked the dead branch's heights covered.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(1),
+            tip_height: stranded_tip.0,
+            tip_hash: stranded_tip.1,
+        })
+        .await
+        .unwrap();
+
+    let peers = [peer(81), peer(82)];
+    for peer_id in peers.iter().cloned() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            verified.0,
+            block::Height(4),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+
+    // Three non-linking responses from two distinct peers trip the reanchor.
+    for _ in 0..3 {
+        let (served_peer, start_height, count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(start_height, block::Height(4));
+        assert_eq!(count, 1);
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireMessage {
+                peer: served_peer,
+                msg: headers_message_from(
+                    start_height,
+                    vec![mainnet_header(&BLOCK_MAINNET_1_BYTES)],
+                ),
+            })
+            .await
+            .unwrap();
+    }
+
+    // The recovery range starts at verified+1 and spans the whole dead branch
+    // up to the taller peer tip, so the store can adjudicate the fork.
+    let mut saw_reanchor = false;
+    for _ in 0..10 {
+        match next_non_query_action(&mut fixture.actions).await {
+            HeaderSyncAction::HeaderReanchored { old, new } => {
+                assert_eq!(old, stranded_tip);
+                assert_eq!(new, verified);
+                saw_reanchor = true;
+            }
+            HeaderSyncAction::SendMessage {
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        want_tree_aux_roots: true,
+                    },
+                ..
+            } if saw_reanchor => {
+                assert_eq!(
+                    start_height,
+                    block::Height(1),
+                    "recovery range starts just above the verified anchor",
+                );
+                assert_eq!(
+                    count, 4,
+                    "recovery range spans the covered dead branch to the peer tip",
+                );
+                return;
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+            }
+            _ => {}
+        }
+    }
+    panic!("reanchor did not produce a recovery range spanning the dead branch");
+}
+
+/// The 2026-07-07 testnet-4 wedge shape, live from the gate-ironwood soak:
+/// during a tip race the state rejected a linking next-height range from
+/// three distinct peers (kind = `InvalidPeerRange`). Those failures never
+/// clear the range's assignment set, so once `HEADER_SYNC_FANOUT` distinct
+/// peers have failed it, `pop_assignable` can never hand the range out again
+/// and `ensure_forward` refuses to queue a fresh range at the same start
+/// height — forward header sync halts permanently even while peers keep
+/// advertising higher tips. Only a full-block commit at the contested height
+/// (gossip/body path) covers the range and prunes the leaked assignment.
+#[tokio::test(flavor = "current_thread")]
+async fn fanout_exhausting_invalid_range_commit_failures_wedge_forward_sync_until_body_heal() {
+    let network = regtest_network();
+    let anchor = (block::Height(0), network.genesis_hash());
+    let fixture_startup = startup_for(network.clone(), anchor, None);
+    let mut fixture = spawn_test_reactor(fixture_startup);
+    let peers = [peer(91), peer(92), peer(93)];
+
+    for peer_id in peers.iter().cloned() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            anchor.0,
+            block::Height(1),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+
+    // A header that links to the anchor and passes regtest stateless checks,
+    // so every hedged response reaches the commit stage.
+    let mut served = *mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    served.previous_block_hash = anchor.1;
+    let served = Arc::new(served);
+
+    // The forward range {1,1} fans out to all three peers; serve each one.
+    let mut served_peers = Vec::new();
+    while served_peers.len() < 3 {
+        let (served_peer, start_height, count) =
+            next_outbound_get_headers(&mut fixture.actions).await;
+        assert_eq!(start_height, block::Height(1));
+        assert_eq!(count, 1);
+        fixture
+            .handle
+            .send(HeaderSyncEvent::WireMessage {
+                peer: served_peer.clone(),
+                msg: headers_message_from(start_height, vec![served.clone()]),
+            })
+            .await
+            .unwrap();
+        served_peers.push(served_peer);
+    }
+
+    // All three responses validate and dispatch commits.
+    let mut commits_seen = 0;
+    while commits_seen < 3 {
+        if let HeaderSyncAction::CommitHeaderRange { start_height, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(start_height, block::Height(1));
+            commits_seen += 1;
+        }
+    }
+
+    // The state rejects each commit as an invalid peer range (the live
+    // incident hit this via a tip-race conflict at the contested height).
+    for peer_id in served_peers {
+        fixture
+            .handle
+            .send(HeaderSyncEvent::HeaderRangeCommitFailed {
+                peer: peer_id,
+                start_height: block::Height(1),
+                count: 1,
+                kind: HeaderSyncCommitFailureKind::InvalidPeerRange,
+            })
+            .await
+            .unwrap();
+    }
+    let mut violations = 0;
+    while violations < 3 {
+        if let HeaderSyncAction::Misbehavior { reason, .. } =
+            next_non_query_action(&mut fixture.actions).await
+        {
+            assert_eq!(reason, HeaderSyncMisbehavior::InvalidRange);
+            violations += 1;
+        }
+    }
+
+    // A fresh peer advertising a higher tip cannot revive the schedule: the
+    // wedged range's assignment set is full and a wider replacement range at
+    // the same start height is refused. Documented gap — forward sync is
+    // halted here today.
+    let fresh_peer = peer(94);
+    connect_peer(&fixture, fresh_peer.clone()).await;
+    advertise_tip(
+        &fixture,
+        fresh_peer,
+        anchor.0,
+        block::Height(2),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+    while let Ok(Some(action)) = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        fixture.actions.recv(),
+    )
+    .await
+    {
+        assert!(
+            !matches!(
+                action,
+                HeaderSyncAction::SendMessage {
+                    msg: HeaderSyncMessage::GetHeaders { .. },
+                    ..
+                }
+            ),
+            "documented gap: fanout-exhausted range must wedge forward sync: {action:?}",
+        );
+    }
+
+    // A full-block commit at the contested height covers the range, prunes
+    // the leaked assignment, and forward sync resumes above it.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::FullBlockCommitted {
+            height: block::Height(1),
+            hash: block::Hash([0xF1; 32]),
+            header: served,
+        })
+        .await
+        .unwrap();
+    let (_healed_peer, start_height, count) = next_outbound_get_headers(&mut fixture.actions).await;
+    assert_eq!(
+        start_height,
+        block::Height(2),
+        "body-path heal resumes forward sync above the covered height",
+    );
+    assert_eq!(count, 1);
+}
