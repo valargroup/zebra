@@ -222,6 +222,20 @@ pub struct Config {
     /// This value is not used by the legacy TCP peer set.
     pub zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
 
+    /// Follow Zebra's default P2P stack selection for the configured network.
+    ///
+    /// This is enabled by default so Zebra can change network defaults during upgrades. When this
+    /// is `true`, Zebra ignores [`legacy_p2p`](Self::legacy_p2p) and
+    /// [`v2_p2p`](Self::v2_p2p) in `zebrad.toml`, and uses the selected network's binary defaults
+    /// instead.
+    ///
+    /// The current defaults are: legacy P2P on for Mainnet, Testnet, and Regtest; Zakura P2P v2
+    /// off on Mainnet; and Zakura P2P v2 on for Testnet and Regtest.
+    ///
+    /// Set `default_p2p = false` only when you want [`legacy_p2p`](Self::legacy_p2p) and
+    /// [`v2_p2p`](Self::v2_p2p) to be fixed manual overrides.
+    pub default_p2p: bool,
+
     /// Enable the experimental Zakura P2P v2 endpoint, capability advertisement, and upgrade hook.
     ///
     /// When enabled, Zebra starts a native Zakura endpoint, advertises the P2P v2 service bit during
@@ -229,9 +243,8 @@ pub struct Config {
     /// before constructing a legacy peer connection if [`legacy_p2p`](Self::legacy_p2p) is also
     /// enabled.
     ///
-    /// In `zebrad.toml`, set `v2_p2p = "default"` to follow Zebra's network defaults: disabled on
-    /// Mainnet, enabled on Testnet, Regtest, and other networks. Set `v2_p2p = true` or
-    /// `v2_p2p = false` to override that network default.
+    /// In `zebrad.toml`, this setting is used only when [`default_p2p`](Self::default_p2p) is
+    /// `false`.
     ///
     /// Until the Zakura supervisor and endpoint connector support legacy upgrades, mutually
     /// capable peers continue on the legacy Zebra path after a temporary Zakura upgrade rejection.
@@ -239,8 +252,9 @@ pub struct Config {
 
     /// Enable the legacy TCP Zcash P2P listener, initial peer dialing, and peer crawler.
     ///
-    /// This is enabled by default to keep the current Zebra networking behavior. Disable it to run
-    /// only the native Zakura P2P v2 endpoint when [`v2_p2p`](Self::v2_p2p) is enabled.
+    /// In `zebrad.toml`, this setting is used only when [`default_p2p`](Self::default_p2p) is
+    /// `false`. Disable it to run only the native Zakura P2P v2 endpoint when
+    /// [`v2_p2p`](Self::v2_p2p) is enabled.
     pub legacy_p2p: bool,
 
     /// Native Zakura endpoint, connection, and bootstrap settings.
@@ -774,6 +788,7 @@ impl Default for Config {
             cache_dir: CacheDir::default(),
             identity_dir: default_network_identity_dir(),
             zakura_node_secret_key: None,
+            default_p2p: true,
             v2_p2p: default_v2_p2p_for_network(&Network::Mainnet),
             legacy_p2p: true,
             zakura: ZakuraConfig::default(),
@@ -796,6 +811,13 @@ fn default_v2_p2p_for_network(network: &Network) -> bool {
     !matches!(network, Network::Mainnet)
 }
 
+fn default_p2p_for_network(network: &Network) -> (bool, bool) {
+    let legacy_p2p = true;
+    let v2_p2p = default_v2_p2p_for_network(network);
+
+    (legacy_p2p, v2_p2p)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum V2P2pPreference {
     #[default]
@@ -808,14 +830,6 @@ impl V2P2pPreference {
         match self {
             V2P2pPreference::Default => default_v2_p2p_for_network(network),
             V2P2pPreference::Explicit(v2_p2p) => v2_p2p,
-        }
-    }
-
-    fn from_resolved(network: &Network, v2_p2p: bool) -> Self {
-        if v2_p2p == default_v2_p2p_for_network(network) {
-            V2P2pPreference::Default
-        } else {
-            V2P2pPreference::Explicit(v2_p2p)
         }
     }
 }
@@ -932,6 +946,7 @@ struct DConfig {
     identity_dir: PathBuf,
     #[serde(default, skip_serializing)]
     zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
+    default_p2p: bool,
     #[serde(default, alias = "enable_p2p_v2")]
     v2_p2p: V2P2pPreference,
     legacy_p2p: Option<bool>,
@@ -955,7 +970,8 @@ impl Default for DConfig {
             cache_dir: config.cache_dir,
             identity_dir: config.identity_dir,
             zakura_node_secret_key: config.zakura_node_secret_key,
-            v2_p2p: V2P2pPreference::Default,
+            default_p2p: true,
+            v2_p2p: V2P2pPreference::Explicit(config.v2_p2p),
             legacy_p2p: None,
             zakura: config.zakura,
             peerset_initial_target_size: config.peerset_initial_target_size,
@@ -1015,6 +1031,7 @@ impl From<Config> for DConfig {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
+            default_p2p,
             v2_p2p,
             legacy_p2p,
             zakura,
@@ -1043,7 +1060,7 @@ impl From<Config> for DConfig {
 
             other_kind => DNetwork::DefaultForKind(other_kind),
         };
-        let v2_p2p = V2P2pPreference::from_resolved(&network, v2_p2p);
+        let v2_p2p = V2P2pPreference::Explicit(v2_p2p);
 
         DConfig {
             listen_addr: listen_addr.to_string(),
@@ -1055,6 +1072,7 @@ impl From<Config> for DConfig {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
+            default_p2p,
             v2_p2p,
             legacy_p2p: Some(legacy_p2p),
             zakura,
@@ -1080,6 +1098,7 @@ impl<'de> Deserialize<'de> for Config {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
+            default_p2p,
             v2_p2p,
             legacy_p2p,
             zakura,
@@ -1110,8 +1129,11 @@ impl<'de> Deserialize<'de> for Config {
             }
         };
 
-        let v2_p2p = v2_p2p.resolve(&network);
-        let legacy_p2p = legacy_p2p.unwrap_or(true);
+        let (legacy_p2p, v2_p2p) = if default_p2p {
+            default_p2p_for_network(&network)
+        } else {
+            (legacy_p2p.unwrap_or(true), v2_p2p.resolve(&network))
+        };
 
         let listen_addr = match listen_addr.parse::<SocketAddr>().or_else(|_| format!("{listen_addr}:{}", network.default_port()).parse()) {
             Ok(socket) => Ok(socket),
@@ -1205,6 +1227,7 @@ impl<'de> Deserialize<'de> for Config {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
+            default_p2p,
             v2_p2p,
             legacy_p2p,
             zakura,

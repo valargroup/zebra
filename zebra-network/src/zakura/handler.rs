@@ -5509,6 +5509,7 @@ mod tests {
 
     fn v2_enabled_config() -> Config {
         Config {
+            default_p2p: false,
             v2_p2p: true,
             ..Config::default()
         }
@@ -5518,6 +5519,7 @@ mod tests {
     async fn v2_p2p_false_leaves_header_sync_disabled() -> Result<(), BoxError> {
         let _guard = zebra_test::init();
         let config = Config {
+            default_p2p: false,
             v2_p2p: false,
             ..Config::default()
         };

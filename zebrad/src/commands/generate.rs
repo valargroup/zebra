@@ -110,8 +110,23 @@ fn document_network_p2p_config(config: &str) -> String {
         return config.to_string();
     };
 
-    let v2_p2p_line = lines.remove(v2_p2p_index);
-    network_end -= 1;
+    let Some(default_p2p_index) = lines[network_start + 1..network_end]
+        .iter()
+        .position(|line| line.starts_with("default_p2p = "))
+        .map(|index| index + network_start + 1)
+    else {
+        return config.to_string();
+    };
+
+    let default_p2p_line = lines[default_p2p_index].clone();
+    let v2_p2p_line = lines[v2_p2p_index].clone();
+    let mut p2p_indexes = [default_p2p_index, v2_p2p_index];
+    p2p_indexes.sort();
+
+    for index in p2p_indexes.into_iter().rev() {
+        lines.remove(index);
+        network_end -= 1;
+    }
 
     let Some(legacy_p2p_index) = lines[network_start + 1..network_end]
         .iter()
@@ -122,16 +137,18 @@ fn document_network_p2p_config(config: &str) -> String {
     };
 
     let comments = [
-        "# P2P stack selection. `legacy_p2p` controls the legacy TCP stack.",
-        "# `v2_p2p` accepts \"default\", true, or false. \"default\" disables",
-        "# Zakura P2P v2 on Mainnet and enables it on Testnet, Regtest, and other networks.",
-        "# Set `v2_p2p` to true or false to override the selected network's default.",
+        "# P2P stack selection:",
+        "# - default_p2p = true ignores legacy_p2p and v2_p2p, using Zebra's binary defaults.",
+        "# - default_p2p = false makes legacy_p2p and v2_p2p manual overrides.",
+        "# Defaults: Mainnet legacy on/v2 off; Testnet and Regtest legacy on/v2 on.",
     ]
     .map(ToString::to_string);
     let comments_len = comments.len();
 
     lines.splice(legacy_p2p_index..legacy_p2p_index, comments);
-    let v2_p2p_insert_index = legacy_p2p_index + comments_len + 1;
+    let default_p2p_insert_index = legacy_p2p_index + comments_len;
+    lines.insert(default_p2p_insert_index, default_p2p_line);
+    let v2_p2p_insert_index = default_p2p_insert_index + 1;
     lines.insert(v2_p2p_insert_index, v2_p2p_line);
 
     let mut output = lines.join("\n");
