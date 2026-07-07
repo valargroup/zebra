@@ -12,9 +12,9 @@
 //!
 //! This module runs the store audit once at [`ZebraDb`] startup and repairs
 //! any violation by truncating the zakura column families to the last
-//! coherent height in one atomic batch. Headers are re-fetchable — header
-//! sync re-downloads the truncated suffix — so correctness beats preserved
-//! rows: any residual write-path bug in this class becomes a self-healing,
+//! coherent height in bounded batches. Headers are re-fetchable — header sync
+//! re-downloads the truncated suffix — so correctness beats preserved rows:
+//! any residual write-path bug in this class becomes a self-healing,
 //! observable transient instead of a permanent on-disk wedge.
 //!
 //! The audit cost is `O(header frontier)`: the zakura column families only
@@ -22,10 +22,7 @@
 //! to remove), and the verified commitment-roots history below the tip is
 //! never scanned.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{fmt::Debug, ops::Bound::*, sync::Arc};
 
 use zebra_chain::block::{self, Height};
 
@@ -34,8 +31,8 @@ use super::{
     ZAKURA_HEADER_HASH_BY_HEIGHT, ZAKURA_HEADER_HEIGHT_BY_HASH,
 };
 use crate::service::finalized_state::{
-    disk_db::{DiskWriteBatch, WriteDisk},
-    disk_format::shielded::CommitmentRootsByHeight,
+    disk_db::{DiskWriteBatch, ReadDisk, WriteDisk},
+    disk_format::{shielded::CommitmentRootsByHeight, FromDisk, IntoDisk},
     zebra_db::ZebraDb,
     COMMITMENT_ROOTS_BY_HEIGHT,
 };
@@ -43,6 +40,10 @@ use crate::service::finalized_state::{
 /// How many violations are included in the repair log line. The full list can
 /// be as long as the stranded suffix; the first few identify the fault shape.
 const LOGGED_VIOLATIONS: usize = 8;
+
+/// Maximum number of rows the startup audit materializes from one column
+/// family at a time. Roughly 1.5MB with 1.5 KB headers.
+const AUDIT_BATCH_ROWS: usize = 100_000;
 
 /// A single header-store invariant violation found by the startup audit.
 ///
@@ -144,7 +145,7 @@ pub(crate) struct ZakuraStoreRepair {
 
 impl ZebraDb {
     /// Audits the zakura header store invariants and repairs any violation by
-    /// deleting the offending rows in one atomic batch.
+    /// deleting the offending rows in bounded batches.
     ///
     /// Checks, over the whole zakura store (which only holds the header
     /// frontier above the finalized tip, so this is cheap):
@@ -170,7 +171,9 @@ impl ZebraDb {
     /// the repair summary after a successful repair write.
     ///
     /// Verified commitment roots at committed heights are never touched: the
-    /// roots column family is only scanned above the finalized tip.
+    /// roots column family is only scanned above the finalized tip. Each scan
+    /// is batched so a large header frontier does not have to fit in memory at
+    /// startup.
     pub(crate) fn audit_and_repair_zakura_header_store(
         &self,
     ) -> Result<Option<ZakuraStoreRepair>, rocksdb::Error> {
@@ -195,48 +198,30 @@ impl ZebraDb {
 
         let finalized_tip = self.tip();
 
-        let headers: BTreeMap<Height, Arc<block::Header>> =
-            self.db.zs_forward_range_iter(&header_cf, ..).collect();
-        let hashes: BTreeMap<Height, block::Hash> =
-            self.db.zs_forward_range_iter(&hash_cf, ..).collect();
-        let heights_by_hash: Vec<(block::Hash, Height)> = self
-            .db
-            .zs_forward_range_iter(&height_by_hash_cf, ..)
-            .collect();
-        let body_size_heights: Vec<Height> = self
-            .db
-            .zs_forward_range_iter::<_, Height, AdvertisedBodySize, _>(&body_size_cf, ..)
-            .map(|(height, _)| height)
-            .collect();
-
         // The roots column family also holds verified rows at committed
         // heights (written by body commits, kept through pruning); those are
         // not zakura frontier rows and are never audited or repaired. Only
         // rows above the finalized tip are provisional header-sync data.
         let provisional_roots_start =
             finalized_tip.and_then(|(tip_height, _)| tip_height.next().ok());
-        let provisional_root_heights: Vec<Height> = match (finalized_tip, provisional_roots_start) {
+        let provisional_roots_empty = match (finalized_tip, provisional_roots_start) {
             // The finalized tip is at the maximum height: no frontier can
             // exist above it.
-            (Some(_), None) => Vec::new(),
+            (Some(_), None) => true,
             (Some(_), Some(start)) => self
                 .db
                 .zs_forward_range_iter::<_, Height, CommitmentRootsByHeight, _>(&roots_cf, start..)
-                .map(|(height, _)| height)
-                .collect(),
+                .next()
+                .is_none(),
             // No finalized tip: every roots row is provisional.
-            (None, _) => self
-                .db
-                .zs_forward_range_iter::<_, Height, CommitmentRootsByHeight, _>(&roots_cf, ..)
-                .map(|(height, _)| height)
-                .collect(),
+            (None, _) => self.db.zs_is_empty(&roots_cf),
         };
 
-        if headers.is_empty()
-            && hashes.is_empty()
-            && heights_by_hash.is_empty()
-            && body_size_heights.is_empty()
-            && provisional_root_heights.is_empty()
+        if self.db.zs_is_empty(&header_cf)
+            && self.db.zs_is_empty(&hash_cf)
+            && self.db.zs_is_empty(&height_by_hash_cf)
+            && self.db.zs_is_empty(&body_size_cf)
+            && provisional_roots_empty
         {
             // Log the pass so operators can verify the audit ran on this boot.
             tracing::info!(
@@ -254,20 +239,20 @@ impl ZebraDb {
         // to the row below, and the reverse index round-trips. The walk stops
         // at the first missing hash row (the candidate chain tip) or the
         // first violation; everything it passed is the coherent prefix.
-        let forward_index: HashMap<block::Hash, Height> = heights_by_hash.iter().copied().collect();
         let last_coherent = finalized_tip.map(|(anchor_height, anchor_hash)| {
             let (mut last_height, mut last_hash) = (anchor_height, anchor_hash);
 
             while let Ok(height) = last_height.next() {
-                let Some(&hash) = hashes.get(&height) else {
+                let Some(hash) = self.db.zs_get(&hash_cf, &height) else {
                     break;
                 };
-                let Some(header) = headers.get(&height) else {
+                let Some(header): Option<Arc<block::Header>> = self.db.zs_get(&header_cf, &height)
+                else {
                     violations.push(ZakuraStoreViolation::MissingHeaderRow { height });
                     break;
                 };
 
-                let computed = block::Hash::from(&**header);
+                let computed = block::Hash::from(&*header);
                 if computed != hash {
                     violations.push(ZakuraStoreViolation::HeaderHashMismatch {
                         height,
@@ -286,7 +271,7 @@ impl ZebraDb {
                     break;
                 }
 
-                let indexed = forward_index.get(&hash).copied();
+                let indexed = self.db.zs_get(&height_by_hash_cf, &hash);
                 if indexed != Some(height) {
                     violations.push(ZakuraStoreViolation::WrongHeightByHash {
                         height,
@@ -319,93 +304,114 @@ impl ZebraDb {
 
         let mut batch = DiskWriteBatch::new();
         let mut deleted_rows = 0;
-
-        // Height-keyed zakura rows survive only inside the coherent window.
-        let height_keyed: [(&'static str, &rocksdb::ColumnFamilyRef<'_>, Vec<Height>); 3] = [
-            (
-                ZAKURA_HEADER_BY_HEIGHT,
-                &header_cf,
-                headers.keys().copied().collect(),
-            ),
-            (
-                ZAKURA_HEADER_HASH_BY_HEIGHT,
-                &hash_cf,
-                hashes.keys().copied().collect(),
-            ),
-            (
-                ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
-                &body_size_cf,
-                body_size_heights,
-            ),
-        ];
-        for (cf_name, cf, heights) in &height_keyed {
-            for &height in heights {
-                if in_window(height) {
-                    continue;
-                }
-
-                violations.push(if committed(height) {
-                    ZakuraStoreViolation::StaleRowAtCommittedHeight {
-                        cf: cf_name,
-                        height,
-                    }
-                } else {
-                    ZakuraStoreViolation::RowAboveLastCoherent {
-                        cf: cf_name,
-                        height,
-                    }
-                });
-
-                batch.zs_delete(*cf, height);
-                deleted_rows += 1;
-            }
-        }
+        let mut pending_deletes = 0;
 
         // Reverse-index entries survive only when their target height is
         // inside the window and stores exactly their hash. This removes the
         // reverse rows of every deleted hash row, plus entries orphaned by
         // earlier overwrites that never cleaned up the displaced hash.
-        for &(hash, points_at) in &heights_by_hash {
-            let target_matches = hashes.get(&points_at) == Some(&hash);
-            if in_window(points_at) && target_matches {
-                continue;
-            }
+        let mut start_after_hash = None;
+        loop {
+            let heights_by_hash =
+                hash_keyed_batch::<Height>(&self.db, &height_by_hash_cf, start_after_hash);
+            let Some(&(last_hash, _)) = heights_by_hash.last() else {
+                break;
+            };
+            start_after_hash = Some(last_hash);
 
-            // Entries whose forward row is deleted above are repair fallout,
-            // not separate faults; only a live-but-disagreeing target is a
-            // distinct violation shape worth reporting.
-            if target_matches {
-                violations.push(if committed(points_at) {
-                    ZakuraStoreViolation::StaleRowAtCommittedHeight {
-                        cf: ZAKURA_HEADER_HEIGHT_BY_HASH,
-                        height: points_at,
-                    }
+            for &(hash, points_at) in &heights_by_hash {
+                let target_matches =
+                    self.db.zs_get::<_, _, block::Hash>(&hash_cf, &points_at) == Some(hash);
+                if in_window(points_at) && target_matches {
+                    continue;
+                }
+
+                // Entries whose forward row is deleted above are repair fallout,
+                // not separate faults; only a live-but-disagreeing target is a
+                // distinct violation shape worth reporting.
+                if target_matches {
+                    violations.push(if committed(points_at) {
+                        ZakuraStoreViolation::StaleRowAtCommittedHeight {
+                            cf: ZAKURA_HEADER_HEIGHT_BY_HASH,
+                            height: points_at,
+                        }
+                    } else {
+                        ZakuraStoreViolation::RowAboveLastCoherent {
+                            cf: ZAKURA_HEADER_HEIGHT_BY_HASH,
+                            height: points_at,
+                        }
+                    });
                 } else {
-                    ZakuraStoreViolation::RowAboveLastCoherent {
-                        cf: ZAKURA_HEADER_HEIGHT_BY_HASH,
-                        height: points_at,
-                    }
-                });
-            } else {
-                violations.push(ZakuraStoreViolation::OrphanHeightByHash { hash, points_at });
-            }
+                    violations.push(ZakuraStoreViolation::OrphanHeightByHash { hash, points_at });
+                }
 
-            batch.zs_delete(&height_by_hash_cf, hash);
-            deleted_rows += 1;
+                queue_repair_delete(
+                    &self.db,
+                    &mut batch,
+                    &mut pending_deletes,
+                    &height_by_hash_cf,
+                    hash,
+                )?;
+                deleted_rows += 1;
+            }
         }
 
-        // Provisional roots above the window are part of the stranded suffix.
-        for &height in &provisional_root_heights {
-            if in_window(height) {
-                continue;
-            }
+        // Height-keyed zakura rows survive only inside the coherent window.
+        audit_height_keyed_rows::<Arc<block::Header>>(
+            &self.db,
+            &header_cf,
+            ZAKURA_HEADER_BY_HEIGHT,
+            &committed,
+            &in_window,
+            &mut violations,
+            &mut batch,
+            &mut pending_deletes,
+            &mut deleted_rows,
+            None,
+        )?;
+        let frontier_rows = audit_height_keyed_rows::<block::Hash>(
+            &self.db,
+            &hash_cf,
+            ZAKURA_HEADER_HASH_BY_HEIGHT,
+            &committed,
+            &in_window,
+            &mut violations,
+            &mut batch,
+            &mut pending_deletes,
+            &mut deleted_rows,
+            None,
+        )?;
+        audit_height_keyed_rows::<AdvertisedBodySize>(
+            &self.db,
+            &body_size_cf,
+            ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT,
+            &committed,
+            &in_window,
+            &mut violations,
+            &mut batch,
+            &mut pending_deletes,
+            &mut deleted_rows,
+            None,
+        )?;
 
-            violations.push(ZakuraStoreViolation::RowAboveLastCoherent {
-                cf: COMMITMENT_ROOTS_BY_HEIGHT,
-                height,
-            });
-            batch.zs_delete(&roots_cf, height);
-            deleted_rows += 1;
+        // Provisional roots above the window are part of the stranded suffix.
+        if let Some(start) = match (finalized_tip, provisional_roots_start) {
+            (Some(_), None) => None,
+            (Some(_), Some(start)) => Some(start),
+            (None, _) => Some(Height(0)),
+        } {
+            audit_height_keyed_rows::<CommitmentRootsByHeight>(
+                &self.db,
+                &roots_cf,
+                COMMITMENT_ROOTS_BY_HEIGHT,
+                &committed,
+                &in_window,
+                &mut violations,
+                &mut batch,
+                &mut pending_deletes,
+                &mut deleted_rows,
+                Some(start),
+            )?;
         }
 
         if violations.is_empty() {
@@ -414,7 +420,7 @@ impl ZebraDb {
             tracing::info!(
                 ?finalized_tip,
                 ?last_coherent,
-                frontier_rows = hashes.len(),
+                frontier_rows,
                 "zakura header store passed its startup coherence audit"
             );
             return Ok(None);
@@ -431,7 +437,7 @@ impl ZebraDb {
              truncating to the last coherent height so header sync re-downloads the rest"
         );
 
-        self.db.write(batch)?;
+        flush_repair_batch(&self.db, &mut batch, &mut pending_deletes)?;
 
         Ok(Some(ZakuraStoreRepair {
             last_coherent,
@@ -439,4 +445,127 @@ impl ZebraDb {
             violations,
         }))
     }
+}
+
+fn height_keyed_batch<V>(
+    db: &crate::service::finalized_state::disk_db::DiskDb,
+    cf: &rocksdb::ColumnFamilyRef<'_>,
+    start: Height,
+) -> Vec<Height>
+where
+    V: FromDisk,
+{
+    db.zs_forward_range_iter::<_, Height, V, _>(cf, start..)
+        .map(|(height, _)| height)
+        .take(AUDIT_BATCH_ROWS)
+        .collect()
+}
+
+fn hash_keyed_batch<V>(
+    db: &crate::service::finalized_state::disk_db::DiskDb,
+    cf: &rocksdb::ColumnFamilyRef<'_>,
+    start_after: Option<block::Hash>,
+) -> Vec<(block::Hash, V)>
+where
+    V: FromDisk,
+{
+    match start_after {
+        Some(start_after) => db
+            .zs_forward_range_iter::<_, block::Hash, V, _>(cf, (Excluded(start_after), Unbounded))
+            .take(AUDIT_BATCH_ROWS)
+            .collect(),
+        None => db
+            .zs_forward_range_iter::<_, block::Hash, V, _>(cf, ..)
+            .take(AUDIT_BATCH_ROWS)
+            .collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_height_keyed_rows<V>(
+    db: &crate::service::finalized_state::disk_db::DiskDb,
+    cf: &rocksdb::ColumnFamilyRef<'_>,
+    cf_name: &'static str,
+    committed: &impl Fn(Height) -> bool,
+    in_window: &impl Fn(Height) -> bool,
+    violations: &mut Vec<ZakuraStoreViolation>,
+    batch: &mut DiskWriteBatch,
+    pending_deletes: &mut usize,
+    deleted_rows: &mut usize,
+    start: Option<Height>,
+) -> Result<usize, rocksdb::Error>
+where
+    V: FromDisk,
+{
+    let mut next_start = start.unwrap_or(Height(0));
+    let mut scanned_rows = 0;
+
+    loop {
+        let heights = height_keyed_batch::<V>(db, cf, next_start);
+        let Some(&last_height) = heights.last() else {
+            break;
+        };
+        scanned_rows += heights.len();
+        next_start = match last_height.next() {
+            Ok(next_height) => next_height,
+            Err(_) => break,
+        };
+
+        for height in heights {
+            if in_window(height) {
+                continue;
+            }
+
+            violations.push(if committed(height) {
+                ZakuraStoreViolation::StaleRowAtCommittedHeight {
+                    cf: cf_name,
+                    height,
+                }
+            } else {
+                ZakuraStoreViolation::RowAboveLastCoherent {
+                    cf: cf_name,
+                    height,
+                }
+            });
+
+            queue_repair_delete(db, batch, pending_deletes, cf, height)?;
+            *deleted_rows += 1;
+        }
+    }
+
+    Ok(scanned_rows)
+}
+
+fn queue_repair_delete<K>(
+    db: &crate::service::finalized_state::disk_db::DiskDb,
+    batch: &mut DiskWriteBatch,
+    pending_deletes: &mut usize,
+    cf: &rocksdb::ColumnFamilyRef<'_>,
+    key: K,
+) -> Result<(), rocksdb::Error>
+where
+    K: IntoDisk + Debug,
+{
+    batch.zs_delete(cf, key);
+    *pending_deletes += 1;
+
+    if *pending_deletes >= AUDIT_BATCH_ROWS {
+        flush_repair_batch(db, batch, pending_deletes)?;
+    }
+
+    Ok(())
+}
+
+fn flush_repair_batch(
+    db: &crate::service::finalized_state::disk_db::DiskDb,
+    batch: &mut DiskWriteBatch,
+    pending_deletes: &mut usize,
+) -> Result<(), rocksdb::Error> {
+    if *pending_deletes == 0 {
+        return Ok(());
+    }
+
+    db.write(std::mem::take(batch))?;
+    *pending_deletes = 0;
+    Ok(())
 }
