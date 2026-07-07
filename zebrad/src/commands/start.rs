@@ -2869,6 +2869,7 @@ mod zakura_header_sync_driver_tests {
         let genesis_hash = network.genesis_hash();
         let mut config = zebra_network::Config {
             network: network.clone(),
+            v2_p2p: true,
             ..zebra_network::Config::default()
         };
         config.zakura.listen_addr = None;
@@ -2977,6 +2978,7 @@ mod zakura_header_sync_driver_tests {
         let genesis_hash = network.genesis_hash();
         let mut config = zebra_network::Config {
             network: network.clone(),
+            v2_p2p: true,
             ..zebra_network::Config::default()
         };
         config.zakura.listen_addr = None;
