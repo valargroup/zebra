@@ -1122,7 +1122,7 @@ pub(crate) fn header_range_commit_failure_kind(
         // rejected because our own header rows failed a linkage/bijection check
         // while reading validation context, not because the peer's range was shown
         // invalid. Scoring peers for it recreates the disconnect-honest-peers
-        // failure mode from the 2026-07-06 incidents.
+        // failure mode.
         | zebra_state::CommitHeaderRangeError::StoreIncoherent(_)
         | zebra_state::CommitHeaderRangeError::CommitResponseDropped => {
             HeaderSyncCommitFailureKind::Local
