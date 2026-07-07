@@ -2126,7 +2126,9 @@ mod zakura_header_sync_driver_tests {
         Service as ZakuraService, Stream as ZakuraStream, ZakuraHeaderSyncDriverStartup,
         BLOCK_SYNC_TABLE, COMMIT_STATE_TABLE, DEFAULT_HS_RANGE,
     };
-    use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+    use zebra_test::vectors::{
+        BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES, BLOCK_MAINNET_3_BYTES,
+    };
 
     use super::zakura::{
         abandoned_block_apply_finished_event, apply_block_sync_body, block_apply_class,
@@ -3098,6 +3100,787 @@ mod zakura_header_sync_driver_tests {
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
         endpoint.shutdown().await;
+    }
+
+    // === Header-sync reorg suite: driver-level scenarios ===
+    //
+    // These drive the real `drive_zakura_header_sync_actions` loop against a
+    // real endpoint + reactor with mock state/verifier services, covering the
+    // chain-selection paths a reorg exercises: commit success/failure
+    // classification, the NewBlock best-chain gate's defensive branches, and
+    // frontier publication. Reactor-level scenarios live in
+    // `zebra-network/src/zakura/header_sync/tests.rs`.
+
+    struct HeaderDriverFixture {
+        endpoint: zebra_network::zakura::ZakuraEndpoint,
+        header_sync: zebra_network::zakura::HeaderSyncHandle,
+        action_tx: mpsc::Sender<zebra_network::zakura::HeaderSyncAction>,
+        shutdown_tx: oneshot::Sender<()>,
+        driver: tokio::task::JoinHandle<()>,
+    }
+
+    async fn spawn_header_driver_fixture<State, ReadState, Verifier>(
+        state: State,
+        read_state: ReadState,
+        verifier: Verifier,
+        trace: zebra_network::zakura::ZakuraTrace,
+    ) -> HeaderDriverFixture
+    where
+        State: tower::Service<
+                zebra_state::Request,
+                Response = zebra_state::Response,
+                Error = zebra_state::BoxError,
+            > + Clone
+            + Send
+            + 'static,
+        State::Future: Send + 'static,
+        ReadState: tower::Service<
+                zebra_state::ReadRequest,
+                Response = zebra_state::ReadResponse,
+                Error = zebra_state::BoxError,
+            > + Clone
+            + Send
+            + 'static,
+        ReadState::Future: Send + 'static,
+        Verifier: tower::Service<zebra_consensus::Request, Response = block::Hash>
+            + Clone
+            + Send
+            + 'static,
+        Verifier::Error: std::fmt::Debug + Send + Sync + 'static,
+        Verifier::Future: Send + 'static,
+    {
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let genesis_hash = network.genesis_hash();
+        let mut config = zebra_network::Config {
+            network: network.clone(),
+            ..zebra_network::Config::default()
+        };
+        config.zakura.listen_addr = None;
+        let endpoint = zebra_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
+            &config,
+            |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
+            Some(ZakuraHeaderSyncDriverStartup {
+                frontiers: HeaderSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: genesis_hash,
+                },
+                best_header_tip: Some((block::Height(0), genesis_hash)),
+                verified_block_tip_hash: genesis_hash,
+            }),
+        )
+        .await
+        .expect("Zakura endpoint starts")
+        .expect("v2_p2p starts an endpoint");
+        let header_sync = endpoint
+            .header_sync()
+            .expect("driver startup starts header sync");
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handles = ZakuraHeaderSyncDriverHandles {
+            endpoint: endpoint.clone(),
+            header_sync: header_sync.clone(),
+        };
+        let driver = tokio::spawn(drive_zakura_header_sync_actions(
+            action_rx,
+            handles,
+            state,
+            read_state,
+            verifier,
+            trace,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        HeaderDriverFixture {
+            endpoint,
+            header_sync,
+            action_tx,
+            shutdown_tx,
+            driver,
+        }
+    }
+
+    async fn shutdown_header_driver(fixture: HeaderDriverFixture) {
+        let _ = fixture.shutdown_tx.send(());
+        fixture.driver.await.expect("driver task exits cleanly");
+        fixture.endpoint.shutdown().await;
+    }
+
+    fn panicking_state_for_header_driver(
+    ) -> BoxCloneService<zebra_state::Request, zebra_state::Response, zebra_state::BoxError> {
+        BoxCloneService::new(service_fn(|request: zebra_state::Request| async move {
+            panic!("unexpected state request: {request:?}");
+            #[allow(unreachable_code)]
+            Ok(zebra_state::Response::Committed(block::Hash([0; 32])))
+        }))
+    }
+
+    fn panicking_read_state_for_header_driver(
+    ) -> BoxCloneService<zebra_state::ReadRequest, zebra_state::ReadResponse, zebra_state::BoxError>
+    {
+        BoxCloneService::new(service_fn(|request: zebra_state::ReadRequest| async move {
+            panic!("unexpected read request: {request:?}");
+            #[allow(unreachable_code)]
+            Ok(zebra_state::ReadResponse::Tip(None))
+        }))
+    }
+
+    fn panicking_verifier_for_header_driver(
+    ) -> BoxCloneService<zebra_consensus::Request, block::Hash, zebra_consensus::BoxError> {
+        BoxCloneService::new(service_fn(|request: zebra_consensus::Request| async move {
+            panic!("unexpected verifier request: {request:?}");
+            #[allow(unreachable_code)]
+            Ok(block::Hash([0; 32]))
+        }))
+    }
+
+    async fn wait_for_reactor_best_tip(
+        fixture: &HeaderDriverFixture,
+        expected: (block::Height, block::Hash),
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.header_sync.best_header_tip() == expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reactor best header tip reaches the expected value");
+    }
+
+    async fn wait_for_best_header_frontier(
+        fixture: &HeaderDriverFixture,
+        expected: (block::Height, block::Hash),
+        change: zebra_network::zakura::FrontierChange,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let update = fixture
+                    .endpoint
+                    .current_sync_frontier()
+                    .expect("exchange remains available");
+                if update.frontier.best_header.height == expected.0
+                    && update.frontier.best_header.hash == expected.1
+                {
+                    assert_eq!(update.change, change);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("driver publishes the expected best-header frontier");
+    }
+
+    /// Sends a sentinel `HeaderAdvanced` and waits for its frontier
+    /// publication. The driver loop is serial, so once the sentinel is
+    /// visible every trace row from earlier actions has been emitted.
+    async fn drain_header_driver_with_sentinel(fixture: &HeaderDriverFixture) {
+        let sentinel = (block::Height(999_999), block::Hash([0xEE; 32]));
+        fixture
+            .action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::HeaderAdvanced {
+                height: sentinel.0,
+                hash: sentinel.1,
+            })
+            .await
+            .expect("driver action channel stays open");
+        wait_for_best_header_frontier(
+            fixture,
+            sentinel,
+            zebra_network::zakura::FrontierChange::HeaderAdvanced,
+        )
+        .await;
+    }
+
+    fn commit_state_row_exists(
+        rows: &[&serde_json::Value],
+        event: &str,
+        str_fields: &[(&str, &str)],
+        u64_fields: &[(&str, u64)],
+    ) -> bool {
+        rows.iter().any(|row| {
+            row.get("event").and_then(serde_json::Value::as_str) == Some(event)
+                && str_fields.iter().all(|(key, expected)| {
+                    row.get(*key).and_then(serde_json::Value::as_str) == Some(*expected)
+                })
+                && u64_fields.iter().all(|(key, expected)| {
+                    row.get(*key).and_then(serde_json::Value::as_u64) == Some(*expected)
+                })
+        })
+    }
+
+    /// Reorg-suite driver scenario: a committed header range advances the
+    /// reactor's best tip and republishes the exchange frontier as
+    /// `HeaderAdvanced` with the store-reported tip hash.
+    #[tokio::test]
+    async fn commit_header_range_success_advances_reactor_tip_and_frontier() {
+        let committed_tip_hash = block::Hash([7; 32]);
+        let state = service_fn(move |request: zebra_state::Request| async move {
+            match request {
+                zebra_state::Request::CommitHeaderRange { .. } => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::Response::CommittedHeaderRange(
+                        zebra_state::HeaderRangeCommitOutcome {
+                            tip_hash: committed_tip_hash,
+                            reorged_at: None,
+                            reorged_to_hash: None,
+                        },
+                    ),
+                ),
+                request => panic!("unexpected state request: {request:?}"),
+            }
+        });
+        let fixture = spawn_header_driver_fixture(
+            state,
+            panicking_read_state_for_header_driver(),
+            panicking_verifier_for_header_driver(),
+            zebra_network::zakura::ZakuraTrace::noop(),
+        )
+        .await;
+
+        let headers = vec![
+            mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
+            mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
+        ];
+        fixture
+            .action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::CommitHeaderRange {
+                peer: test_zakura_peer(9),
+                anchor: zebra_chain::parameters::Network::Mainnet.genesis_hash(),
+                start_height: block::Height(1),
+                headers,
+                body_sizes: vec![0, 0],
+                tree_aux_roots: Vec::new(),
+                finalized: false,
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        let expected = (block::Height(2), committed_tip_hash);
+        wait_for_reactor_best_tip(&fixture, expected).await;
+        wait_for_best_header_frontier(
+            &fixture,
+            expected,
+            zebra_network::zakura::FrontierChange::HeaderAdvanced,
+        )
+        .await;
+
+        shutdown_header_driver(fixture).await;
+    }
+
+    /// Reorg-suite driver scenario 1a: a lower-work conflicting range (the
+    /// losing side of a fork) fails its commit as a LOCAL failure — the peer
+    /// served an individually valid but worse fork and must not be scored —
+    /// while a too-deep reorg is classified as an invalid peer range. Neither
+    /// failure moves the reactor's best tip.
+    #[tokio::test]
+    async fn commit_conflict_failures_classify_local_vs_peer_through_driver() {
+        let mut capture =
+            TraceCapture::for_test("commit_conflict_failures_classify_local_vs_peer").unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let state = service_fn(move |request: zebra_state::Request| async move {
+            match request {
+                zebra_state::Request::CommitHeaderRange { headers, .. } if headers.len() == 1 => {
+                    Err::<zebra_state::Response, zebra_state::BoxError>(Box::new(
+                        zebra_state::CommitHeaderRangeError::LowerWorkConflict {
+                            height: block::Height(2),
+                            existing_work: 20,
+                            new_work: 10,
+                        },
+                    ))
+                }
+                zebra_state::Request::CommitHeaderRange { .. } => {
+                    Err(Box::new(zebra_state::CommitHeaderRangeError::ReorgTooDeep {
+                        height: block::Height(5),
+                        best_header_tip: block::Height(500),
+                    }) as zebra_state::BoxError)
+                }
+                request => panic!("unexpected state request: {request:?}"),
+            }
+        });
+        let fixture = spawn_header_driver_fixture(
+            state,
+            panicking_read_state_for_header_driver(),
+            panicking_verifier_for_header_driver(),
+            trace,
+        )
+        .await;
+        let genesis_hash = zebra_chain::parameters::Network::Mainnet.genesis_hash();
+
+        // The losing branch of scenario 1a: one conflicting lower-work header.
+        fixture
+            .action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::CommitHeaderRange {
+                peer: test_zakura_peer(11),
+                anchor: block::Hash([1; 32]),
+                start_height: block::Height(2),
+                headers: vec![mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone()],
+                body_sizes: vec![0],
+                tree_aux_roots: Vec::new(),
+                finalized: false,
+            })
+            .await
+            .expect("driver action channel stays open");
+        // A reorg beyond the allowed window: the peer served a bad range.
+        fixture
+            .action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::CommitHeaderRange {
+                peer: test_zakura_peer(12),
+                anchor: block::Hash([4; 32]),
+                start_height: block::Height(5),
+                headers: vec![
+                    mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone(),
+                    mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone(),
+                ],
+                body_sizes: vec![0, 0],
+                tree_aux_roots: Vec::new(),
+                finalized: false,
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        drain_header_driver_with_sentinel(&fixture).await;
+        assert_eq!(
+            fixture.header_sync.best_header_tip(),
+            (block::Height(0), genesis_hash),
+            "failed commits must not move the reactor best tip",
+        );
+        shutdown_header_driver(fixture).await;
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        let rows = commit_state.rows();
+        assert!(
+            commit_state_row_exists(
+                &rows,
+                cs_trace::COMMIT_FINISH,
+                &[
+                    (cs_trace::ACTION, "commit_header_range"),
+                    (cs_trace::RESULT, "local_error"),
+                ],
+                &[(cs_trace::RANGE_START, 2)],
+            ),
+            "LowerWorkConflict must classify as a local (non-scoring) failure; rows: {rows:?}",
+        );
+        assert!(
+            commit_state_row_exists(
+                &rows,
+                cs_trace::COMMIT_FINISH,
+                &[
+                    (cs_trace::ACTION, "commit_header_range"),
+                    (cs_trace::RESULT, "invalid_peer_range"),
+                ],
+                &[(cs_trace::RANGE_START, 5)],
+            ),
+            "ReorgTooDeep must classify as an invalid peer range; rows: {rows:?}",
+        );
+    }
+
+    /// Reorg-suite driver scenario: when the best-chain check itself fails
+    /// (state `Depth` read error mid-reorg), the driver must fail safe to the
+    /// side-chain outcome — no frontier advance, no gossip — instead of
+    /// forwarding a possibly losing branch.
+    #[tokio::test]
+    async fn new_block_depth_read_failure_downgrades_to_side_chain_accept() {
+        let mut capture =
+            TraceCapture::for_test("new_block_depth_read_failure_side_chain").unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block_hash = block.hash();
+        let block_height = block.coinbase_height().expect("test block has height");
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::Depth(_) => {
+                    Err::<zebra_state::ReadResponse, zebra_state::BoxError>(
+                        "depth read failed during reorg".into(),
+                    )
+                }
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(block) => {
+                    Ok::<_, zebra_consensus::BoxError>(block.hash())
+                }
+                request => panic!("unexpected verifier request: {request:?}"),
+            }
+        });
+        let fixture = spawn_header_driver_fixture(
+            panicking_state_for_header_driver(),
+            read_state,
+            verifier,
+            trace,
+        )
+        .await;
+        let genesis_hash = zebra_chain::parameters::Network::Mainnet.genesis_hash();
+
+        fixture
+            .action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::NewBlockReceived {
+                peer: test_zakura_peer(21),
+                height: block_height,
+                hash: block_hash,
+                block,
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        drain_header_driver_with_sentinel(&fixture).await;
+        assert_eq!(
+            fixture.header_sync.best_header_tip(),
+            (block::Height(0), genesis_hash),
+            "a NewBlock whose best-chain check failed must not advance the header frontier",
+        );
+        shutdown_header_driver(fixture).await;
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        let rows = commit_state.rows();
+        let hash_label = format!("{block_hash}");
+        assert!(
+            commit_state_row_exists(
+                &rows,
+                cs_trace::COMMIT_FINISH,
+                &[
+                    (cs_trace::ACTION, "new_block"),
+                    (cs_trace::RESULT, "accepted_non_best_chain"),
+                    (cs_trace::HASH, &hash_label),
+                ],
+                &[],
+            ),
+            "a Depth read failure must downgrade the accept to side-chain; rows: {rows:?}",
+        );
+    }
+
+    /// Reorg-suite driver scenario: verifier outcomes map to the matching
+    /// reactor events — duplicate errors to `NewBlockDuplicate`, other errors
+    /// and hash mismatches to `NewBlockRejected` — without frontier movement.
+    #[tokio::test]
+    async fn new_block_verifier_outcomes_map_to_duplicate_and_rejected() {
+        let mut capture =
+            TraceCapture::for_test("new_block_verifier_outcomes_map_to_events").unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let duplicate_block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let rejected_block = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let wrong_hash_block = mainnet_block(&BLOCK_MAINNET_3_BYTES);
+        let duplicate_hash = duplicate_block.hash();
+        let rejected_hash = rejected_block.hash();
+        let wrong_hash_hash = wrong_hash_block.hash();
+        let verifier = service_fn(move |request: zebra_consensus::Request| async move {
+            match request {
+                zebra_consensus::Request::Commit(block) if block.hash() == duplicate_hash => {
+                    Err::<block::Hash, zebra_consensus::BoxError>(Box::new(
+                        zebra_consensus::VerifyBlockError::Block {
+                            source: zebra_consensus::BlockError::AlreadyInChain(
+                                duplicate_hash,
+                                zebra_state::KnownBlock::BestChain,
+                            ),
+                        },
+                    ))
+                }
+                zebra_consensus::Request::Commit(block) if block.hash() == rejected_hash => {
+                    Err("contextual validation failed".into())
+                }
+                zebra_consensus::Request::Commit(_) => Ok(block::Hash([0x77; 32])),
+                request => panic!("unexpected verifier request: {request:?}"),
+            }
+        });
+        let fixture = spawn_header_driver_fixture(
+            panicking_state_for_header_driver(),
+            panicking_read_state_for_header_driver(),
+            verifier,
+            trace,
+        )
+        .await;
+        let genesis_hash = zebra_chain::parameters::Network::Mainnet.genesis_hash();
+
+        for block in [duplicate_block, rejected_block, wrong_hash_block] {
+            let height = block.coinbase_height().expect("test block has height");
+            let hash = block.hash();
+            fixture
+                .action_tx
+                .send(zebra_network::zakura::HeaderSyncAction::NewBlockReceived {
+                    peer: test_zakura_peer(31),
+                    height,
+                    hash,
+                    block,
+                })
+                .await
+                .expect("driver action channel stays open");
+        }
+
+        drain_header_driver_with_sentinel(&fixture).await;
+        assert_eq!(
+            fixture.header_sync.best_header_tip(),
+            (block::Height(0), genesis_hash),
+            "no rejected or duplicate NewBlock may advance the header frontier",
+        );
+        shutdown_header_driver(fixture).await;
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        let rows = commit_state.rows();
+        for (hash, result) in [
+            (duplicate_hash, "duplicate"),
+            (rejected_hash, "rejected"),
+            (wrong_hash_hash, "rejected"),
+        ] {
+            let hash_label = format!("{hash}");
+            assert!(
+                commit_state_row_exists(
+                    &rows,
+                    cs_trace::COMMIT_FINISH,
+                    &[
+                        (cs_trace::ACTION, "new_block"),
+                        (cs_trace::RESULT, result),
+                        (cs_trace::HASH, &hash_label),
+                    ],
+                    &[],
+                ),
+                "expected a {result} commit-finish row for {hash_label}; rows: {rows:?}",
+            );
+        }
+    }
+
+    /// Reorg-suite driver scenario: a reactor walk-back (`HeaderReanchored`)
+    /// republishes the exchange frontier with the `HeaderReanchored` change
+    /// so downstream consumers see the lowered header frontier.
+    #[tokio::test]
+    async fn header_reanchored_action_publishes_reanchored_frontier() {
+        let fixture = spawn_header_driver_fixture(
+            panicking_state_for_header_driver(),
+            panicking_read_state_for_header_driver(),
+            panicking_verifier_for_header_driver(),
+            zebra_network::zakura::ZakuraTrace::noop(),
+        )
+        .await;
+
+        let reanchored = (block::Height(2), block::Hash([2; 32]));
+        fixture
+            .action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::HeaderReanchored {
+                old: (block::Height(5), block::Hash([5; 32])),
+                new: reanchored,
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        wait_for_best_header_frontier(
+            &fixture,
+            reanchored,
+            zebra_network::zakura::FrontierChange::HeaderReanchored,
+        )
+        .await;
+        shutdown_header_driver(fixture).await;
+    }
+
+    /// Reorg-suite driver scenario: `QueryBestHeaderTip` republishes the
+    /// durable header tip when every height above the verified block tip has
+    /// its tree-aux roots (the root-coverage chain-selection gate passes).
+    #[tokio::test]
+    async fn query_best_header_tip_with_root_coverage_republishes_tip() {
+        let genesis_hash = zebra_chain::parameters::Network::Mainnet.genesis_hash();
+        let durable_tip = (block::Height(2), block::Hash([2; 32]));
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| async move {
+            match request {
+                zebra_state::ReadRequest::BestHeaderTip => Ok::<_, zebra_state::BoxError>(
+                    zebra_state::ReadResponse::BestHeaderTip(Some(durable_tip)),
+                ),
+                zebra_state::ReadRequest::Tip => Ok(zebra_state::ReadResponse::Tip(Some((
+                    block::Height(0),
+                    genesis_hash,
+                )))),
+                zebra_state::ReadRequest::BlockRoots {
+                    start_height,
+                    count,
+                } => {
+                    assert_eq!(start_height, block::Height(1));
+                    assert_eq!(count, 2);
+                    Ok(zebra_state::ReadResponse::BlockRoots(vec![
+                        root_at(block::Height(1)),
+                        root_at(block::Height(2)),
+                    ]))
+                }
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let fixture = spawn_header_driver_fixture(
+            panicking_state_for_header_driver(),
+            read_state,
+            panicking_verifier_for_header_driver(),
+            zebra_network::zakura::ZakuraTrace::noop(),
+        )
+        .await;
+
+        fixture
+            .action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::QueryBestHeaderTip)
+            .await
+            .expect("driver action channel stays open");
+
+        wait_for_reactor_best_tip(&fixture, durable_tip).await;
+        wait_for_best_header_frontier(
+            &fixture,
+            durable_tip,
+            zebra_network::zakura::FrontierChange::HeaderAdvanced,
+        )
+        .await;
+        shutdown_header_driver(fixture).await;
+    }
+
+    /// Reorg-suite driver scenario: serving a header range stays live when
+    /// the size-hint read fails and the root read returns partial coverage —
+    /// the response degrades (zero sizes, no roots) instead of wedging the
+    /// driver loop.
+    #[tokio::test]
+    async fn served_header_range_survives_hint_and_root_read_failures() {
+        let mut capture =
+            TraceCapture::for_test("served_header_range_survives_degraded_reads").unwrap();
+        let trace = zebra_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
+        let header_1 = mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone();
+        let header_2 = mainnet_block(&BLOCK_MAINNET_2_BYTES).header.clone();
+        let read_state = service_fn(move |request: zebra_state::ReadRequest| {
+            let header_1 = header_1.clone();
+            let header_2 = header_2.clone();
+            async move {
+                match request {
+                    zebra_state::ReadRequest::HeadersByHeightRange { start, count } => {
+                        assert_eq!(start, block::Height(1));
+                        assert_eq!(count, 2);
+                        Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::Headers(vec![
+                            (block::Height(1), block::Hash([1; 32]), header_1),
+                            (block::Height(2), block::Hash([2; 32]), header_2),
+                        ]))
+                    }
+                    zebra_state::ReadRequest::BlockSizeHints { .. } => {
+                        Err("size hint read failed".into())
+                    }
+                    zebra_state::ReadRequest::BlockRoots { .. } => Ok(
+                        zebra_state::ReadResponse::BlockRoots(vec![root_at(block::Height(1))]),
+                    ),
+                    request => panic!("unexpected read request: {request:?}"),
+                }
+            }
+        });
+        let fixture = spawn_header_driver_fixture(
+            panicking_state_for_header_driver(),
+            read_state,
+            panicking_verifier_for_header_driver(),
+            trace,
+        )
+        .await;
+
+        fixture
+            .action_tx
+            .send(
+                zebra_network::zakura::HeaderSyncAction::QueryHeadersByHeightRange {
+                    peer: test_zakura_peer(41),
+                    start: block::Height(1),
+                    count: 2,
+                    want_tree_aux_roots: true,
+                },
+            )
+            .await
+            .expect("driver action channel stays open");
+
+        drain_header_driver_with_sentinel(&fixture).await;
+        shutdown_header_driver(fixture).await;
+
+        capture.flush().await;
+        let reader = capture.reader().unwrap();
+        let commit_state = reader.table(COMMIT_STATE_TABLE.table());
+        let rows = commit_state.rows();
+        assert!(
+            commit_state_row_exists(
+                &rows,
+                cs_trace::REACTOR_EVENT_SENT,
+                &[(cs_trace::ACTION, "header_range_response_ready")],
+                &[(cs_trace::RANGE_COUNT, 2)],
+            ),
+            "degraded reads must still produce a header range response; rows: {rows:?}",
+        );
+    }
+
+    /// Every `CommitHeaderRangeError` variant classifies as either a local
+    /// failure (retry without scoring) or an invalid peer range. The
+    /// reorg-relevant rule: conflict outcomes the store adjudicates
+    /// (`LowerWorkConflict`) and local resource faults never score the peer,
+    /// while structurally invalid or window-violating ranges do.
+    /// (`ValidateContextError` is skipped: its variants are `#[non_exhaustive]`
+    /// and cannot be constructed outside `zebra-state`.)
+    #[test]
+    fn header_range_commit_failure_kind_covers_all_constructible_variants() {
+        use zebra_state::CommitHeaderRangeError as E;
+
+        let local_failures = [
+            E::LowerWorkConflict {
+                height: block::Height(2),
+                existing_work: 20,
+                new_work: 10,
+            },
+            E::StorageWriteError {
+                error: "disk failure".to_string(),
+            },
+            E::SendCommitRequestFailed,
+            E::CommitResponseDropped,
+        ];
+        for error in local_failures {
+            assert_eq!(
+                header_range_commit_failure_kind(&error),
+                HeaderSyncCommitFailureKind::Local,
+                "{error}",
+            );
+        }
+
+        let invalid_peer_ranges = [
+            E::EmptyRange,
+            E::RangeTooLong { actual: 50_000 },
+            E::BodySizeCountMismatch {
+                headers: 2,
+                body_sizes: 1,
+            },
+            E::TreeAuxRootCountMismatch {
+                headers: 2,
+                roots: 1,
+            },
+            E::TreeAuxRootHeightMismatch {
+                expected_height: block::Height(1),
+                root_height: block::Height(2),
+            },
+            E::UnknownAnchor {
+                anchor: block::Hash([9; 32]),
+            },
+            E::HeightOverflow,
+            E::ImmutableConflict {
+                height: block::Height(1),
+            },
+            E::ReorgTooDeep {
+                height: block::Height(1),
+                best_header_tip: block::Height(500),
+            },
+            E::CheckpointConflict {
+                height: block::Height(1),
+                expected: block::Hash([1; 32]),
+                actual: block::Hash([2; 32]),
+            },
+            E::ConflictingFullBlockHeader {
+                height: block::Height(1),
+            },
+        ];
+        for error in invalid_peer_ranges {
+            assert_eq!(
+                header_range_commit_failure_kind(&error),
+                HeaderSyncCommitFailureKind::InvalidPeerRange,
+                "{error}",
+            );
+        }
     }
 
     #[tokio::test]
