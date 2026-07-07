@@ -770,7 +770,7 @@ impl Default for Config {
             cache_dir: CacheDir::default(),
             identity_dir: default_network_identity_dir(),
             zakura_node_secret_key: None,
-            v2_p2p: true,
+            v2_p2p: default_v2_p2p_for_network(&Network::Mainnet),
             legacy_p2p: true,
             zakura: ZakuraConfig::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
@@ -786,6 +786,10 @@ impl Default for Config {
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
         }
     }
+}
+
+fn default_v2_p2p_for_network(network: &Network) -> bool {
+    !matches!(network, Network::Mainnet)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -853,8 +857,8 @@ struct DConfig {
     #[serde(default, skip_serializing)]
     zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
     #[serde(alias = "enable_p2p_v2")]
-    v2_p2p: bool,
-    legacy_p2p: bool,
+    v2_p2p: Option<bool>,
+    legacy_p2p: Option<bool>,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
     #[serde(alias = "new_peer_interval", with = "humantime_serde")]
@@ -875,8 +879,8 @@ impl Default for DConfig {
             cache_dir: config.cache_dir,
             identity_dir: config.identity_dir,
             zakura_node_secret_key: config.zakura_node_secret_key,
-            v2_p2p: config.v2_p2p,
-            legacy_p2p: config.legacy_p2p,
+            v2_p2p: None,
+            legacy_p2p: None,
             zakura: config.zakura,
             peerset_initial_target_size: config.peerset_initial_target_size,
             crawl_new_peer_interval: config.crawl_new_peer_interval,
@@ -974,8 +978,8 @@ impl From<Config> for DConfig {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
-            v2_p2p,
-            legacy_p2p,
+            v2_p2p: Some(v2_p2p),
+            legacy_p2p: Some(legacy_p2p),
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -1028,6 +1032,9 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_regtest(Default::default())
             }
         };
+
+        let v2_p2p = v2_p2p.unwrap_or_else(|| default_v2_p2p_for_network(&network));
+        let legacy_p2p = legacy_p2p.unwrap_or(true);
 
         let listen_addr = match listen_addr.parse::<SocketAddr>().or_else(|_| format!("{listen_addr}:{}", network.default_port()).parse()) {
             Ok(socket) => Ok(socket),
