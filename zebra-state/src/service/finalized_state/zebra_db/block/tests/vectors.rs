@@ -106,7 +106,7 @@ fn header_range_commit_keeps_body_availability_separate() {
     let (state, genesis, block1) = mainnet_state_with_genesis();
 
     let mut batch = DiskWriteBatch::new();
-    let committed_hash = batch
+    let outcome = batch
         .prepare_header_range_batch(
             &state,
             genesis.hash(),
@@ -118,7 +118,7 @@ fn header_range_commit_keeps_body_availability_separate() {
         .write_batch(batch)
         .expect("header range batch writes successfully");
 
-    assert_eq!(committed_hash, block1.hash());
+    assert_eq!(outcome.tip_hash, block1.hash());
     assert_eq!(state.best_header_tip(), Some((Height(1), block1.hash())));
     assert_eq!(state.finalized_tip_height(), Some(Height(0)));
     assert_eq!(state.tip(), Some((Height(0), genesis.hash())));

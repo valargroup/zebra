@@ -61,7 +61,9 @@ fn redeliver_trunk(
         .collect();
     let body_sizes = vec![0; headers.len()];
     let mut batch = DiskWriteBatch::new();
-    let result = batch.prepare_header_range_batch(state, anchor, &headers, &body_sizes);
+    let result = batch
+        .prepare_header_range_batch(state, anchor, &headers, &body_sizes)
+        .map(|outcome| outcome.tip_hash);
     if result.is_ok() {
         state
             .write_batch(batch)
