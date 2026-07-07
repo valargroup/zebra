@@ -27,20 +27,23 @@ use zebra_chain::block::Height;
 
 use super::super::super::startup_audit::ZakuraStoreViolation;
 use super::super::super::{
-    ZAKURA_HEADER_BY_HEIGHT, ZAKURA_HEADER_HASH_BY_HEIGHT, ZAKURA_HEADER_HEIGHT_BY_HASH,
+    test_body_size, ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT, ZAKURA_HEADER_BY_HEIGHT,
+    ZAKURA_HEADER_HASH_BY_HEIGHT, ZAKURA_HEADER_HEIGHT_BY_HASH,
 };
 use super::super::common::{
     commit_header_range, persistent_config, persistent_state, state_with_genesis_config,
+    write_full_block_header_and_transactions,
 };
 use super::{
     audit::{audit_store, dump_store, StoreDump},
-    fabricate::{Universe, BRANCH_A, FORK_HEIGHT},
+    fabricate::{fabricate_body, Universe, BRANCH_A, FORK_HEIGHT},
 };
 use crate::{
     error::{CommitHeaderRangeError, StoreIncoherentError},
     service::finalized_state::{
         disk_db::{DiskWriteBatch, WriteDisk},
-        ZebraDb,
+        disk_format::shielded::CommitmentRootsByHeight,
+        ZebraDb, COMMITMENT_ROOTS_BY_HEIGHT,
     },
     Config,
 };
@@ -535,5 +538,127 @@ fn startup_repair_emits_incoherent_metric() {
     let clean = CounterCapture::default();
     let state = metrics::with_local_recorder(&clean, || reopen(state, &config, &universe));
     assert_eq!(clean.get(METRIC), 0, "a clean reopen emits nothing");
+    assert_clean(&state);
+}
+
+/// Stale zakura rows at *pruned* heights are classified
+/// `StaleRowAtCommittedHeight` and deleted, while everything else — the
+/// zakura frontier and the roots rows at committed heights — is untouched.
+///
+/// This is the test the audit's committed-height predicate was chosen for:
+/// the predicate is the consensus `hash_by_height` row, which pruning
+/// retains, not body presence (pruning removes bodies). A body-presence
+/// predicate would misclassify these rows as frontier rows and let the
+/// pre-#491 bug-2 shape (stale re-delivered rows below the body tip)
+/// survive on pruned stores.
+#[test]
+fn startup_removes_stale_rows_at_pruned_heights() {
+    let _init_guard = zebra_test::init();
+    let universe = Universe::new();
+    let tempdir = tempfile::tempdir().expect("test tempdir is available");
+    let config = persistent_config(tempdir.path());
+    let state = trunk_state(&universe, config.clone());
+
+    // Commit bodies 1..=10 (releasing the zakura rows there), then prune
+    // raw transactions below height 8 through the production prune batch.
+    for fab in &universe.trunk[..10] {
+        write_full_block_header_and_transactions(&state, fabricate_body(fab));
+    }
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_prune_batch(&state, Height(1), Height(8));
+    state.write_batch(batch).expect("prune batch writes");
+
+    // The pruned-store shape: committed heights whose bodies are gone.
+    assert!(state.contains_height(Height(5)));
+    assert!(!state.contains_body_at_height(Height(5)));
+    assert!(state.contains_body_at_height(Height(8)));
+
+    // A verified roots row at a pruned height (pruning retains these): the
+    // audit must leave it untouched — committed heights are out of scope.
+    let roots_cf = state.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_insert(
+        &roots_cf,
+        Height(5),
+        CommitmentRootsByHeight {
+            sapling: zebra_chain::sapling::tree::NoteCommitmentTree::default().root(),
+            orchard: zebra_chain::orchard::tree::NoteCommitmentTree::default().root(),
+            auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([7u8; 32]),
+            ironwood: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+            sapling_tx: 0,
+            orchard_tx: 0,
+            ironwood_tx: 0,
+        },
+    );
+    state.db.write(batch).expect("raw insert writes");
+
+    let clean = dump_store(&state);
+    assert!(
+        clean.roots.contains_key(&Height(5)),
+        "the roots row at a pruned height is present and out of audit scope"
+    );
+
+    // Hand-plant stale zakura rows at pruned heights: a full row triple at
+    // height 5 and a body-size hint at height 3 (the pre-guard re-delivery
+    // shape: `contains_height` true, `contains_body_at_height` false).
+    let header_cf = state.db.cf_handle(ZAKURA_HEADER_BY_HEIGHT).unwrap();
+    let hash_cf = state.db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
+    let reverse_cf = state.db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
+    let body_size_cf = state
+        .db
+        .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
+        .unwrap();
+    let stale = &universe.trunk[4];
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_insert(&header_cf, Height(5), stale.header.clone());
+    batch.zs_insert(&hash_cf, Height(5), stale.hash);
+    batch.zs_insert(&reverse_cf, stale.hash, Height(5));
+    batch.zs_insert(&body_size_cf, Height(3), test_body_size(77));
+    state.db.write(batch).expect("raw insert writes");
+
+    let repair = state
+        .audit_and_repair_zakura_header_store()
+        .expect("audit reads and writes succeed")
+        .expect("the stale rows are repaired");
+    assert_eq!(repair.deleted_rows, 4);
+    for (cf, height) in [
+        (ZAKURA_HEADER_BY_HEIGHT, Height(5)),
+        (ZAKURA_HEADER_HASH_BY_HEIGHT, Height(5)),
+        (ZAKURA_HEADER_HEIGHT_BY_HASH, Height(5)),
+        (ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT, Height(3)),
+    ] {
+        assert!(
+            repair.violations.iter().any(|violation| matches!(
+                violation,
+                ZakuraStoreViolation::StaleRowAtCommittedHeight {
+                    cf: found_cf,
+                    height: found_height,
+                } if *found_cf == cf && *found_height == height
+            )),
+            "expected StaleRowAtCommittedHeight for {cf} at {height:?}: {:?}",
+            repair.violations
+        );
+    }
+    assert_eq!(
+        repair.last_coherent,
+        Some((Height(FORK_HEIGHT), universe.trunk_at(FORK_HEIGHT).hash)),
+        "stale rows at pruned heights must not shorten the coherent frontier"
+    );
+
+    // The repair restores exactly the pre-corruption store: the frontier
+    // and the out-of-scope roots rows at committed heights survive.
+    assert_eq!(dump_store(&state), clean);
+    assert_clean(&state);
+
+    // The same heal runs on the real startup path (reopen).
+    let mut batch = DiskWriteBatch::new();
+    batch.zs_insert(&hash_cf, Height(6), universe.trunk[5].hash);
+    state.db.write(batch).expect("raw insert writes");
+    let state = reopen(state, &config, &universe);
+    assert_eq!(
+        dump_store(&state),
+        clean,
+        "the startup repair removes the stale pruned-height row"
+    );
     assert_clean(&state);
 }

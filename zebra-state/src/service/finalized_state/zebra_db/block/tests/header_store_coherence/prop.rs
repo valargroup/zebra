@@ -58,6 +58,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
             .prop_map(|(source, index)| Op::CommitBody { source, index }),
         2 => (source_strategy(), 0..40usize).prop_map(|(source, index)| Op::Seed { source, index }),
         3 => (1..8usize).prop_map(|count| Op::Finalize { count }),
+        1 => (2..=TRUNK_LEN as u32).prop_map(|until| Op::Prune { until }),
         1 => Just(Op::Reopen),
     ]
 }

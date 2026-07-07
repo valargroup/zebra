@@ -539,6 +539,41 @@ fn s10_seed_interplay() {
     );
 }
 
+/// s11: online pruning below the body tip is membership-neutral — the zakura
+/// frontier, chain selection, reorgs, and restart survival are unaffected —
+/// and it leaves the pruned-store shape (consensus hash rows retained,
+/// bodies gone) the startup audit's committed-height predicate relies on.
+#[test]
+fn s11_prune_below_body_tip_is_membership_neutral() {
+    let _init_guard = zebra_test::init();
+    let mut harness = Harness::new();
+
+    let outcomes = harness
+        .run_all(&[
+            commit_trunk(),
+            Op::Finalize { count: 10 },
+            Op::Prune { until: 8 },
+            // A reorg above the fork still works over a pruned base.
+            commit_branch(BRANCH_A),
+            Op::Reopen,
+            // Deeper pruning after the reorg and restart is still clean.
+            Op::Finalize { count: 2 },
+            Op::Prune { until: 12 },
+        ])
+        .expect("pruning sequence has no violations");
+    outcomes.iter().for_each(assert_accepted);
+
+    assert_eq!(
+        harness.state().best_header_tip(),
+        Some(branch_tip(BRANCH_A)),
+    );
+    // The pruned-store shape: heights stay committed, bodies are gone.
+    assert!(harness.state().contains_height(Height(5)));
+    assert!(!harness.state().contains_body_at_height(Height(5)));
+    assert!(!harness.state().contains_body_at_height(Height(11)));
+    assert!(harness.state().contains_body_at_height(Height(12)));
+}
+
 /// s11: a refused (unlinked) seed converges through header-range sync. The
 /// zakura store follows branch A (seeded at the fork height); the
 /// non-finalized best chain switches to branch B and its new best tip (B's
