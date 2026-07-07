@@ -73,12 +73,16 @@ initial_testnet_peers = [
     "dnsseed.testnet.z.cash:18233",
     "testnet.seeder.zfnd.org:18233",
 ]
+# P2P stack selection. `legacy_p2p` controls the legacy TCP stack.
+# `v2_p2p` accepts "default", true, or false. "default" disables
+# Zakura P2P v2 on Mainnet and enables it on Testnet, Regtest, and other networks.
+# Set `v2_p2p` to true or false to override the selected network's default.
 legacy_p2p = true
+v2_p2p = "default"
 listen_addr = "[::]:8233"
 max_connections_per_ip = 1
 network = "Mainnet"
 peerset_initial_target_size = 100
-v2_p2p = false
 
 [network.zakura]
 bootstrap_peers = [

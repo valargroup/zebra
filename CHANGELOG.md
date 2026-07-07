@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
-- Mainnet nodes now default `network.v2_p2p` to `false`, while Testnet and
-  Regtest nodes still default to running both `v2_p2p` and `legacy_p2p`.
+- `network.v2_p2p = "default"` now follows the selected network: `false` on
+  Mainnet, and `true` on Testnet, Regtest, and other networks. Set
+  `network.v2_p2p = true` or `false` to override that network default.
 - Verified-commitment-trees fast sync is now enabled by default when checkpoint
   sync is enabled. Operators can keep checkpoint sync but opt out of the new
   path by setting `consensus.vct_fast_sync = false`.

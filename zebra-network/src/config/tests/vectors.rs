@@ -185,19 +185,39 @@ fn p2p_protocol_flags_default_by_network_and_roundtrip() {
     assert!(regtest_config.v2_p2p);
     assert!(regtest_config.legacy_p2p);
 
-    let config: Config = toml::from_str(
+    let default_testnet_config: Config = toml::from_str(
         r#"
+        network = 'Testnet'
+        v2_p2p = "default"
+        "#,
+    )
+    .unwrap();
+    assert!(default_testnet_config.v2_p2p);
+
+    let explicit_testnet_config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
         v2_p2p = false
         legacy_p2p = false
         "#,
     )
     .unwrap();
-    assert!(!config.v2_p2p);
-    assert!(!config.legacy_p2p);
+    assert!(!explicit_testnet_config.v2_p2p);
+    assert!(!explicit_testnet_config.legacy_p2p);
+
+    let config: Config = toml::from_str(
+        r#"
+        v2_p2p = true
+        legacy_p2p = true
+        "#,
+    )
+    .unwrap();
+    assert!(config.v2_p2p);
+    assert!(config.legacy_p2p);
 
     let serialized = toml::to_string(&config).unwrap();
-    assert!(serialized.contains("v2_p2p = false"));
-    assert!(serialized.contains("legacy_p2p = false"));
+    assert!(serialized.contains("v2_p2p = true"));
+    assert!(serialized.contains("legacy_p2p = true"));
 
     let deserialized: Config = toml::from_str(&serialized).unwrap();
     assert_eq!(config, deserialized);
@@ -338,6 +358,36 @@ fn p2p_v2_old_enable_config_alias_still_parses() {
 
     assert!(!config.v2_p2p);
     assert!(config.legacy_p2p);
+}
+
+#[test]
+fn p2p_v2_default_config_value_follows_network_defaults() {
+    let _init_guard = zebra_test::init();
+
+    let mainnet_config: Config = toml::from_str(
+        r#"
+        network = "Mainnet"
+        v2_p2p = "default"
+        "#,
+    )
+    .unwrap();
+    assert!(!mainnet_config.v2_p2p);
+
+    let testnet_config: Config = toml::from_str(
+        r#"
+        network = "Testnet"
+        v2_p2p = "default"
+        "#,
+    )
+    .unwrap();
+    assert!(testnet_config.v2_p2p);
+
+    let invalid = toml::from_str::<Config>("v2_p2p = 'enabled'")
+        .expect_err("only true, false, and default are valid v2_p2p values");
+    assert!(
+        invalid.to_string().contains("expected true, false, or"),
+        "unexpected invalid v2_p2p error: {invalid}",
+    );
 }
 
 #[test]

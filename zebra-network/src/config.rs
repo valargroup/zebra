@@ -14,7 +14,7 @@ use std::{
 use indexmap::IndexSet;
 use iroh::SecretKey;
 use rand::rngs::OsRng;
-use serde::{de, Deserialize, Deserializer, Serializer};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use tokio::fs;
 
 use tracing::Span;
@@ -228,6 +228,10 @@ pub struct Config {
     /// the legacy Zcash handshake, and routes mutually capable peers to the Zakura upgrade hook
     /// before constructing a legacy peer connection if [`legacy_p2p`](Self::legacy_p2p) is also
     /// enabled.
+    ///
+    /// In `zebrad.toml`, set `v2_p2p = "default"` to follow Zebra's network defaults: disabled on
+    /// Mainnet, enabled on Testnet, Regtest, and other networks. Set `v2_p2p = true` or
+    /// `v2_p2p = false` to override that network default.
     ///
     /// Until the Zakura supervisor and endpoint connector support legacy upgrades, mutually
     /// capable peers continue on the legacy Zebra path after a temporary Zakura upgrade rejection.
@@ -792,6 +796,78 @@ fn default_v2_p2p_for_network(network: &Network) -> bool {
     !matches!(network, Network::Mainnet)
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum V2P2pPreference {
+    #[default]
+    Default,
+    Explicit(bool),
+}
+
+impl V2P2pPreference {
+    fn resolve(self, network: &Network) -> bool {
+        match self {
+            V2P2pPreference::Default => default_v2_p2p_for_network(network),
+            V2P2pPreference::Explicit(v2_p2p) => v2_p2p,
+        }
+    }
+
+    fn from_resolved(network: &Network, v2_p2p: bool) -> Self {
+        if v2_p2p == default_v2_p2p_for_network(network) {
+            V2P2pPreference::Default
+        } else {
+            V2P2pPreference::Explicit(v2_p2p)
+        }
+    }
+}
+
+impl Serialize for V2P2pPreference {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            V2P2pPreference::Default => serializer.serialize_str("default"),
+            V2P2pPreference::Explicit(v2_p2p) => serializer.serialize_bool(*v2_p2p),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for V2P2pPreference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V2P2pPreferenceVisitor;
+
+        impl de::Visitor<'_> for V2P2pPreferenceVisitor {
+            type Value = V2P2pPreference;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("true, false, or \"default\"")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(V2P2pPreference::Explicit(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "default" => Ok(V2P2pPreference::Default),
+                    _ => Err(E::invalid_value(de::Unexpected::Str(value), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(V2P2pPreferenceVisitor)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DTestnetParameters {
@@ -856,8 +932,8 @@ struct DConfig {
     identity_dir: PathBuf,
     #[serde(default, skip_serializing)]
     zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
-    #[serde(alias = "enable_p2p_v2")]
-    v2_p2p: Option<bool>,
+    #[serde(default, alias = "enable_p2p_v2")]
+    v2_p2p: V2P2pPreference,
     legacy_p2p: Option<bool>,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
@@ -879,7 +955,7 @@ impl Default for DConfig {
             cache_dir: config.cache_dir,
             identity_dir: config.identity_dir,
             zakura_node_secret_key: config.zakura_node_secret_key,
-            v2_p2p: None,
+            v2_p2p: V2P2pPreference::Default,
             legacy_p2p: None,
             zakura: config.zakura,
             peerset_initial_target_size: config.peerset_initial_target_size,
@@ -967,6 +1043,7 @@ impl From<Config> for DConfig {
 
             other_kind => DNetwork::DefaultForKind(other_kind),
         };
+        let v2_p2p = V2P2pPreference::from_resolved(&network, v2_p2p);
 
         DConfig {
             listen_addr: listen_addr.to_string(),
@@ -978,7 +1055,7 @@ impl From<Config> for DConfig {
             cache_dir,
             identity_dir,
             zakura_node_secret_key,
-            v2_p2p: Some(v2_p2p),
+            v2_p2p,
             legacy_p2p: Some(legacy_p2p),
             zakura,
             peerset_initial_target_size,
@@ -1033,7 +1110,7 @@ impl<'de> Deserialize<'de> for Config {
             }
         };
 
-        let v2_p2p = v2_p2p.unwrap_or_else(|| default_v2_p2p_for_network(&network));
+        let v2_p2p = v2_p2p.resolve(&network);
         let legacy_p2p = legacy_p2p.unwrap_or(true);
 
         let listen_addr = match listen_addr.parse::<SocketAddr>().or_else(|_| format!("{listen_addr}:{}", network.default_port()).parse()) {
