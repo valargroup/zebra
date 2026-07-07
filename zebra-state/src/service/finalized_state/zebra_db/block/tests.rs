@@ -20,6 +20,8 @@ use crate::{
     Config,
 };
 
+pub(crate) mod common;
+pub(crate) mod header_store_coherence;
 mod prune;
 mod snapshot;
 mod vectors;

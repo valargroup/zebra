@@ -2256,6 +2256,145 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[test]
+    fn lower_work_conflict_is_local_header_sync_commit_failure() {
+        // A lower-work conflicting range is individually valid — the peer
+        // offered a worse fork, which is not misbehavior. Scoring it would
+        // disconnect honest peers serving a losing branch (scenario 1a), so
+        // the rejection must stay a non-scoring local failure.
+        let error = zebra_state::CommitHeaderRangeError::LowerWorkConflict {
+            height: block::Height(54),
+            existing_work: 100,
+            new_work: 50,
+        };
+
+        assert_eq!(
+            header_range_commit_failure_kind(&error),
+            HeaderSyncCommitFailureKind::Local
+        );
+    }
+
+    /// A reorging `CommitHeaderRange` outcome must not make the driver send
+    /// any follow-up state request: the state's switch orchestration already
+    /// rolled the stranded body suffix back before the header rewrite
+    /// (REORG_PLAN Pillar 1a), so a separate driver-side `InvalidateBlock`
+    /// would be a double invalidation (INTEGRATION_TEST_PLAN.md T3.2).
+    #[tokio::test]
+    async fn reorging_header_commit_sends_no_driver_side_invalidation() {
+        let network = zebra_chain::parameters::Network::Mainnet;
+        let genesis_hash = network.genesis_hash();
+        let mut config = zebra_network::Config {
+            network: network.clone(),
+            ..zebra_network::Config::default()
+        };
+        config.zakura.listen_addr = None;
+        let endpoint = zebra_network::zakura::spawn_zakura_endpoint_with_header_sync_driver(
+            &config,
+            |_supervisor, _trace| Arc::new(NoopZakuraService) as Arc<dyn ZakuraService>,
+            Some(ZakuraHeaderSyncDriverStartup {
+                frontiers: HeaderSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: genesis_hash,
+                },
+                best_header_tip: Some((block::Height(0), genesis_hash)),
+                verified_block_tip_hash: genesis_hash,
+            }),
+        )
+        .await
+        .expect("Zakura endpoint starts")
+        .expect("v2_p2p starts an endpoint");
+
+        let committed_header = mainnet_block(&BLOCK_MAINNET_1_BYTES).header.clone();
+        let tip_hash = block::Hash::from(committed_header.as_ref());
+
+        let (action_tx, action_rx) = mpsc::channel(4);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handles = ZakuraHeaderSyncDriverHandles {
+            endpoint: endpoint.clone(),
+            header_sync: endpoint
+                .header_sync()
+                .expect("driver startup starts header sync"),
+        };
+        // The only state request the driver may make is the commit itself; a
+        // reorging outcome must not trigger InvalidateBlock (or anything
+        // else) — the mock panics the driver task on any other request.
+        let state = service_fn(move |request: zebra_state::Request| async move {
+            match request {
+                zebra_state::Request::CommitHeaderRange { .. } => {
+                    Ok::<_, zebra_state::BoxError>(zebra_state::Response::CommittedHeaderRange(
+                        zebra_state::HeaderRangeCommitOutcome {
+                            tip_hash,
+                            reorged_at: Some(block::Height(1)),
+                            reorged_to_hash: Some(tip_hash),
+                        },
+                    ))
+                }
+                request => panic!(
+                    "a reorging header commit must not drive further state writes: {request:?}"
+                ),
+            }
+        });
+        let read_state = service_fn(|request: zebra_state::ReadRequest| async move {
+            panic!("unexpected read request during a reorging commit: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_state::BoxError>(zebra_state::ReadResponse::Tip(None))
+        });
+        let verifier = service_fn(|request: zebra_consensus::Request| async move {
+            panic!("unexpected verifier request during a reorging commit: {request:?}");
+            #[allow(unreachable_code)]
+            Ok::<_, zebra_consensus::BoxError>(block::Hash([0; 32]))
+        });
+        let driver = tokio::spawn(drive_zakura_header_sync_actions(
+            action_rx,
+            handles,
+            state,
+            read_state,
+            verifier,
+            zebra_network::zakura::ZakuraTrace::noop(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let peer =
+            zebra_network::zakura::ZakuraPeerId::new(vec![6; 32]).expect("test peer id is valid");
+        action_tx
+            .send(zebra_network::zakura::HeaderSyncAction::CommitHeaderRange {
+                peer,
+                anchor: genesis_hash,
+                start_height: block::Height(1),
+                headers: vec![committed_header],
+                body_sizes: vec![0],
+                tree_aux_roots: Vec::new(),
+                finalized: false,
+            })
+            .await
+            .expect("driver action channel stays open");
+
+        // The reorging commit completes through the ordinary success path:
+        // the frontier advances to the committed tip (published after the
+        // state call, so any follow-up write would already have panicked).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let update = endpoint
+                    .current_sync_frontier()
+                    .expect("exchange remains available");
+                if update.frontier.best_header.height == block::Height(1) {
+                    assert_eq!(update.frontier.best_header.hash, tip_hash);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a reorging commit still advances the header frontier");
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        endpoint.shutdown().await;
+    }
+
+    #[test]
     fn served_header_body_size_hints_align_with_served_heights() {
         let start = block::Height(10);
         let header_heights = [

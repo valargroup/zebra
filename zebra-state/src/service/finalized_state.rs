@@ -79,7 +79,7 @@ pub(crate) mod commitment_aux_verify;
 mod disk_db;
 mod disk_format;
 mod vct;
-mod zebra_db;
+pub(crate) mod zebra_db;
 
 use vct::{VctCommitState, VctState, VctWriteData};
 

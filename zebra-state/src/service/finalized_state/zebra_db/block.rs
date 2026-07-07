@@ -64,7 +64,7 @@ mod startup_audit;
 pub(crate) use canonical_suffix::CanonicalHeaderRow;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 const ZAKURA_HEADER_HASH_BY_HEIGHT: &str = "zakura_header_hash_by_height";
 const ZAKURA_HEADER_HEIGHT_BY_HASH: &str = "zakura_header_height_by_hash";

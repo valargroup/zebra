@@ -5320,3 +5320,359 @@ async fn misbehavior_is_recorded_without_disconnecting_the_peer() {
         "misbehavior is record-only: an InvalidStatus peer must NOT be disconnected",
     );
 }
+
+/// Scenario 1a at the peer layer (INTEGRATION_TEST_PLAN.md T3.1): a peer
+/// whose served range is rejected as a lower-work conflicting fork gets a
+/// non-scoring `Local` commit failure (the driver maps
+/// `CommitHeaderRangeError::LowerWorkConflict` to that kind). The peer must
+/// never be scored or disconnected and must keep receiving requests; a later
+/// higher-work commit (decided in the state) completes the switch.
+#[tokio::test(flavor = "current_thread")]
+async fn lower_work_conflict_keeps_peer_serving_until_switch_completes() {
+    let header1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header3 = mainnet_header(&BLOCK_MAINNET_3_BYTES);
+    let header4 = mainnet_header(&BLOCK_MAINNET_4_BYTES);
+    // Anchors above genesis must be checkpoints; pin block 3 as one on a
+    // network whose genesis is the mainnet genesis, so the mainnet test
+    // headers link above the anchor.
+    let (network, anchor_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), block::Hash::from(header3.as_ref()));
+    let anchor = (block::Height(3), anchor_hash);
+    let mut fixture = spawn_test_reactor(startup_for(network, anchor, Some(anchor)));
+    let mut tip = fixture.handle.subscribe_tip();
+    let peer_a = peer(83);
+    let peer_b = peer(84);
+
+    // Only peer A advertises: every request must go to it. Peer B stays
+    // connected but silent.
+    connect_peer(&fixture, peer_a.clone()).await;
+    connect_peer(&fixture, peer_b.clone()).await;
+    advertise_tip(
+        &fixture,
+        peer_a.clone(),
+        anchor.0,
+        block::Height(4),
+        DEFAULT_HS_RANGE,
+        1,
+    )
+    .await;
+
+    // Serves peer A's requests — the checkpoint backfill below the anchor
+    // (which must be answered, or it pins the peer's single effective
+    // request slot) and the forward range at height 4 — until the forward
+    // range reaches the committer. Panics on any misbehavior report.
+    async fn serve_until_forward_commit(
+        fixture: &mut ReactorFixture,
+        expected_peer: &ZakuraPeerId,
+        backfill: &[Arc<block::Header>],
+        forward: Arc<block::Header>,
+        checkpoint_hash: block::Hash,
+    ) {
+        loop {
+            match next_non_query_action(&mut fixture.actions).await {
+                HeaderSyncAction::SendMessage {
+                    peer,
+                    msg: HeaderSyncMessage::GetHeaders { start_height, .. },
+                } => {
+                    assert_eq!(
+                        &peer, expected_peer,
+                        "only the advertising peer receives requests"
+                    );
+                    let msg = if start_height == block::Height(4) {
+                        headers_message_from(start_height, vec![forward.clone()])
+                    } else {
+                        assert_eq!(start_height, block::Height(1), "unexpected request");
+                        headers_message_from(start_height, backfill.to_vec())
+                    };
+                    fixture
+                        .handle
+                        .send(HeaderSyncEvent::WireMessage { peer, msg })
+                        .await
+                        .unwrap();
+                }
+                HeaderSyncAction::CommitHeaderRange {
+                    peer, start_height, ..
+                } if start_height == block::Height(1) => {
+                    // The finalized checkpoint backfill commits cleanly.
+                    assert_eq!(&peer, expected_peer);
+                    fixture
+                        .handle
+                        .send(HeaderSyncEvent::HeaderRangeCommitted {
+                            start_height,
+                            tip_height: block::Height(3),
+                            tip_hash: checkpoint_hash,
+                        })
+                        .await
+                        .unwrap();
+                }
+                HeaderSyncAction::CommitHeaderRange {
+                    peer,
+                    anchor: commit_anchor,
+                    start_height,
+                    ..
+                } => {
+                    assert_eq!(&peer, expected_peer);
+                    assert_eq!(commit_anchor, checkpoint_hash);
+                    assert_eq!(start_height, block::Height(4));
+                    return;
+                }
+                HeaderSyncAction::Misbehavior { peer, reason } => {
+                    panic!("unexpected misbehavior from {peer:?}: {reason:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Peer A serves its (lower-work) branch; the reactor hands it to the
+    // committer.
+    let backfill = [header1.clone(), header2.clone(), header3.clone()];
+    serve_until_forward_commit(
+        &mut fixture,
+        &peer_a,
+        &backfill,
+        header4.clone(),
+        anchor_hash,
+    )
+    .await;
+
+    // The state rejects the range as a lower-work conflicting fork; the
+    // driver reports the non-scoring `Local` kind.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitFailed {
+            peer: peer_a.clone(),
+            start_height: block::Height(4),
+            count: 1,
+            kind: HeaderSyncCommitFailureKind::Local,
+        })
+        .await
+        .unwrap();
+
+    // The scheduler hands out ranges on event ticks; a fresh peer connection
+    // provides one (in production events flow continuously).
+    connect_peer(&fixture, peer(85)).await;
+
+    // Peer A was not scored and stays in rotation: the retried range goes
+    // back to it and reaches the committer again. This time the state (which
+    // owns the work comparison) accepts — the switch completes.
+    serve_until_forward_commit(
+        &mut fixture,
+        &peer_a,
+        &backfill,
+        header4.clone(),
+        anchor_hash,
+    )
+    .await;
+    let tip_hash = block::Hash::from(header4.as_ref());
+    fixture
+        .handle
+        .send(HeaderSyncEvent::HeaderRangeCommitted {
+            start_height: block::Height(4),
+            tip_height: block::Height(4),
+            tip_hash,
+        })
+        .await
+        .unwrap();
+    tip.changed().await.unwrap();
+    assert_eq!(*tip.borrow(), (block::Height(4), tip_hash));
+}
+
+/// `StoreIncoherent`-shaped commit failures walking back and converging
+/// (INTEGRATION_TEST_PLAN.md T3.3): the driver classifies store incoherence
+/// as `ContextMismatch` (covered in zebrad's classification tests); here the
+/// reactor receives that kind from independent peers on every commit, starts
+/// a walk-back without scoring anyone, re-anchors from the store's reanchor
+/// target, and converges by re-committing through the fork. (The store-side
+/// repair the walk-back races against is covered by the startup-audit suite.)
+#[tokio::test(flavor = "current_thread")]
+async fn context_mismatch_walk_back_reanchors_and_converges_without_scoring() {
+    let header1 = mainnet_header(&BLOCK_MAINNET_1_BYTES);
+    let header2 = mainnet_header(&BLOCK_MAINNET_2_BYTES);
+    let header3 = mainnet_header(&BLOCK_MAINNET_3_BYTES);
+    let header4 = mainnet_header(&BLOCK_MAINNET_4_BYTES);
+    let by_height = [
+        header1.clone(),
+        header2.clone(),
+        header3.clone(),
+        header4.clone(),
+    ];
+    let serve = |start_height: block::Height, count: u32| {
+        let start = start_height.0 as usize;
+        let served: Vec<_> = by_height[start - 1..(start - 1 + count as usize).min(4)].to_vec();
+        headers_message_from(start_height, served)
+    };
+    // The network's genesis is the mainnet genesis (so the mainnet test
+    // headers link), with the mandatory checkpoint pinned to block 3.
+    let (network, checkpoint_hash) =
+        checkpoint_testnet_with_hash(block::Height(3), block::Hash::from(header3.as_ref()));
+    // Anchor at genesis (the walk-back floor is max(finalized, anchor), and
+    // this test needs to observe a re-anchor below the verified tip); the
+    // durable store already holds headers up to the checkpoint.
+    let anchor = (block::Height(0), network.genesis_hash());
+    let stored_tip = (block::Height(3), checkpoint_hash);
+    let mut startup = HeaderSyncStartup::new(
+        network,
+        anchor,
+        HeaderSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: stored_tip.0,
+            verified_block_hash: stored_tip.1,
+        },
+        Some(stored_tip),
+        ZakuraHeaderSyncConfig::default(),
+        LOCAL_MAX_MESSAGE_BYTES,
+    );
+    startup.range_state_actions_enabled = true;
+    let mut fixture = spawn_test_reactor(startup);
+    let mut tip = fixture.handle.subscribe_tip();
+    // Three peers: a failed range stays assigned to the peers that already
+    // served it (ContextMismatch keeps hedging distinctness), so reaching
+    // the stale-anchor quorum needs a third independent server.
+    let peers = [peer(86), peer(87), peer(88)];
+
+    for peer_id in peers.iter().cloned() {
+        connect_peer(&fixture, peer_id.clone()).await;
+        advertise_tip(
+            &fixture,
+            peer_id,
+            block::Height(0),
+            block::Height(4),
+            DEFAULT_HS_RANGE,
+            1,
+        )
+        .await;
+    }
+
+    // Every served range reaches the committer and fails ContextMismatch
+    // (the live shape of a corrupted store: the linkage-verified reads
+    // reject every commit attempt, whoever serves it). The reactor must not
+    // score anyone and must eventually query a walk-back reanchor target.
+    let target = loop {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::QueryReanchorTarget { height } => break height,
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        ..
+                    },
+            } => {
+                fixture
+                    .handle
+                    .send(HeaderSyncEvent::WireMessage {
+                        peer,
+                        msg: serve(start_height, count),
+                    })
+                    .await
+                    .unwrap();
+            }
+            HeaderSyncAction::CommitHeaderRange {
+                peer,
+                start_height,
+                headers,
+                ..
+            } => {
+                fixture
+                    .handle
+                    .send(HeaderSyncEvent::HeaderRangeCommitFailed {
+                        peer,
+                        start_height,
+                        count: headers.len() as u32,
+                        kind: HeaderSyncCommitFailureKind::ContextMismatch,
+                    })
+                    .await
+                    .unwrap();
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("honest peer {peer:?} scored for a local context mismatch: {reason:?}")
+            }
+            _ => {}
+        }
+    };
+    assert_eq!(
+        target,
+        block::Height(2),
+        "the walk-back starts one below the verified tip"
+    );
+
+    // The store (repaired by the audits) answers the reanchor query.
+    fixture
+        .handle
+        .send(HeaderSyncEvent::ReanchorTargetLoaded {
+            height: target,
+            hash: Some(block::Hash::from(header2.as_ref())),
+        })
+        .await
+        .unwrap();
+    tip.changed().await.unwrap();
+    assert_eq!(
+        *tip.borrow_and_update(),
+        (block::Height(2), block::Hash::from(header2.as_ref()))
+    );
+
+    // The re-anchored frontier re-requests through the fork; the store is
+    // healthy again, so commits succeed and sync converges — still with no
+    // one scored. The recommit through the fork must anchor at the reanchor
+    // hash.
+    let final_tip = (block::Height(4), block::Hash::from(header4.as_ref()));
+    let mut saw_fork_recommit = false;
+    while *tip.borrow_and_update() != final_tip {
+        match next_action(&mut fixture.actions).await {
+            HeaderSyncAction::SendMessage {
+                peer,
+                msg:
+                    HeaderSyncMessage::GetHeaders {
+                        start_height,
+                        count,
+                        ..
+                    },
+            } => {
+                fixture
+                    .handle
+                    .send(HeaderSyncEvent::WireMessage {
+                        peer,
+                        msg: serve(start_height, count),
+                    })
+                    .await
+                    .unwrap();
+            }
+            HeaderSyncAction::CommitHeaderRange {
+                anchor: commit_anchor,
+                start_height,
+                headers,
+                ..
+            } => {
+                if start_height == block::Height(3) {
+                    assert_eq!(
+                        commit_anchor,
+                        block::Hash::from(header2.as_ref()),
+                        "the recommit through the fork anchors at the reanchor target"
+                    );
+                    saw_fork_recommit = true;
+                }
+                let tip_index = start_height.0 as usize - 1 + headers.len() - 1;
+                fixture
+                    .handle
+                    .send(HeaderSyncEvent::HeaderRangeCommitted {
+                        start_height,
+                        tip_height: block::Height(start_height.0 + headers.len() as u32 - 1),
+                        tip_hash: block::Hash::from(by_height[tip_index].as_ref()),
+                    })
+                    .await
+                    .unwrap();
+            }
+            HeaderSyncAction::Misbehavior { peer, reason } => {
+                panic!("honest peer {peer:?} scored during walk-back recovery: {reason:?}")
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_fork_recommit,
+        "convergence must re-commit the range at the fork point"
+    );
+}
