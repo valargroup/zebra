@@ -1,10 +1,8 @@
 //! Startup-audit self-repair: a hand-corrupted zakura header store heals when
-//! the database is (re)opened (REORG_PLAN Pillar 3, startup half).
+//! the database is reopened.
 //!
-//! The write path refuses to create incoherent stores (the Phase-1.5 guards)
-//! and the consensus readers refuse to consume them (Pillar 2), so these tests
-//! corrupt the column families directly — the same hand-made corruption
-//! technique as the audit's and read-path tests — and assert that:
+//! The normal write path refuses to create incoherent stores, so these tests
+//! corrupt the column families directly and assert that:
 //!
 //! - the startup audit finds the violation and truncates the store to the
 //!   last coherent height in all five column families, leaving a store the
@@ -13,8 +11,7 @@
 //!   and persists: a second reopen finds a coherent store and changes nothing;
 //! - repair is minimal where truncation is not needed (an orphaned
 //!   reverse-index row, stale rows at committed heights);
-//! - a store that failed the Pillar-2 linkage-verified reads passes them
-//!   after the heal; and
+//! - a store with broken linkage-verified reads passes them after the heal; and
 //! - the `state.zakura.header_store.incoherent` metric is emitted exactly
 //!   when a repair runs.
 
