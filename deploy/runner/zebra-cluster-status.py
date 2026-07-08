@@ -72,6 +72,33 @@ class Node:
         return [*cmd, self.ssh_string, *remote]
 
 
+@dataclass(frozen=True)
+class DashboardProfile:
+    id: str
+    label: str
+    nodes_config: Path
+    target_spacing: float
+    upgrade_height: int | None = None
+
+    def metadata(self) -> dict:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "target_spacing": self.target_spacing,
+            "has_upgrade_height": self.upgrade_height is not None,
+            "upgrade_height": self.upgrade_height,
+        }
+
+
+@dataclass(frozen=True)
+class DashboardConfig:
+    default_profile: str
+    profiles: dict[str, DashboardProfile]
+
+    def profile_list(self) -> list[dict]:
+        return [profile.metadata() for profile in self.profiles.values()]
+
+
 def load_nodes(config_path: Path) -> list[Node]:
     with config_path.open("rb") as fh:
         data = tomllib.load(fh)
@@ -109,6 +136,73 @@ def load_nodes(config_path: Path) -> list[Node]:
     if not nodes:
         raise SystemExit(f"no [[nodes]] defined in {config_path}")
     return nodes
+
+
+def load_dashboard_config(config_path: Path) -> DashboardConfig:
+    with config_path.open("rb") as fh:
+        data = tomllib.load(fh)
+
+    default_profile = data.get("default_profile")
+    if not isinstance(default_profile, str) or not default_profile:
+        raise SystemExit("dashboard config missing non-empty default_profile")
+
+    raw_profiles = data.get("profiles")
+    if not isinstance(raw_profiles, dict) or not raw_profiles:
+        raise SystemExit("dashboard config must define at least one [profiles.<id>] table")
+
+    profiles = {}
+    base_dir = config_path.parent
+    for profile_id, raw in raw_profiles.items():
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", profile_id):
+            raise SystemExit(f"invalid profile id {profile_id!r}; use letters, numbers, '_' or '-'")
+        if not isinstance(raw, dict):
+            raise SystemExit(f"profile {profile_id!r} must be a table")
+
+        label = raw.get("label")
+        nodes_config = raw.get("nodes_config")
+        target_spacing = raw.get("target_spacing")
+        upgrade_height = raw.get("upgrade_height")
+
+        if not isinstance(label, str) or not label:
+            raise SystemExit(f"profile {profile_id!r} missing non-empty label")
+        if not isinstance(nodes_config, str) or not nodes_config:
+            raise SystemExit(f"profile {profile_id!r} missing non-empty nodes_config")
+        if not isinstance(target_spacing, (int, float)) or target_spacing <= 0:
+            raise SystemExit(f"profile {profile_id!r} target_spacing must be a positive number")
+        if upgrade_height is not None:
+            if not isinstance(upgrade_height, int) or upgrade_height < 0:
+                raise SystemExit(f"profile {profile_id!r} upgrade_height must be a non-negative integer")
+
+        nodes_path = Path(nodes_config).expanduser()
+        if not nodes_path.is_absolute():
+            nodes_path = base_dir / nodes_path
+        profiles[profile_id] = DashboardProfile(
+            id=profile_id,
+            label=label,
+            nodes_config=nodes_path,
+            target_spacing=float(target_spacing),
+            upgrade_height=upgrade_height,
+        )
+
+    if default_profile not in profiles:
+        raise SystemExit(f"default_profile {default_profile!r} is not defined in profiles")
+    return DashboardConfig(default_profile=default_profile, profiles=profiles)
+
+
+def legacy_dashboard_config(
+    nodes_config: Path,
+    *,
+    target_spacing: float,
+    upgrade_height: int,
+) -> DashboardConfig:
+    profile = DashboardProfile(
+        id="default",
+        label="Zakura Ironwood testnet",
+        nodes_config=nodes_config,
+        target_spacing=target_spacing,
+        upgrade_height=upgrade_height,
+    )
+    return DashboardConfig(default_profile=profile.id, profiles={profile.id: profile})
 
 
 def ssh_host(ssh_string: str) -> str:
@@ -293,7 +387,7 @@ class ClusterCollector:
         nodes: list[Node],
         interval: float,
         stale_after: float,
-        upgrade_height: int,
+        upgrade_height: int | None,
         target_spacing: float,
     ):
         self.nodes = nodes
@@ -422,7 +516,11 @@ class ClusterCollector:
         with self.lock:
             rows = [dict(row) for row in self.rows]
             last_poll = self.last_poll
-            upgrade = self.upgrade_estimate(time.time())
+            upgrade = (
+                self.upgrade_estimate(time.time())
+                if self.upgrade_height is not None
+                else None
+            )
         healthy = sum(1 for row in rows if row.get("healthy"))
         return {
             "generated_at": time.time(),
@@ -435,6 +533,7 @@ class ClusterCollector:
         }
 
     def upgrade_estimate(self, now: float) -> dict:
+        assert self.upgrade_height is not None
         current_height = self.height_history[-1][1] if self.height_history else None
         blocks_remaining = (
             max(self.upgrade_height - current_height, 0)
@@ -619,6 +718,40 @@ h2 {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.3; transform: scale(0.7); }
 }
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.profile-toggle {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 2px;
+  border: 1px solid var(--line-hi);
+  border-radius: 999px;
+  background: var(--base);
+}
+.profile-toggle[hidden] { display: none; }
+.profile-toggle button {
+  min-height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+.profile-toggle button[aria-pressed="true"] {
+  background: var(--pink-soft);
+  color: var(--pink-hi);
+}
+.hidden { display: none !important; }
 .grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -797,6 +930,7 @@ tbody tr:hover td { background: rgba(46, 42, 66, 0.35); }
     flex-direction: column;
     align-items: flex-start;
   }
+  .topbar-actions { justify-content: flex-start; }
   .panel { padding: 18px; }
 }
 </style>
@@ -807,11 +941,14 @@ tbody tr:hover td { background: rgba(46, 42, 66, 0.35); }
     <div class="brand">
       <img src="https://avatars.githubusercontent.com/u/272444516?s=200&v=4" alt="Valar Group" class="brand-icon" width="44" height="44">
       <div class="brand-wordmark">
-        <p class="eyebrow">Zakura Ironwood testnet observability</p>
-        <h1>Zakura Cluster Status</h1>
+        <p class="eyebrow" id="brand-eyebrow">Cluster observability</p>
+        <h1 id="brand-title">Zebra Cluster Status</h1>
       </div>
     </div>
-    <div class="status" id="status">Connecting</div>
+    <div class="topbar-actions">
+      <div class="profile-toggle" id="profile-toggle" hidden></div>
+      <div class="status" id="status">Connecting</div>
+    </div>
   </section>
 
   <section class="grid" aria-label="Cluster summary">
@@ -827,19 +964,19 @@ tbody tr:hover td { background: rgba(46, 42, 66, 0.35); }
       <span>Stale window</span>
       <strong id="stale-window">...</strong>
     </article>
-    <article class="summary-card">
+    <article class="summary-card upgrade-card">
       <span>Upgrade height</span>
       <strong id="upgrade-height">...</strong>
     </article>
-    <article class="summary-card">
+    <article class="summary-card upgrade-card">
       <span>Blocks remaining</span>
       <strong id="blocks-remaining">...</strong>
     </article>
-    <article class="summary-card">
+    <article class="summary-card upgrade-card">
       <span>Upgrade ETA</span>
       <strong id="upgrade-eta">...</strong>
     </article>
-    <article class="summary-card">
+    <article class="summary-card upgrade-card">
       <span>Block time</span>
       <strong id="block-time">...</strong>
       <small id="block-time-source">...</small>
@@ -941,30 +1078,76 @@ function copyButton(value, label) {
   if (!value) return '';
   return `<button class="copy-button" type="button" data-copy-value="${esc(value)}" aria-label="${esc(label)}" title="${esc(label)}">${copyIcon}</button>`;
 }
+const profileStorageKey = 'zebra-cluster-status-profile';
+let selectedProfile = localStorage.getItem(profileStorageKey) || '';
+function profileUrl() {
+  return selectedProfile
+    ? '/data?profile=' + encodeURIComponent(selectedProfile)
+    : '/data';
+}
+function setSelectedProfile(profileId) {
+  selectedProfile = profileId || '';
+  if (selectedProfile) localStorage.setItem(profileStorageKey, selectedProfile);
+  else localStorage.removeItem(profileStorageKey);
+  tick();
+}
+function renderProfiles(data) {
+  const toggle = document.getElementById('profile-toggle');
+  const profiles = data.profiles || [];
+  if (profiles.length <= 1) {
+    toggle.hidden = true;
+    toggle.innerHTML = '';
+    return;
+  }
+  toggle.hidden = false;
+  toggle.innerHTML = profiles.map((profile) => `
+    <button type="button" data-profile="${esc(profile.id)}" aria-pressed="${profile.id === data.active_profile.id ? 'true' : 'false'}">${esc(profile.label)}</button>
+  `).join('');
+  for (const button of toggle.querySelectorAll('[data-profile]')) {
+    button.addEventListener('click', () => setSelectedProfile(button.dataset.profile));
+  }
+}
 async function tick() {
   let data;
   try {
-    const response = await fetch('/data', { cache: 'no-store' });
+    let response = await fetch(profileUrl(), { cache: 'no-store' });
+    if (!response.ok && selectedProfile) {
+      selectedProfile = '';
+      localStorage.removeItem(profileStorageKey);
+      response = await fetch('/data', { cache: 'no-store' });
+    }
     data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'request failed');
   } catch (error) {
     document.getElementById('status').textContent = 'Unreachable';
     document.getElementById('summary').textContent = 'Dashboard data endpoint is unreachable.';
     return;
   }
+  selectedProfile = data.active_profile.id;
+  localStorage.setItem(profileStorageKey, selectedProfile);
+  renderProfiles(data);
+  document.title = data.active_profile.label + ' status';
+  document.getElementById('brand-eyebrow').textContent = data.active_profile.label + ' observability';
+  document.getElementById('brand-title').textContent = data.active_profile.label;
   const poll = data.last_poll ? new Date(data.last_poll * 1000).toLocaleString() : 'not yet polled';
   document.getElementById('status').textContent = data.healthy === data.total ? 'Healthy' : 'Degraded';
   document.getElementById('healthy-count').textContent = data.healthy + ' / ' + data.total;
   document.getElementById('last-poll').textContent = poll;
   document.getElementById('stale-window').textContent = Math.round(data.stale_after) + 's';
   const upgrade = data.upgrade || {};
-  const etaAt = upgrade.eta_at ? new Date(upgrade.eta_at * 1000).toLocaleString() : 'waiting for block movement';
-  document.getElementById('upgrade-height').textContent = formatNumber(upgrade.height);
-  document.getElementById('blocks-remaining').textContent = upgrade.activated ? 'activated' : formatNumber(upgrade.blocks_remaining);
-  document.getElementById('upgrade-eta').textContent = upgrade.activated ? 'activated' : countdown(upgrade.eta_seconds) + ' / ' + etaAt;
-  document.getElementById('block-time').textContent = formatBlockTime(upgrade.seconds_per_block);
-  document.getElementById('block-time-source').textContent = upgrade.source === 'observed'
-    ? 'recent average'
-    : 'default estimate';
+  for (const card of document.querySelectorAll('.upgrade-card')) {
+    card.classList.toggle('hidden', data.upgrade == null);
+  }
+  if (data.upgrade != null) {
+    const etaAt = upgrade.eta_at ? new Date(upgrade.eta_at * 1000).toLocaleString() : 'waiting for block movement';
+    document.getElementById('upgrade-height').textContent = formatNumber(upgrade.height);
+    document.getElementById('blocks-remaining').textContent = upgrade.activated ? 'activated' : formatNumber(upgrade.blocks_remaining);
+    document.getElementById('upgrade-eta').textContent = upgrade.activated ? 'activated' : countdown(upgrade.eta_seconds) + ' / ' + etaAt;
+    document.getElementById('block-time').textContent = formatBlockTime(upgrade.seconds_per_block);
+    document.getElementById('block-time-source').textContent = upgrade.source === 'observed'
+      ? 'recent average'
+      : 'default estimate';
+  }
   document.getElementById('summary').textContent = data.healthy + ' / ' + data.total + ' nodes healthy';
   const body = document.getElementById('rows');
   body.innerHTML = data.rows.map((row) => `
@@ -992,34 +1175,85 @@ setInterval(tick, 10000);
 </html>"""
 
 
-COLLECTOR: ClusterCollector | None = None
+class DashboardState:
+    def __init__(
+        self,
+        config: DashboardConfig,
+        collectors: dict[str, ClusterCollector],
+    ):
+        self.config = config
+        self.collectors = collectors
+
+    def profile_payload(self) -> dict:
+        return {
+            "default_profile": self.config.default_profile,
+            "profiles": self.config.profile_list(),
+        }
+
+    def snapshot(self, profile_id: str | None) -> dict:
+        selected = profile_id or self.config.default_profile
+        collector = self.collectors.get(selected)
+        if collector is None:
+            raise KeyError(selected)
+
+        profile = self.config.profiles[selected]
+        snapshot = collector.snapshot()
+        snapshot.update(self.profile_payload())
+        snapshot["active_profile"] = profile.metadata()
+        return snapshot
+
+
+DASHBOARD: DashboardState | None = None
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
         pass
 
-    def send_body(self, body: bytes, content_type: str) -> None:
-        self.send_response(200)
+    def send_body(self, body: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def send_json(self, payload: dict, status: int = 200) -> None:
+        self.send_body(json.dumps(payload).encode(), "application/json", status=status)
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/data":
-            assert COLLECTOR is not None
-            body = json.dumps(COLLECTOR.snapshot()).encode()
-            return self.send_body(body, "application/json")
+            assert DASHBOARD is not None
+            query = urllib.parse.parse_qs(parsed.query)
+            profile_values = query.get("profile") or []
+            profile_id = profile_values[0] if profile_values else None
+            try:
+                return self.send_json(DASHBOARD.snapshot(profile_id))
+            except KeyError:
+                return self.send_json(
+                    {
+                        "error": "unknown profile",
+                        "profile": profile_id,
+                        **DASHBOARD.profile_payload(),
+                    },
+                    status=404,
+                )
+        if parsed.path == "/profiles":
+            assert DASHBOARD is not None
+            return self.send_json(DASHBOARD.profile_payload())
         return self.send_body(PAGE.encode(), "text/html; charset=utf-8")
 
 
 def main() -> None:
-    global COLLECTOR
+    global DASHBOARD
 
     parser = argparse.ArgumentParser(description="Serve a Zebra fleet status dashboard.")
-    parser.add_argument("--config", required=True, help="path to deploy/deployer nodes TOML")
+    config_group = parser.add_mutually_exclusive_group(required=True)
+    config_group.add_argument("--config", help="path to deploy/deployer nodes TOML")
+    config_group.add_argument(
+        "--dashboard-config",
+        help="path to dashboard TOML with multiple profiles",
+    )
     parser.add_argument("--host", default="0.0.0.0", help="dashboard bind host")
     parser.add_argument("--port", type=int, default=8090, help="dashboard bind port")
     parser.add_argument("--interval", type=float, default=10.0, help="poll interval in seconds")
@@ -1033,7 +1267,7 @@ def main() -> None:
         "--upgrade-height",
         type=int,
         default=DEFAULT_UPGRADE_HEIGHT,
-        help="testnet upgrade activation height to estimate",
+        help="testnet upgrade activation height to estimate in --config mode",
     )
     parser.add_argument(
         "--target-spacing",
@@ -1043,19 +1277,36 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    nodes = load_nodes(Path(args.config))
-    COLLECTOR = ClusterCollector(
-        nodes,
-        args.interval,
-        args.stale_after,
-        args.upgrade_height,
-        args.target_spacing,
-    )
-    threading.Thread(target=COLLECTOR.loop, daemon=True).start()
+    if args.dashboard_config:
+        dashboard_config = load_dashboard_config(Path(args.dashboard_config))
+    else:
+        dashboard_config = legacy_dashboard_config(
+            Path(args.config),
+            target_spacing=args.target_spacing,
+            upgrade_height=args.upgrade_height,
+        )
+
+    collectors = {}
+    node_counts = {}
+    for profile in dashboard_config.profiles.values():
+        nodes = load_nodes(profile.nodes_config)
+        collector = ClusterCollector(
+            nodes,
+            args.interval,
+            args.stale_after,
+            profile.upgrade_height,
+            profile.target_spacing,
+        )
+        collectors[profile.id] = collector
+        node_counts[profile.id] = len(nodes)
+        threading.Thread(target=collector.loop, daemon=True).start()
+
+    DASHBOARD = DashboardState(dashboard_config, collectors)
 
     print(
         f"cluster status dashboard bound on {args.host}:{args.port}; "
-        f"polling {len(nodes)} node(s) every {args.interval}s"
+        f"polling {sum(node_counts.values())} node(s) across {len(node_counts)} profile(s) "
+        f"every {args.interval}s"
     )
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 

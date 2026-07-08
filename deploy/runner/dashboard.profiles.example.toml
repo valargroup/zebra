@@ -1,0 +1,17 @@
+# Example multi-profile config for zebra-cluster-status.py.
+#
+# Keep environment-specific node lists outside the repo, and point each profile
+# at the rendered nodes TOML for that fleet.
+
+default_profile = "mainnet"
+
+[profiles.mainnet]
+label = "Zebra mainnet"
+nodes_config = "/opt/zebra-dashboard/mainnet.nodes.toml"
+target_spacing = 75.0
+
+[profiles.testnet]
+label = "Zakura Ironwood testnet"
+nodes_config = "/opt/zebra-dashboard/testnet.nodes.toml"
+target_spacing = 7.5
+upgrade_height = 4134000

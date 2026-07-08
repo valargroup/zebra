@@ -25,6 +25,25 @@ Repo-relative paths below are from the repo root `/root/zebra/`.
   Defaults put the instrumented binary + CSVs under `/root/wal-bench/` and forks
   under `/mnt/roman-dev-2-data/`.
 
+## Cluster Status Dashboard Profiles
+
+`zebra-cluster-status.py` still supports the original single-profile mode:
+
+```bash
+./zebra-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml
+```
+
+For a dashboard that can switch between fleets without restarting the server,
+pass a profile config instead:
+
+```bash
+./zebra-cluster-status.py --dashboard-config /opt/zebra-dashboard/dashboard.toml
+```
+
+See `dashboard.profiles.example.toml` for the config shape. Keep live node IPs
+and rendered node lists outside the repo, then point each profile's
+`nodes_config` at those local TOML files.
+
 ## One-time setup — the two frozen serving nodes
 
 Edit `cohort.env` (`COHORT_TAG`, the two `NODE_*_SSH`/`IP`, `SERVE_COMMIT` = a
