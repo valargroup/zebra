@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 - Verified-commitment-trees fast sync is now enabled by default when checkpoint
   sync is enabled. Operators can keep checkpoint sync but opt out of the new
   path by setting `consensus.vct_fast_sync = false`.
+- All Zakura header-store writers (header-range commits, best-chain seeds, and
+  body-commit releases) now change chain membership through a single
+  suffix-replacement primitive that deletes everything above the fork point by
+  scanning the actual on-disk rows of all five column families — so rows can no
+  longer be stranded by bounded delete loops — and verifies linkage as a hard
+  precondition. Any batch that replaces a header suffix (a header reorg) is
+  followed by the store coherence audit, repairing and reporting
+  (`state.zakura.header_store.incoherent`) any residual violation at the moment
+  it happens instead of leaving a latent on-disk fault.
 - Refreshed the default Testnet Zakura bootstrap peer identities
   (`DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS`) after the Testnet fleet's iroh node
   keys were rotated. The previous hardcoded node IDs were stale, so a fresh node
