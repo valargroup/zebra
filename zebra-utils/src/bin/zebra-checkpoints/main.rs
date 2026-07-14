@@ -23,6 +23,7 @@ use structopt::StructOpt;
 
 use zebra_chain::{
     block::{self, Block, Height, HeightDiff, TryIntoHeight},
+    parameters::constants::MAX_BLOCK_REORG_HEIGHT,
     serialization::ZcashDeserializeInto,
     transparent::MIN_TRANSPARENT_COINBASE_MATURITY,
 };
@@ -31,6 +32,11 @@ use zebra_node_services::{
     rpc_client::RpcRequestClient,
 };
 use zebra_utils::init_tracing;
+
+const _: () = assert!(
+    MAX_BLOCK_REORG_HEIGHT >= MIN_TRANSPARENT_COINBASE_MATURITY,
+    "checkpoint settlement margin must be at least the coinbase maturity",
+);
 
 pub mod args;
 
@@ -162,14 +168,14 @@ async fn main() -> Result<()> {
         .try_into_height()
         .expect("height: unexpected invalid value, missing field, or field type");
 
-    // Checkpoints must be on the main chain, so we skip blocks that are within the
-    // Zcash reorg limit.
-    let height_limit = height_limit - HeightDiff::from(MIN_TRANSPARENT_COINBASE_MATURITY);
+    // Checkpoints must be on a settled part of the best chain, so skip blocks
+    // within Zebra's rollback window.
+    let height_limit = height_limit - HeightDiff::from(MAX_BLOCK_REORG_HEIGHT);
     let height_limit = height_limit
         .ok_or_else(|| {
             eyre!(
                 "checkpoint generation needs at least {:?} blocks",
-                MIN_TRANSPARENT_COINBASE_MATURITY
+                MAX_BLOCK_REORG_HEIGHT
             )
         })
         .with_suggestion(|| "Hint: wait for the node to sync more blocks")?;

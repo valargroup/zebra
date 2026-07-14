@@ -25,7 +25,7 @@ pub use zebra_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
 /// sized as a defence-in-depth measure against sustained consensus splits.
 //
 // TODO: change to HeightDiff
-pub const MAX_BLOCK_REORG_HEIGHT: u32 = 1000;
+pub const MAX_BLOCK_REORG_HEIGHT: u32 = zebra_chain::parameters::constants::MAX_BLOCK_REORG_HEIGHT;
 
 /// The directory name used to distinguish the state database from Zebra's other databases or flat files.
 pub const STATE_DATABASE_KIND: &str = "state";
