@@ -124,20 +124,37 @@ impl ZebraDb {
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
     ) -> ZebraDb {
-        let disk_version = DiskDb::try_reusing_previous_db_after_major_upgrade(
-            &restorable_db_versions(),
-            format_version_in_code,
-            config,
-            &db_kind,
-            network,
-        )
-        .or_else(|| {
+        // A secondary must not reuse, rename, or create the primary database.
+        let disk_version = if read_only {
             database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
                 .expect("unable to read database format version file")
-        });
+        } else {
+            DiskDb::try_reusing_previous_db_after_major_upgrade(
+                &restorable_db_versions(),
+                format_version_in_code,
+                config,
+                &db_kind,
+                network,
+            )
+            .or_else(|| {
+                database_format_version_on_disk(
+                    config,
+                    &db_kind,
+                    format_version_in_code.major,
+                    network,
+                )
+                .expect("unable to read database format version file")
+            })
+        };
 
         // Log any format changes before opening the database, in case opening fails.
         let format_change = DbFormatChange::open_database(format_version_in_code, disk_version);
+
+        assert!(
+            !read_only || !format_change.is_newly_created(),
+            "cannot open read-only state because no database exists in {:?}",
+            config.cache_dir
+        );
 
         // Format upgrades try to write to the database, so we always skip them
         // if `read_only` is `true`.
