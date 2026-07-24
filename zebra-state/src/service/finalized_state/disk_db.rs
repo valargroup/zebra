@@ -1003,7 +1003,16 @@ impl DiskDb {
     ) -> DiskDb {
         // If the database is ephemeral, we don't need to check the cache directory.
         if !config.ephemeral {
-            DiskDb::validate_cache_dir(&config.cache_dir);
+            if read_only {
+                fs::read_dir(&config.cache_dir).unwrap_or_else(|error| {
+                    panic!(
+                        "cannot open read-only state cache directory {:?}: {error}",
+                        config.cache_dir
+                    )
+                });
+            } else {
+                DiskDb::validate_cache_dir(&config.cache_dir);
+            }
         }
 
         let db_kind = db_kind.as_ref();

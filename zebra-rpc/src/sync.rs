@@ -19,6 +19,9 @@ use crate::indexer::{indexer_client::IndexerClient, BlockAndHash, Empty};
 /// How long to wait between calls to `subscribe_to_non_finalized_state_change` when it returns an error.
 const POLL_DELAY: Duration = Duration::from_secs(5);
 
+/// How long to wait before retrying a block that failed to commit.
+const COMMIT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Syncs non-finalized blocks in the best chain from a trusted Zebra node's RPC methods.
 #[derive(Debug)]
 pub struct TrustedChainSync {
@@ -135,6 +138,7 @@ impl TrustedChainSync {
     #[tracing::instrument(skip_all)]
     async fn sync(&mut self) {
         let mut non_finalized_blocks_listener = None;
+        let mut last_failed_commit_hash = None;
         self.try_catch_up_with_primary().await;
         if let Some(finalized_tip_block) = self.finalized_chain_tip_block().await {
             self.chain_tip_sender.set_finalized_tip(finalized_tip_block);
@@ -185,6 +189,7 @@ impl TrustedChainSync {
             let block = SemanticallyVerifiedBlock::with_hash(Arc::new(block), hash);
             match self.try_commit(block.clone()).await {
                 Ok(()) => {
+                    last_failed_commit_hash = None;
                     while self
                         .non_finalized_state
                         .root_height()
@@ -198,15 +203,19 @@ impl TrustedChainSync {
                     self.update_channels();
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        ?hash,
-                        "failed to commit block to non-finalized state"
-                    );
+                    if last_failed_commit_hash != Some(hash) {
+                        tracing::warn!(
+                            ?error,
+                            ?hash,
+                            "failed to commit block to non-finalized state"
+                        );
+                        last_failed_commit_hash = Some(hash);
+                    }
 
                     // TODO: Investigate whether it would be correct to ignore some errors here instead of
                     //       trying every block in the non-finalized state again.
                     non_finalized_blocks_listener = None;
+                    tokio::time::sleep(COMMIT_RETRY_DELAY).await;
                 }
             };
         }

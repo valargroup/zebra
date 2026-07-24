@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Read-only state opens no longer create or rename the primary state directory,
+  and trusted-chain synchronization backs off after repeated commit failures.
+
 ### Added
 
 - Zebra now tags the coinbase input of every block it mines with a `🌸`. The
