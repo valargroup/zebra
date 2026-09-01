@@ -140,6 +140,9 @@ impl ServeProfile {
     }
 
     /// A slow peer: a fixed RTT before the first block plus per-block serve latency.
+    // Retained scaffolding for the deferred `fuzz_reorg` scenario (awaiting the
+    // high-fidelity `Committer<MockVerifier>` tier); not currently constructed.
+    #[allow(dead_code)]
     pub(crate) fn slow(rtt: Duration, per_block: Duration) -> Self {
         Self {
             first_block_latency: LatencyDist::Fixed(rtt),
@@ -271,6 +274,9 @@ pub(crate) enum TipEventKind {
     /// Move the best-header target down to `height` (`HeaderReanchored`).
     HeaderReanchor(block::Height),
     /// Reset the verified-body tip down to `height` (`VerifiedReset`) — a reorg/rollback.
+    // Retained scaffolding for the deferred `fuzz_reorg` scenario (awaiting the
+    // high-fidelity `Committer<MockVerifier>` tier); not currently constructed.
+    #[allow(dead_code)]
     VerifiedReset(block::Height),
 }
 

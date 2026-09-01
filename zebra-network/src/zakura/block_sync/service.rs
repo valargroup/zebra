@@ -4,10 +4,8 @@ use crate::zakura::{
     PeerStreamSession, Service, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
     FRAME_HEADER_BYTES,
 };
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
-};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::time::Instant;
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
