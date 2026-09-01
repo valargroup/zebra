@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MinimumPeerVersion::chain_tip()` for checking tip state from peer routing
+  logic.
 - Added `zebra_network::zakura`, a default-off iroh scaffold that exposes a
   relay/discovery-off endpoint builder and reserves the persistent Zakura iroh
   node secret-key path and config field.
-- Added `PeerServices::NODE_P2P_V2`, the default-on `v2_p2p` and `legacy_p2p`
-  network configs, and a neutral legacy-handshake upgrade hook for mutually
-  capable Zakura peers.
+- Added `PeerServices::NODE_P2P_V2`, the `default_p2p`, `v2_p2p`, and
+  `legacy_p2p` network configs, and a neutral legacy-handshake upgrade hook for
+  mutually capable Zakura peers.
 - Added bounded Zakura P2P v2 upgrade prelude and control-handshake wire types,
   including transcript binding, native-vs-upgraded control validation, and
   duplicate-peer handling scaffolding.
@@ -44,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `MinimumPeerVersion::chain_tip_height()` is replaced by
+  `MinimumPeerVersion::chain_tip()`, which returns the underlying chain tip
+  reference so peer routing can query tip readiness.
+- Added `network.identity_dir` for auto-generated Zakura iroh identity keys,
+  defaulting to `~/.zakura`. This path is independent of the peer cache
+  directory, so cache or state snapshots do not clone a node's long-term P2P
+  identity.
+- Added `network.zakura.max_connections_per_ip`, defaulting to 16, so native
+  Zakura admission can allow NATed or co-hosted peers without changing the
+  legacy peer-set per-IP default.
 - `Request::PushTransaction` is now a 2-tuple variant:
   `PushTransaction(UnminedTx, Option<PeerSource>)`, so inbound peer-pushed
   transactions can be attributed to the sending peer for mempool admission
@@ -140,6 +152,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Legacy peer-set stall tracking no longer disconnects peers for empty
+  `FindBlocks` or `FindHeaders` responses when Zebra is at or near the network
+  tip.
+- Zakura header sync now sends a redundant `Status` as an application-level
+  keepalive on a spam-safe budget (at least twice the inbound status minimum
+  interval), so healthy connections between peers idle at the same tip are no
+  longer closed by the application idle reaper every idle window. Unsent or
+  changed statuses still retry on the fast unsolicited budget. Service park
+  decisions (admission rejections and no-demand ordered streams) are now
+  logged at info and counted in the new `sync.header.peer.parked`,
+  `sync.block.peer.parked`, `zakura.discovery.peer.parked`, and
+  `zakura.p2p.stream.parked.no_demand` metrics.
 - Use network protocol version 170160 as the NU6.3 minimum on Mainnet, Testnet,
   and Regtest, matching Zebra's advertised current protocol version.
 - A peer upgraded from legacy TCP to Zakura is no longer re-dialed over legacy.

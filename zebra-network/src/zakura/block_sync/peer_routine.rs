@@ -26,6 +26,9 @@ use std::collections::BTreeMap;
 use tokio::sync::{futures::Notified, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+use super::super::trace::{
+    ordered_send_error_label, queue_send_trace as qs_trace, QUEUE_SEND_TABLE,
+};
 use super::events::RoutineToReactor;
 use super::{
     admission::{
@@ -268,11 +271,6 @@ impl PeerRoutine {
         let inbound_status_meter = super::state::RateMeter::new(
             config.status_refresh_interval.min(Duration::from_secs(1)),
         );
-        // Defer the first Status reply: the reactor already sends a connect-status
-        // on `PeerConnected`, so the peer's first inbound `Status` should not also
-        // trigger an immediate reply.
-        let mut status_reply_meter = status_reply_meter;
-        status_reply_meter.mark_taken(Instant::now());
         let max_blocks_per_response = config.advertised_max_blocks_per_response();
         let max_response_bytes = config.advertised_max_response_bytes();
         PeerRoutine {
@@ -517,6 +515,9 @@ impl PeerRoutine {
         if !self.inbound_status_meter.try_take(now) && !grows {
             return;
         }
+        // The reply is best-effort: if both the connect-time Status and this
+        // first reply are dropped by a full outbound queue, recovery depends on
+        // the remote's later Status retry arriving after this meter reopens.
         let send_reply = self.status_reply_meter.try_take(now);
         self.received_status = true;
         self.servable_low = status.servable_low;
@@ -651,8 +652,8 @@ impl PeerRoutine {
             // above-window slots even for a near-floor block.
             let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
             let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
-            let normal_slots = self.window.available_slots();
-            let floor_slots = self.window.available_slots_with_bonus(floor_bonus);
+            let normal_slots = self.window.available_slots_at(now);
+            let floor_slots = self.window.available_slots_with_bonus_at(floor_bonus, now);
             // Break only when even a bypassed floor request has no slot. A cwnd that is
             // saturated for above-floor work (`normal_slots == 0`) still leaves up to
             // `floor_bonus` slots so the lowest missing height keeps moving — unless the
@@ -724,7 +725,7 @@ impl PeerRoutine {
                         AdmissionOutcome::Admit(grant) => {
                             let floor_cwnd_cap = self
                                 .window
-                                .cwnd_byte_headroom(floor_bonus)
+                                .cwnd_byte_headroom_at(floor_bonus, now)
                                 .unwrap_or(u64::MAX);
                             items = self.work.take_in_range_budgeted(
                                 servable_low,
@@ -767,7 +768,10 @@ impl PeerRoutine {
                         // Bound the take by remaining cwnd byte headroom (byte mode, no floor
                         // bonus) so an above-floor request never overshoots the byte window
                         // beyond the one always-taken item.
-                        let above_cwnd_cap = self.window.cwnd_byte_headroom(0).unwrap_or(u64::MAX);
+                        let above_cwnd_cap = self
+                            .window
+                            .cwnd_byte_headroom_at(0, now)
+                            .unwrap_or(u64::MAX);
                         items = self.work.take_in_range_budgeted(
                             servable_low,
                             grant.take_high,
@@ -883,6 +887,10 @@ impl PeerRoutine {
             };
 
             let queued_at = Instant::now();
+            let msg = BlockSyncMessage::GetBlocks {
+                start_height: request.start_height,
+                count: request.count,
+            };
             if let Err(error) = self
                 .session
                 .try_send_get_blocks(request.start_height, request.count)
@@ -894,6 +902,7 @@ impl PeerRoutine {
                     ?error,
                     "failed to queue Zakura block-sync GetBlocks"
                 );
+                self.trace_queue_send_failed(&msg, &error);
                 // Nothing was received, so return every taken height to the queue.
                 // Held-aware: a competing peer's late body may have converted a taken
                 // height during the reserve await; that body is owned by the Sequencer,
@@ -1979,19 +1988,52 @@ impl PeerRoutine {
         // snapshot reflects a sealed peer's collapsed floor bonus.
         let base_floor_bonus = usize::try_from(self.config.floor_bypass_slots).unwrap_or(0);
         let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
+        let now = Instant::now();
         self.emit(bs_trace::BLOCK_FILL_STOP, |row| {
             bs_insert_peer(row, bs_trace::PEER, &self.peer);
             bs_insert_str(row, bs_trace::FILL_STOP_REASON, reason);
             bs_insert_u64(row, bs_trace::FILL_SENT, 0);
-            bs_insert_u64(row, "normal_slots", self.window.available_slots() as u64);
+            bs_insert_u64(
+                row,
+                "normal_slots",
+                self.window.available_slots_at(now) as u64,
+            );
             bs_insert_u64(
                 row,
                 "floor_slots",
-                self.window.available_slots_with_bonus(floor_bonus) as u64,
+                self.window.available_slots_with_bonus_at(floor_bonus, now) as u64,
             );
             bs_insert_u64(row, "budget_available", self.budget.available());
             bs_insert_u64(row, "pending_work", self.work.pending_len() as u64);
             bs_insert_u64(row, "received_status", u64::from(self.received_status));
+        });
+    }
+
+    fn trace_queue_send_failed(&self, msg: &BlockSyncMessage, error: &OrderedSendError) {
+        self.trace.emit_with(QUEUE_SEND_TABLE, |row| {
+            bs_insert_str(row, qs_trace::EVENT, qs_trace::QUEUE_SEND_FAILED);
+            bs_insert_str(row, qs_trace::SERVICE, "block_sync");
+            bs_insert_str(row, qs_trace::MESSAGE, block_sync_message_label(msg));
+            bs_insert_peer(row, qs_trace::PEER, &self.peer);
+            bs_insert_str(row, qs_trace::ERROR, ordered_send_error_label(error));
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_CAPACITY,
+                u64::try_from(self.session.outbound_capacity()).unwrap_or(u64::MAX),
+            );
+            bs_insert_u64(
+                row,
+                qs_trace::QUEUE_MAX_CAPACITY,
+                u64::try_from(self.session.outbound_max_capacity()).unwrap_or(u64::MAX),
+            );
+            if let BlockSyncMessage::GetBlocks {
+                start_height,
+                count,
+            } = msg
+            {
+                bs_insert_height(row, qs_trace::RANGE_START, *start_height);
+                bs_insert_u64(row, qs_trace::RANGE_COUNT, u64::from(*count));
+            }
         });
     }
 

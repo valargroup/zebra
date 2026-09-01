@@ -10,7 +10,7 @@
 //!
 //! Check transparent address indexes, UTXOs, etc.
 
-use std::{iter, path::Path, sync::Arc};
+use std::{iter, sync::Arc};
 
 use super::super::RetentionPlan;
 use zebra_chain::{
@@ -37,6 +37,10 @@ use zebra_chain::{
 };
 use zebra_test::vectors::{MAINNET_BLOCKS, TESTNET_BLOCKS};
 
+use super::common::{
+    commit_header_range, mainnet_block, no_extra_checkpoint_test_network, persistent_config,
+    persistent_state, root_at, state_with_genesis_config, write_full_block_header_and_transactions,
+};
 use crate::{
     constants::{
         state_database_format_version_in_code, MAX_BLOCK_REORG_HEIGHT,
@@ -543,7 +547,7 @@ fn committed_body_releases_only_its_height_and_keeps_the_frontier() {
 }
 
 #[test]
-fn write_block_deletes_matching_provisional_zakura_roots() {
+fn write_block_replaces_matching_provisional_zakura_roots_with_verified_row() {
     let _init_guard = zebra_test::init();
     let genesis = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
@@ -562,6 +566,8 @@ fn write_block_deletes_matching_provisional_zakura_roots() {
             .map(ToString::to_string),
         false,
     );
+    // Provisional rows are distinguishable from the verified row the body commit
+    // writes: `root_at` uses a zeroed auth-data root, the commit stores the real one.
     let roots = [root_at(Height(1)), root_at(Height(2))];
 
     write_full_block(&mut state, genesis);
@@ -573,14 +579,91 @@ fn write_block_deletes_matching_provisional_zakura_roots() {
         roots.to_vec()
     );
 
-    write_full_block(&mut state, block1);
+    write_full_block(&mut state, block1.clone());
 
-    assert!(state
-        .zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1))
-        .is_empty());
+    // The body commit replaces the provisional row at its height with the verified
+    // row derived from the committed treestate, and leaves higher provisional rows
+    // untouched.
+    let verified_row = BlockCommitmentRoots {
+        height: Height(1),
+        sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
+        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
+        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
+        sapling_tx: 0,
+        orchard_tx: 0,
+        ironwood_tx: 0,
+        auth_data_root: block1.auth_data_root(),
+    };
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1)),
+        vec![verified_row]
+    );
     assert_eq!(
         state.zakura_header_commitment_roots_by_height_range(Height(2)..=Height(2)),
         vec![root_at(Height(2))]
+    );
+}
+
+/// A header range re-delivered over a height whose body is already committed (a
+/// header store behind the body store, or a late range response racing body sync)
+/// must not overwrite the verified serving-index row with peer-supplied roots:
+/// committed roots win on any overlap (design §9).
+#[test]
+fn header_range_roots_do_not_overwrite_committed_serving_index_rows() {
+    let _init_guard = zebra_test::init();
+    let genesis = zebra_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("genesis block deserializes");
+    let block1 = zebra_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 1 deserializes");
+    let mut state = ZebraDb::new(
+        &Config::ephemeral(),
+        STATE_DATABASE_KIND,
+        &state_database_format_version_in_code(),
+        &Mainnet,
+        true,
+        STATE_COLUMN_FAMILIES_IN_CODE
+            .iter()
+            .map(ToString::to_string),
+        false,
+    );
+
+    write_full_block(&mut state, genesis.clone());
+    write_full_block(&mut state, block1.clone());
+
+    let verified_rows = state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1));
+    assert_eq!(
+        verified_rows.len(),
+        1,
+        "the body commit writes the verified serving-index row"
+    );
+
+    // Re-deliver the real header for the committed height, but with garbage roots —
+    // exactly what a malicious serving peer can put in a `Headers` response, since
+    // root bytes are unauthenticated at header-commit time.
+    let mut poisoned = root_at(Height(1));
+    poisoned.sapling_tx = 99;
+    poisoned.auth_data_root = zebra_chain::block::merkle::AuthDataRoot::from([0xAA; 32]);
+
+    let mut batch = DiskWriteBatch::new();
+    batch
+        .prepare_header_range_batch_with_roots(
+            &state,
+            genesis.hash(),
+            std::slice::from_ref(&block1.header),
+            &[0],
+            &[poisoned],
+        )
+        .expect("re-delivering the same header over a committed height is accepted");
+    state
+        .write_batch(batch)
+        .expect("header range batch writes successfully");
+
+    assert_eq!(
+        state.zakura_header_commitment_roots_by_height_range(Height(1)..=Height(1)),
+        verified_rows,
+        "peer-supplied roots must not overwrite the verified committed row"
     );
 }
 
@@ -937,10 +1020,16 @@ fn header_range_commit_rejects_non_current_anchor_hash() {
     let block2 = mainnet_block(2);
     let alternate_block2 = alternate_header(stale_anchor, &block2.header, 1);
 
+    // A hash→height entry whose height→hash row names a different block is a
+    // bijection violation in our own indexes, reported as a local storage
+    // fault rather than an unknown anchor. Either way the stale anchor cannot
+    // be committed on.
     let mut batch = DiskWriteBatch::new();
     assert!(matches!(
         batch.prepare_header_range_batch(&state, stale_anchor, &[alternate_block2], &[0]),
-        Err(CommitHeaderRangeError::UnknownAnchor { anchor }) if anchor == stale_anchor
+        Err(CommitHeaderRangeError::StoreIncoherent(
+            crate::error::StoreIncoherentError::BijectionMismatch { hash, height, stored },
+        )) if hash == stale_anchor && height == Height(1) && stored == Some(block1.hash())
     ));
 
     assert_eq!(state.hash(Height(1)), None);
@@ -1131,47 +1220,6 @@ fn state_with_genesis_and_zakura_seed(network: &Network, genesis: Arc<Block>) ->
     state_with_genesis_config(network, genesis, config)
 }
 
-fn state_with_genesis_config(network: &Network, genesis: Arc<Block>, config: Config) -> ZebraDb {
-    let state = ZebraDb::new(
-        &config,
-        STATE_DATABASE_KIND,
-        &state_database_format_version_in_code(),
-        network,
-        true,
-        STATE_COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string),
-        false,
-    );
-
-    write_full_block_header_and_transactions(&state, genesis.clone());
-
-    state
-}
-
-fn persistent_config(cache_dir: &Path) -> Config {
-    Config {
-        cache_dir: cache_dir.to_owned(),
-        ephemeral: false,
-        debug_skip_non_finalized_state_backup_task: true,
-        ..Config::default()
-    }
-}
-
-fn persistent_state(config: &Config, network: &Network) -> ZebraDb {
-    ZebraDb::new(
-        config,
-        STATE_DATABASE_KIND,
-        &state_database_format_version_in_code(),
-        network,
-        true,
-        STATE_COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string),
-        false,
-    )
-}
-
 fn checkpoint_test_network(genesis_hash: block::Hash, checkpoint_hash: block::Hash) -> Network {
     testnet::Parameters::build()
         .with_network_name("HeaderCheckpointTest")
@@ -1195,34 +1243,6 @@ fn checkpoint_test_network(genesis_hash: block::Hash, checkpoint_hash: block::Ha
         .expect("test network is valid")
 }
 
-fn no_extra_checkpoint_test_network(genesis_hash: block::Hash) -> Network {
-    testnet::Parameters::build()
-        .with_network_name("HeaderReorgTest")
-        .expect("test network name is valid")
-        .with_genesis_hash(genesis_hash)
-        .expect("test genesis hash is valid")
-        .with_target_difficulty_limit(Mainnet.target_difficulty_limit())
-        .expect("mainnet difficulty limit is valid for test network")
-        .with_activation_heights(testnet::ConfiguredActivationHeights {
-            canopy: Some(1),
-            ..Default::default()
-        })
-        .expect("test activation heights are valid")
-        .clear_funding_streams()
-        .clear_checkpoints()
-        .expect("genesis-only checkpoints are valid")
-        .to_network()
-        .expect("test network is valid")
-}
-
-fn mainnet_block(height: u32) -> Arc<Block> {
-    MAINNET_BLOCKS
-        .get(&height)
-        .expect("test vector exists")
-        .zcash_deserialize_into::<Arc<Block>>()
-        .expect("mainnet test block deserializes")
-}
-
 fn synthetic_headers_from_state(
     state: &ZebraDb,
     anchor_height: Height,
@@ -1232,7 +1252,9 @@ fn synthetic_headers_from_state(
 ) -> Vec<Arc<block::Header>> {
     let network = state.network();
     let template = mainnet_block(1);
-    let mut context = state.recent_header_context(anchor_height);
+    let mut context = state
+        .recent_header_context(anchor_height)
+        .expect("test store is coherent");
     let mut previous_hash = anchor_hash;
     let mut previous_height = anchor_height;
     let mut nonce_tag = nonce_seed;
@@ -1285,19 +1307,6 @@ fn alternate_header(
     Arc::new(header)
 }
 
-fn root_at(height: Height) -> BlockCommitmentRoots {
-    BlockCommitmentRoots {
-        height,
-        sapling_root: sapling::tree::NoteCommitmentTree::default().root(),
-        orchard_root: orchard::tree::NoteCommitmentTree::default().root(),
-        ironwood_root: zebra_chain::ironwood::tree::NoteCommitmentTree::default().root(),
-        sapling_tx: 0,
-        orchard_tx: 0,
-        ironwood_tx: 0,
-        auth_data_root: zebra_chain::block::merkle::AuthDataRoot::from([0u8; 32]),
-    }
-}
-
 fn write_full_block(state: &mut ZebraDb, block: Arc<Block>) {
     let checkpoint_verified = CheckpointVerifiedBlock::from(block);
     let finalized =
@@ -1310,37 +1319,9 @@ fn write_full_block(state: &mut ZebraDb, block: Arc<Block>) {
             &Mainnet,
             "test",
             RetentionPlan::Store,
-            None,
+            Default::default(),
         )
         .expect("block commit succeeds");
-}
-
-fn commit_header_range(
-    state: &ZebraDb,
-    anchor: block::Hash,
-    headers: &[Arc<block::Header>],
-) -> block::Hash {
-    let mut batch = DiskWriteBatch::new();
-    let body_sizes = vec![0; headers.len()];
-    let committed_hash = batch
-        .prepare_header_range_batch(state, anchor, headers, &body_sizes)
-        .expect("header range is valid");
-    state
-        .write_batch(batch)
-        .expect("header range batch writes successfully");
-    committed_hash
-}
-
-fn write_full_block_header_and_transactions(state: &ZebraDb, block: Arc<Block>) {
-    let checkpoint_verified = CheckpointVerifiedBlock::from(block);
-    let finalized =
-        FinalizedBlock::from_checkpoint_verified(checkpoint_verified, Treestate::default());
-
-    let mut batch = DiskWriteBatch::new();
-    batch
-        .prepare_block_header_and_transaction_data_batch(state, &finalized, true, None)
-        .expect("full block header and transaction batch is valid");
-    state.db.write(batch).expect("full block batch writes");
 }
 
 fn test_block_db_round_trip_with(

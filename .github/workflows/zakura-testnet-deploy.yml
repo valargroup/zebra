@@ -1,0 +1,315 @@
+name: Deploy Zakura testnet fleet
+
+# Manual fleet deploy for the Zakura testnet nodes.
+#
+# Runs on a self-hosted Linux x86_64 runner, expected to be installed on
+# zakura-testnet-1 with the `zakura-testnet-deployer` label. The deployer builds
+# a native zebrad binary on that runner, then uses deploy/deployer/deploy.py to
+# scp/install it across the fleet.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git branch, tag, or SHA to build and deploy"
+        required: true
+        type: string
+        default: ironwood-main
+      force_rebuild:
+        description: "Rebuild even if a cached binary for this commit exists"
+        type: boolean
+        required: false
+        default: false
+      no_restart:
+        description: "Stage binary/config/unit without restarting zebrad"
+        type: boolean
+        required: false
+        default: false
+      node:
+        description: "Optional single deployer node name; blank deploys the whole fleet"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-testnet-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: "Deploy Zakura testnet ${{ inputs.ref }}"
+    runs-on: [self-hosted, "${{ vars.ZAKURA_TESTNET_RUNNER_LABEL || 'zakura-testnet-deployer' }}"]
+    timeout-minutes: 180
+    environment: zakura-testnet
+
+    steps:
+      - name: Checkout deploy ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          toolchain: stable
+          cache-on-failure: true
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-on-failure: true
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            git \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler \
+            python3
+
+      - name: Start SSH agent when deploy key is configured
+        env:
+          ZAKURA_TESTNET_DEPLOY_SSH_KEY: ${{ secrets.ZAKURA_TESTNET_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ZAKURA_TESTNET_DEPLOY_SSH_KEY}" ]; then
+            echo "ZAKURA_TESTNET_DEPLOY_SSH_KEY is not set; using the runner's existing SSH identity."
+            exit 0
+          fi
+
+          ssh_agent_sock="$RUNNER_TEMP/ssh-agent.sock"
+          ssh-agent -a "$ssh_agent_sock" > "$RUNNER_TEMP/ssh-agent.env"
+          SSH_AUTH_SOCK="$ssh_agent_sock" ssh-add - <<< "$ZAKURA_TESTNET_DEPLOY_SSH_KEY"
+          echo "SSH_AUTH_SOCK=$ssh_agent_sock" >> "$GITHUB_ENV"
+
+      - name: Pin fleet host keys
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          : > ~/.ssh/known_hosts
+          for host in 167.99.103.111 167.99.110.145 138.68.229.254 164.92.209.78 206.189.148.0; do
+            ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
+          done
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Generate deployer fleet config
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          cat > nodes.ci.toml <<EOF
+          [defaults]
+          service_name    = "zebrad"
+          bin_path        = "/usr/local/bin/zebrad"
+          config_path     = "/etc/zakura/zebrad.toml"
+          network         = "Testnet"
+          listen_addr     = "0.0.0.0:18233"
+          rpc_listen_addr = "0.0.0.0:18232"
+          rpc_enable_cookie_auth = false
+          storage_mode    = "archive"
+          v2_p2p          = true
+          legacy_p2p      = true
+          metrics_endpoint = "127.0.0.1:9999"
+          tracing_filter  = "info,zebra_network::zakura=info"
+          checkpoint_sync = false
+          vct_fast_sync   = false
+
+          [defaults.zakura]
+          listen_addr = "0.0.0.0:8234"
+          bootstrap_peers = [
+              "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
+              "4faac8f988a7820690d63b57a385cd6f833638b068e774550712c05e4b692426@167.99.110.145:8234",
+              "9ce6b95aa197d169399788fe01dd8a88140e81d23d00b4739aeeb1113c6247a2@138.68.229.254:8234",
+              "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a@164.92.209.78:8234",
+              "50999835f48f4a048c0e9042e5332844c9673943d7fab1f7e993bae698c27ea3@206.189.148.0:8234",
+          ]
+
+          [[nodes]]
+          name       = "zakura-testnet-1"
+          ssh_string = "root@167.99.103.111"
+          commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
+
+          [[nodes]]
+          name       = "zakura-testnet-2"
+          ssh_string = "root@167.99.110.145"
+          commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-2-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-2-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-2-data/logs/zebrad.log"
+
+          [[nodes]]
+          name       = "zakura-testnet-3"
+          ssh_string = "root@138.68.229.254"
+          commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-3-data/logs/zebrad.log"
+
+          [[nodes]]
+          name       = "zakura-testnet-eu"
+          ssh_string = "root@164.92.209.78"
+          commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-eu-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-eu-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-eu-data/logs/zebrad.log"
+
+          [[nodes]]
+          name       = "zakura-testnet-as"
+          ssh_string = "root@206.189.148.0"
+          commit     = "${{ inputs.ref }}"
+          network_cache_dir = "/mnt/zakura-testnet-as-data/zebra-cache"
+          state_cache_dir = "/mnt/zakura-testnet-as-data/zebra-cache"
+          log_file = "/mnt/zakura-testnet-as-data/logs/zebrad.log"
+          EOF
+
+      - name: Build deployer binary
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py build "${args[@]}"
+
+      - name: Deploy fleet
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ "${{ inputs.no_restart }}" = "true" ]; then
+            args+=(--no-restart)
+          fi
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py deploy "${args[@]}"
+
+      - name: Show fleet status
+        if: always()
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py status "${args[@]}"
+
+      - name: Install cluster status dashboard
+        if: always()
+        run: |
+          set -euo pipefail
+
+          dashboard_dir="/opt/zakura-testnet-dashboard"
+          sudo install -d -m 755 "$dashboard_dir"
+          sudo install -m 755 deploy/runner/zebra-cluster-status.py "$dashboard_dir/zebra-cluster-status.py"
+          sudo install -m 644 deploy/deployer/nodes.ci.toml "$dashboard_dir/nodes.toml"
+
+          sudo tee /etc/systemd/system/zakura-testnet-dashboard.service >/dev/null <<'EOF'
+          [Unit]
+          Description=Zakura testnet cluster status dashboard
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/zakura-testnet-dashboard
+          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zebra-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300 --upgrade-height 4134000 --target-spacing 7.5
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-testnet-dashboard.service
+          sudo systemctl restart zakura-testnet-dashboard.service
+          sudo systemctl --no-pager --full status zakura-testnet-dashboard.service || true
+
+      - name: Install snapshots website
+        if: always()
+        run: |
+          set -euo pipefail
+
+          site_dir="/opt/zakura-testnet-snapshots/site"
+          sudo install -d -m 755 "$site_dir"
+          sudo install -d -m 755 "$site_dir/files"
+          sudo install -m 644 deploy/deployer/testnet/snapshots-site/index.html "$site_dir/index.html"
+
+          if ! sudo test -f "$site_dir/snapshots.json"; then
+            sudo install -m 644 deploy/deployer/testnet/snapshots-site/snapshots.json "$site_dir/snapshots.json"
+          fi
+
+          sudo tee /etc/systemd/system/zakura-testnet-snapshots.service >/dev/null <<'EOF'
+          [Unit]
+          Description=Zakura testnet snapshots website
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/zakura-testnet-snapshots/site
+          ExecStart=/usr/bin/python3 -m http.server 8091 --bind 0.0.0.0 --directory /opt/zakura-testnet-snapshots/site
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-testnet-snapshots.service
+          sudo systemctl restart zakura-testnet-snapshots.service
+          sudo systemctl --no-pager --full status zakura-testnet-snapshots.service || true
+
+      - name: Fetch recent logs on failure
+        if: failure()
+        working-directory: deploy/deployer
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml --lines 300)
+          if [ -n "${{ inputs.node }}" ]; then
+            args+=(--node "${{ inputs.node }}")
+          fi
+
+          python3 deploy.py logs fetch "${args[@]}" || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        with:
+          name: zakura-testnet-deploy-logs-${{ github.run_id }}
+          path: deploy/deployer/logs/
+          if-no-files-found: ignore
+          retention-days: 14

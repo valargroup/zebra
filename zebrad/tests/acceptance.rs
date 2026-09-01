@@ -796,7 +796,7 @@ fn last_config_is_stored() -> Result<()> {
     let generated_content =
         fs::read_to_string(generated_config_path).expect("Should have been able to read the file");
 
-    // We need to replace the cache dir path as stored configs has a dummy `cache_dir` string there.
+    // Replace local filesystem paths with dummy strings so stored configs are portable.
     let processed_generated_content = generated_content
         .replace(
             zebra_state::Config::default()
@@ -805,40 +805,24 @@ fn last_config_is_stored() -> Result<()> {
                 .expect("a valid cache dir"),
             "cache_dir",
         )
+        .replace(
+            zebra_network::Config::default()
+                .identity_dir
+                .to_str()
+                .expect("a valid identity dir"),
+            "identity_dir",
+        )
         .trim()
         .to_string();
 
-    // Loop all the stored configs
-    //
-    // TODO: use the same filename list code in last_config_is_stored() and stored_configs_work()
-    for config_file in configs_dir()
-        .read_dir()
-        .expect("read_dir call failed")
-        .flatten()
-    {
-        let config_file_path = config_file.path();
-        let config_file_name = config_file_path
-            .file_name()
-            .expect("config files must have a file name")
-            .to_string_lossy();
+    let expected_config_path = current_version_config_path();
 
-        if config_file_name.as_ref().starts_with('.') || config_file_name.as_ref().starts_with('#')
-        {
-            // Skip editor files and other invalid config paths
-            tracing::info!(
-                ?config_file_path,
-                "skipping hidden/temporary config file path"
-            );
-            continue;
-        }
-
-        // Read stored config
-        let stored_content = fs::read_to_string(config_file_full_path(config_file_path))
-            .expect("Should have been able to read the file")
+    if expected_config_path.exists() {
+        let stored_content = fs::read_to_string(&expected_config_path)
+            .expect("Should have been able to read the versioned config file")
             .trim()
             .to_string();
 
-        // If any stored config is equal to the generated then we are good.
         if stored_content.eq(&processed_generated_content) {
             return Ok(());
         }
@@ -846,9 +830,10 @@ fn last_config_is_stored() -> Result<()> {
 
     println!(
         "\n\
-         Here is the missing config file: \n\
+         Here is the expected config file content for {}: \n\
          \n\
-         {processed_generated_content}\n"
+         {processed_generated_content}\n",
+        expected_config_path.display()
     );
 
     Err(eyre!(
@@ -856,14 +841,22 @@ fn last_config_is_stored() -> Result<()> {
          \n\
          Take the missing config file logged above, \n\
          and commit it to Zebra's git repository as:\n\
-         zebrad/tests/common/configs/<next-release-tag>.toml \n\
+         {} \n\
          \n\
          Or run: \n\
          cargo build --bin zebrad && \n\
          zebrad generate | \n\
-         sed 's/cache_dir = \".*\"/cache_dir = \"cache_dir\"/' > \n\
-         zebrad/tests/common/configs/<next-release-tag>.toml",
+         sed 's/cache_dir = \".*\"/cache_dir = \"cache_dir\"/' | \n\
+         sed 's/identity_dir = \".*\"/identity_dir = \"identity_dir\"/' > \n\
+         {}",
+        expected_config_path.display(),
+        expected_config_path.display(),
     ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn current_version_config_path() -> PathBuf {
+    configs_dir().join(format!("v{}.toml", env!("CARGO_PKG_VERSION")))
 }
 
 /// Checks that Zebra prints an informative message when it cannot parse the

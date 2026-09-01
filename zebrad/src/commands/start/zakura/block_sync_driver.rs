@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -34,7 +34,10 @@ use super::{
 pub(crate) const ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_INTERVAL: Duration =
     Duration::from_millis(200);
 const ZAKURA_BLOCK_SYNC_CHECKPOINT_FRONTIER_REFRESH_ATTEMPTS: usize = 24;
-pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 = 262_144;
+
+#[cfg(test)]
+pub(crate) const ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW: u32 =
+    zebra_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BlockApplyClass {
@@ -108,6 +111,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     combined_apply_limit: usize,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
+    block_sync_handoff: std::sync::Arc<super::BlockSyncHandoff>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) where
     ReadState: Service<
@@ -146,6 +150,11 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     let mut shutting_down = false;
 
     loop {
+        if block_sync_handoff.is_yielded_to_legacy() {
+            release_pending_applies(&block_sync, &mut pending_applies, &trace);
+            release_pending_probe_applies(&block_sync, &mut pending_probe_applies, &trace);
+        }
+
         if !shutting_down && shutdown.as_mut().now_or_never().is_some() {
             shutting_down = true;
             pending_applies.clear();
@@ -156,6 +165,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         if shutting_down {
             if let Some(completed) = in_flight_applies.next().await {
                 handle_completed_block_apply(
+                    &block_sync_handoff,
                     completed,
                     &mut pending_applies,
                     &mut in_flight_applies,
@@ -182,6 +192,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
         if !in_flight_applies.is_empty() {
             if let Some(Some(completed)) = in_flight_applies.next().now_or_never() {
                 handle_completed_block_apply(
+                    &block_sync_handoff,
                     completed,
                     &mut pending_applies,
                     &mut in_flight_applies,
@@ -223,6 +234,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         continue;
                     };
                     handle_completed_block_apply(
+                        &block_sync_handoff,
                         completed,
                         &mut pending_applies,
                         &mut in_flight_applies,
@@ -276,7 +288,8 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 debug!(?peer, ?reason, "recorded Zakura block-sync peer violation");
             }
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
+                limit,
                 best_header_tip,
             } => {
                 emit_commit_state(
@@ -285,18 +298,13 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     "block_sync_driver",
                     |row| {
                         insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
-                        insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, verified_block_tip);
+                        insert_cs_height(row, cs_trace::RANGE_START, from);
+                        insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(limit));
                         insert_cs_height(row, cs_trace::BEST_HEADER_TIP, best_header_tip);
                     },
                 );
                 let started = Instant::now();
-                match query_block_sync_needed_blocks(
-                    read_state.clone(),
-                    verified_block_tip,
-                    best_header_tip,
-                )
-                .await
-                {
+                match query_block_sync_needed_blocks(read_state.clone(), from, limit).await {
                     Ok(blocks) => {
                         emit_commit_state(
                             &trace,
@@ -331,7 +339,8 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                             },
                         );
                         warn!(
-                            ?verified_block_tip,
+                            ?from,
+                            ?limit,
                             ?best_header_tip,
                             ?error,
                             "failed to query Zakura block-sync needed blocks"
@@ -469,6 +478,10 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
             BlockSyncAction::SubmitBlock { token, block } => {
                 let class = block_apply_class(block.as_ref(), max_checkpoint_height);
                 let height = block.coinbase_height();
+                if block_sync_handoff.is_yielded_to_legacy() {
+                    abandon_block_apply(&block_sync, token, block.as_ref(), &trace);
+                    continue;
+                }
                 emit_commit_state(
                     &trace,
                     cs_trace::BLOCK_SUBMIT_QUEUED,
@@ -535,6 +548,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block,
                 });
                 drain_pending_block_applies(
+                    &block_sync_handoff,
                     &mut pending_applies,
                     &mut in_flight_applies,
                     &mut checkpoint_in_flight,
@@ -555,6 +569,79 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
     }
 }
 
+fn abandon_block_apply(
+    block_sync: &BlockSyncHandle,
+    token: BlockApplyToken,
+    block: &block::Block,
+    trace: &ZakuraTrace,
+) {
+    let Some((height, expected_hash, result, event)) =
+        abandoned_block_apply_finished_event(token, block)
+    else {
+        warn!(
+            expected_hash = ?block.hash(),
+            "dropping abandoned Zakura block-sync body without coinbase height"
+        );
+        return;
+    };
+
+    let _ = block_sync.send_control(event);
+    emit_commit_state(
+        trace,
+        cs_trace::REACTOR_EVENT_SENT,
+        "block_sync_driver",
+        |row| {
+            insert_cs_str(row, cs_trace::ACTION, "block_apply_finished");
+            insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
+            insert_cs_height(row, cs_trace::HEIGHT, height);
+            insert_cs_hash(row, cs_trace::HASH, expected_hash);
+            insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
+            insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, false);
+        },
+    );
+}
+
+pub(crate) fn abandoned_block_apply_finished_event(
+    token: BlockApplyToken,
+    block: &block::Block,
+) -> Option<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
+    let height = block.coinbase_height()?;
+    let hash = block.hash();
+    let result = BlockApplyResult::TimedOut;
+
+    Some((
+        height,
+        hash,
+        result,
+        BlockSyncEvent::BlockApplyFinished {
+            token,
+            height,
+            hash,
+            result,
+            local_frontier: None,
+        },
+    ))
+}
+
+fn abandoned_pending_apply_finished_events(
+    pending_applies: &mut VecDeque<PendingBlockApply>,
+) -> Vec<(block::Height, block::Hash, BlockApplyResult, BlockSyncEvent)> {
+    let mut events = Vec::new();
+    while let Some(pending) = pending_applies.pop_front() {
+        if let Some(event) =
+            abandoned_block_apply_finished_event(pending.token, pending.block.as_ref())
+        {
+            events.push(event);
+        } else {
+            warn!(
+                expected_hash = ?pending.block.hash(),
+                "dropping abandoned Zakura block-sync body without coinbase height"
+            );
+        }
+    }
+    events
+}
+
 pub(crate) fn coalesce_ready_needed_block_queries(
     actions: &mut mpsc::Receiver<BlockSyncAction>,
     deferred_actions: &mut VecDeque<BlockSyncAction>,
@@ -564,10 +651,11 @@ pub(crate) fn coalesce_ready_needed_block_queries(
     while let Some(action) = deferred_actions.pop_front() {
         match action {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
+                limit,
                 best_header_tip,
             } => {
-                latest_query = Some((verified_block_tip, best_header_tip));
+                latest_query = Some((from, limit, best_header_tip));
             }
             action => retained.push_back(action),
         }
@@ -577,21 +665,24 @@ pub(crate) fn coalesce_ready_needed_block_queries(
     while let Ok(action) = actions.try_recv() {
         match action {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
+                limit,
                 best_header_tip,
             } => {
-                latest_query = Some((verified_block_tip, best_header_tip));
+                latest_query = Some((from, limit, best_header_tip));
             }
             action => deferred_actions.push_back(action),
         }
     }
 
-    let latest_query = latest_query.map(|(verified_block_tip, best_header_tip)| {
-        BlockSyncAction::QueryNeededBlocks {
-            verified_block_tip,
-            best_header_tip,
-        }
-    });
+    let latest_query =
+        latest_query.map(
+            |(from, limit, best_header_tip)| BlockSyncAction::QueryNeededBlocks {
+                from,
+                limit,
+                best_header_tip,
+            },
+        );
 
     if !deferred_actions.is_empty() {
         if let Some(query) = latest_query {
@@ -609,7 +700,8 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     deferred_actions: &mut VecDeque<BlockSyncAction>,
 ) -> BlockSyncAction {
     let BlockSyncAction::QueryNeededBlocks {
-        mut verified_block_tip,
+        mut from,
+        mut limit,
         mut best_header_tip,
     } = action
     else {
@@ -620,10 +712,12 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     while let Ok(action) = actions.try_recv() {
         match action {
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip: latest_verified_block_tip,
+                from: latest_from,
+                limit: latest_limit,
                 best_header_tip: latest_best_header_tip,
             } => {
-                verified_block_tip = latest_verified_block_tip;
+                from = latest_from;
+                limit = latest_limit;
                 best_header_tip = latest_best_header_tip;
                 coalesced_count = coalesced_count.saturating_add(1);
             }
@@ -636,13 +730,15 @@ pub(crate) fn coalesce_stale_needed_block_queries(
     }
 
     BlockSyncAction::QueryNeededBlocks {
-        verified_block_tip,
+        from,
+        limit,
         best_header_tip,
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn handle_completed_block_apply<ReadState, BlockVerifier>(
+    handoff: &std::sync::Arc<super::BlockSyncHandoff>,
     completed: BlockApplyCompletion,
     pending_applies: &mut VecDeque<PendingBlockApply>,
     in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyCompletion>>,
@@ -677,6 +773,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     observe_block_apply_completion(completed, checkpoint_frontier_refresh);
 
     drain_pending_block_applies(
+        handoff,
         pending_applies,
         in_flight_applies,
         checkpoint_in_flight,
@@ -696,6 +793,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
 
 #[allow(clippy::too_many_arguments)]
 fn drain_pending_block_applies<ReadState, BlockVerifier>(
+    handoff: &std::sync::Arc<super::BlockSyncHandoff>,
     pending_applies: &mut VecDeque<PendingBlockApply>,
     in_flight_applies: &mut FuturesUnordered<BoxFuture<'static, BlockApplyCompletion>>,
     checkpoint_in_flight: &mut usize,
@@ -724,6 +822,12 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
+    // Once legacy fallback owns body commits, start no new Zakura applies. The
+    // loop releases queued bodies outside the apply-start path.
+    if handoff.is_yielded_to_legacy() {
+        return;
+    }
+
     // The checkpoint verifier can hold a complete range until its checkpoint is
     // reached. Keep room for the current range and the next complete range.
     let checkpoint_pipeline_apply_limit = checkpoint_apply_limit.saturating_mul(2);
@@ -755,21 +859,73 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
         }
 
         let class = pending.class;
+        let Some(permit) = handoff.begin_apply() else {
+            decrement_in_flight_apply_count(class, checkpoint_in_flight, full_in_flight);
+            pending_applies.push_front(pending);
+            return;
+        };
+        let apply = apply_block_sync_body(
+            block_verifier.clone(),
+            latest_chain_tip.clone(),
+            endpoint.clone(),
+            read_state.clone(),
+            block_sync.clone(),
+            pending.token,
+            pending.block,
+            class,
+            trace.clone(),
+            throughput_probe.clone(),
+        );
         in_flight_applies.push(
-            apply_block_sync_body(
-                block_verifier.clone(),
-                latest_chain_tip.clone(),
-                endpoint.clone(),
-                read_state.clone(),
-                block_sync.clone(),
-                pending.token,
-                pending.block,
-                class,
-                trace.clone(),
-                throughput_probe.clone(),
-            )
+            async move {
+                // Hold the gate slot for the whole apply, so fallback observes
+                // this work until it has finished.
+                let _permit = permit;
+                apply.await
+            }
             .boxed(),
         );
+    }
+}
+
+fn release_pending_applies(
+    block_sync: &BlockSyncHandle,
+    pending_applies: &mut VecDeque<PendingBlockApply>,
+    trace: &ZakuraTrace,
+) {
+    for (height, expected_hash, result, event) in
+        abandoned_pending_apply_finished_events(pending_applies)
+    {
+        let token = match &event {
+            BlockSyncEvent::BlockApplyFinished { token, .. } => *token,
+            _ => unreachable!("abandoned apply release only builds BlockApplyFinished events"),
+        };
+
+        let _ = block_sync.send_control(event);
+        emit_commit_state(
+            trace,
+            cs_trace::REACTOR_EVENT_SENT,
+            "block_sync_driver",
+            |row| {
+                insert_cs_str(row, cs_trace::ACTION, "block_apply_finished");
+                insert_cs_u64(row, cs_trace::APPLY_TOKEN, token);
+                insert_cs_height(row, cs_trace::HEIGHT, height);
+                insert_cs_hash(row, cs_trace::HASH, expected_hash);
+                insert_cs_str(row, cs_trace::RESULT, block_apply_result_label(result));
+                insert_cs_bool(row, cs_trace::LOCAL_FRONTIER, false);
+            },
+        );
+    }
+}
+
+fn release_pending_probe_applies(
+    block_sync: &BlockSyncHandle,
+    pending_probe_applies: &mut BTreeMap<block::Height, PendingBlockApply>,
+    trace: &ZakuraTrace,
+) {
+    let pending = std::mem::take(pending_probe_applies);
+    for pending in pending.into_values() {
+        abandon_block_apply(block_sync, pending.token, pending.block.as_ref(), trace);
     }
 }
 
@@ -1270,8 +1426,8 @@ fn publish_body_frontier(
 
 pub(crate) async fn query_block_sync_needed_blocks<ReadState>(
     read_state: ReadState,
-    verified_block_tip: block::Height,
-    best_header_tip: block::Height,
+    from: block::Height,
+    limit: u32,
 ) -> Result<Vec<BlockSyncBlockMeta>, zebra_state::BoxError>
 where
     ReadState: Service<
@@ -1283,10 +1439,9 @@ where
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    let Some((from, limit)) = block_sync_missing_body_window(verified_block_tip, best_header_tip)
-    else {
+    if limit == 0 {
         return Ok(Vec::new());
-    };
+    }
 
     let mut needed = Vec::new();
     let mut next_from = from;
@@ -1324,114 +1479,54 @@ where
         + 'static,
     ReadState::Future: Send + 'static,
 {
-    let missing = match tokio::time::timeout(
+    let metadata = match tokio::time::timeout(
         ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        read_state
-            .clone()
-            .oneshot(zebra_state::ReadRequest::MissingBlockBodies { from, limit }),
+        read_state.oneshot(zebra_state::ReadRequest::MissingBlockBodyMetadata { from, limit }),
     )
     .await
     {
-        Ok(Ok(zebra_state::ReadResponse::MissingBlockBodies(heights))) => heights,
+        Ok(Ok(zebra_state::ReadResponse::MissingBlockBodyMetadata(metadata))) => metadata,
         Ok(Ok(response)) => {
-            warn!(?response, "unexpected MissingBlockBodies response");
+            warn!(?response, "unexpected MissingBlockBodyMetadata response");
             return Ok(Vec::new());
         }
         Ok(Err(error)) => return Err(error),
         Err(elapsed) => return Err(Box::new(elapsed)),
     };
 
-    let Some(first) = missing.first().copied() else {
-        return Ok(Vec::new());
-    };
-    let Some(last) = missing.last().copied() else {
-        return Ok(Vec::new());
-    };
-    let span = last.0.saturating_sub(first.0).saturating_add(1);
-
-    let headers = match tokio::time::timeout(
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        read_state
-            .clone()
-            .oneshot(zebra_state::ReadRequest::HeadersByHeightRange {
-                start: first,
-                count: span,
-            }),
-    )
-    .await
-    {
-        Ok(Ok(zebra_state::ReadResponse::Headers(headers))) => headers,
-        Ok(Ok(response)) => {
-            warn!(?response, "unexpected HeadersByHeightRange response");
-            return Ok(Vec::new());
-        }
-        Ok(Err(error)) => return Err(error),
-        Err(elapsed) => return Err(Box::new(elapsed)),
-    };
-
-    let size_hints = match tokio::time::timeout(
-        ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
-        read_state.oneshot(zebra_state::ReadRequest::BlockSizeHints {
-            from: first,
-            count: span,
-        }),
-    )
-    .await
-    {
-        Ok(Ok(zebra_state::ReadResponse::BlockSizeHints(hints))) => hints,
-        Ok(Ok(response)) => {
-            warn!(?response, "unexpected BlockSizeHints response");
-            Vec::new()
-        }
-        Ok(Err(error)) => return Err(error),
-        Err(elapsed) => return Err(Box::new(elapsed)),
-    };
-
-    Ok(block_sync_needed_blocks_from_state(
-        missing, headers, size_hints,
-    ))
+    Ok(block_sync_needed_blocks_from_state(metadata))
 }
 
+#[cfg(test)]
 pub(crate) fn block_sync_missing_body_window(
-    verified_block_tip: block::Height,
+    from: block::Height,
     best_header_tip: block::Height,
+    limit: u32,
 ) -> Option<(block::Height, u32)> {
-    if best_header_tip <= verified_block_tip {
+    if best_header_tip < from || limit == 0 {
         return None;
     }
 
-    let from = block::Height(verified_block_tip.0.saturating_add(1));
-    let limit = best_header_tip
+    let available = best_header_tip
         .0
-        .saturating_sub(verified_block_tip.0)
+        .saturating_sub(from.0)
+        .saturating_add(1)
         .clamp(1, ZAKURA_BLOCK_SYNC_MISSING_BODY_WINDOW);
-    Some((from, limit))
+    Some((from, available.min(limit)))
 }
 
 pub(crate) fn block_sync_needed_blocks_from_state(
-    missing: Vec<block::Height>,
-    headers: Vec<(block::Height, block::Hash, Arc<block::Header>)>,
-    size_hints: Vec<(block::Height, Option<u32>)>,
+    metadata: Vec<(block::Height, block::Hash, Option<u32>)>,
 ) -> Vec<BlockSyncBlockMeta> {
-    let headers: HashMap<_, _> = headers
+    metadata
         .into_iter()
-        .map(|(height, hash, _header)| (height, hash))
-        .collect();
-    let size_hints: HashMap<_, _> = size_hints.into_iter().collect();
-
-    missing
-        .into_iter()
-        .filter_map(|height| {
-            let hash = *headers.get(&height)?;
-            let size = size_hints
-                .get(&height)
-                .copied()
-                .flatten()
+        .map(|(height, hash, size)| {
+            let size = size
                 .filter(|size| *size > 0)
                 .map(BlockSizeEstimate::Advertised)
                 .unwrap_or(BlockSizeEstimate::Unknown);
 
-            Some(BlockSyncBlockMeta { height, hash, size })
+            BlockSyncBlockMeta { height, hash, size }
         })
         .collect()
 }
@@ -1448,11 +1543,13 @@ fn trace_block_driver_action(trace: &ZakuraTrace, action: &BlockSyncAction) {
                 insert_cs_str(row, cs_trace::REASON, block_sync_misbehavior_label(*reason));
             }
             BlockSyncAction::QueryNeededBlocks {
-                verified_block_tip,
+                from,
+                limit,
                 best_header_tip,
             } => {
                 insert_cs_str(row, cs_trace::ACTION, "query_needed_blocks");
-                insert_cs_height(row, cs_trace::VERIFIED_BLOCK_TIP, *verified_block_tip);
+                insert_cs_height(row, cs_trace::RANGE_START, *from);
+                insert_cs_u64(row, cs_trace::RANGE_COUNT, u64::from(*limit));
                 insert_cs_height(row, cs_trace::BEST_HEADER_TIP, *best_header_tip);
             }
             BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
@@ -1542,4 +1639,82 @@ fn block_sync_misbehavior_label(reason: BlockSyncMisbehavior) -> &'static str {
 
 fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use zebra_chain::serialization::ZcashDeserializeInto;
+    use zebra_test::vectors::{BLOCK_MAINNET_1_BYTES, BLOCK_MAINNET_2_BYTES};
+
+    fn mainnet_block(bytes: &[u8]) -> Arc<block::Block> {
+        Arc::new(bytes.zcash_deserialize_into().expect("block vector parses"))
+    }
+
+    #[test]
+    fn abandoned_pending_apply_events_drain_queued_blocks() {
+        let block1 = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        let block2 = mainnet_block(&BLOCK_MAINNET_2_BYTES);
+        let block1_height = block1.coinbase_height().expect("test block has height");
+        let block2_height = block2.coinbase_height().expect("test block has height");
+        let block1_hash = block1.hash();
+        let block2_hash = block2.hash();
+        let mut pending_applies = VecDeque::from([
+            PendingBlockApply {
+                token: 11,
+                class: BlockApplyClass::Full,
+                block: block1,
+            },
+            PendingBlockApply {
+                token: 12,
+                class: BlockApplyClass::Full,
+                block: block2,
+            },
+        ]);
+
+        let events = abandoned_pending_apply_finished_events(&mut pending_applies);
+
+        assert!(
+            pending_applies.is_empty(),
+            "abandoned pending applies must be drained and dropped"
+        );
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            (
+                height,
+                hash,
+                BlockApplyResult::TimedOut,
+                BlockSyncEvent::BlockApplyFinished {
+                    token: 11,
+                    height: event_height,
+                    hash: event_hash,
+                    result: BlockApplyResult::TimedOut,
+                    local_frontier: None,
+                },
+            ) if height == block1_height
+                && hash == block1_hash
+                && event_height == block1_height
+                && event_hash == block1_hash
+        ));
+        assert!(matches!(
+            events[1],
+            (
+                height,
+                hash,
+                BlockApplyResult::TimedOut,
+                BlockSyncEvent::BlockApplyFinished {
+                    token: 12,
+                    height: event_height,
+                    hash: event_hash,
+                    result: BlockApplyResult::TimedOut,
+                    local_frontier: None,
+                },
+            ) if height == block2_height
+                && hash == block2_hash
+                && event_height == block2_height
+                && event_hash == block2_hash
+        ));
+    }
 }

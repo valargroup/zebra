@@ -36,7 +36,7 @@ use crate::{
     constants::{
         MAX_BLOCK_REORG_HEIGHT, MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_PRUNE_HEIGHTS_PER_COMMIT,
     },
-    error::{CommitCheckpointVerifiedError, CommitHeaderRangeError},
+    error::{CommitCheckpointVerifiedError, CommitHeaderRangeError, StoreIncoherentError},
     request::FinalizedBlock,
     service::check,
     service::finalized_state::{
@@ -46,14 +46,18 @@ use crate::{
             shielded::CommitmentRootsByHeight,
             transparent::{AddressBalanceLocationUpdates, OutputLocation},
         },
+        vct::VctWriteData,
         zebra_db::{metrics::block_precommit_metrics, ZebraDb},
-        FromDisk, IntoDisk, RawBytes, PRUNING_METADATA, VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
+        FromDisk, IntoDisk, RawBytes, COMMITMENT_ROOTS_BY_HEIGHT, PRUNING_METADATA,
+        VCT_SYNC_METADATA, VCT_UPGRADE_METADATA,
     },
     HashOrHeight,
 };
 
 #[cfg(feature = "indexer")]
 use crate::request::Spend;
+
+mod startup_audit;
 
 #[cfg(test)]
 mod tests;
@@ -62,25 +66,9 @@ const ZAKURA_HEADER_HASH_BY_HEIGHT: &str = "zakura_header_hash_by_height";
 const ZAKURA_HEADER_HEIGHT_BY_HASH: &str = "zakura_header_height_by_hash";
 const ZAKURA_HEADER_BY_HEIGHT: &str = "zakura_header_by_height";
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";
-pub const ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT: &str =
-    "zakura_header_commitment_roots_by_height";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct AdvertisedBodySize(u32);
-
-/// Verified-commitment-trees data used only while checkpoint fast-sync skips
-/// per-height Sapling and Orchard tree writes.
-///
-/// Live semantic sync must pass `None` for this data so it keeps writing the
-/// full per-height trees.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VctData {
-    /// Roots to insert into the anchor set instead of writing per-height trees.
-    pub(in super::super) anchor_roots: (sapling::tree::Root, orchard::tree::Root),
-
-    /// Height below which per-height trees are absent in a VCT-synced database.
-    pub(in super::super) sync_below: Height,
-}
 
 impl AdvertisedBodySize {
     fn new(size: u32) -> Option<Self> {
@@ -205,10 +193,7 @@ impl ZebraDb {
         &self,
         range: impl RangeBounds<block::Height>,
     ) -> Vec<BlockCommitmentRoots> {
-        let roots_by_height = self
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let roots_by_height = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
 
         self.db
             .zs_forward_range_iter::<_, block::Height, CommitmentRootsByHeight, _>(
@@ -241,6 +226,13 @@ impl ZebraDb {
             let Some(orchard) = self.orchard_tree_by_height(&height) else {
                 break;
             };
+            // The `unwrap_or_else` default is never reached in practice: the Sapling/Orchard
+            // lookups above already `break` for any height `ironwood_tree_by_height` would
+            // return `None` for (above the tip, or a fast-synced database's absent band).
+            let ironwood_root = self
+                .ironwood_tree_by_height(&height)
+                .map(|tree| tree.root())
+                .unwrap_or_else(|| ironwood::tree::NoteCommitmentTree::default().root());
 
             let (sapling_tx, orchard_tx, ironwood_tx, auth_data_root) = self
                 .block(height.into())
@@ -263,7 +255,7 @@ impl ZebraDb {
                 height,
                 sapling_root: sapling.root(),
                 orchard_root: orchard.root(),
-                ironwood_root: ironwood::tree::NoteCommitmentTree::default().root(),
+                ironwood_root,
                 sapling_tx,
                 orchard_tx,
                 ironwood_tx,
@@ -554,31 +546,85 @@ impl ZebraDb {
     }
 
     /// Returns recent header difficulty/time context in reverse height order,
-    /// starting at `height`.
+    /// starting at `height`, verifying `previous_block_hash` linkage at every
+    /// step of the walk.
+    ///
+    /// Returns an empty context when there is no stored row at `height` (the
+    /// caller decides whether that anchor is unknown), and a shorter-than-span
+    /// context when the walk reaches genesis.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreIncoherentError`] when the walk finds a header row that
+    /// is not the block its hash row names, a row that does not link to the
+    /// row below it, or a gap below a stored row. Feeding such a window into
+    /// difficulty validation would mix rows from more than one branch (or
+    /// shift the adjustment window), producing `InvalidDifficultyThreshold`
+    /// rejections of honest input — the reader surfaces the storage fault
+    /// explicitly instead. The per-row hash check costs one header hash per
+    /// consumed row, negligible next to the validation the window feeds.
     pub fn recent_header_context(
         &self,
         height: block::Height,
-    ) -> Vec<(
-        zebra_chain::work::difficulty::CompactDifficulty,
-        DateTime<Utc>,
-    )> {
+    ) -> Result<
+        Vec<(
+            zebra_chain::work::difficulty::CompactDifficulty,
+            DateTime<Utc>,
+        )>,
+        StoreIncoherentError,
+    > {
         let mut context = Vec::with_capacity(check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
-        let mut current_height = Some(height);
 
-        while let Some(height) = current_height {
-            let Some((_hash, header)) = self.header_by_height(height) else {
-                break;
-            };
+        let Some((mut hash, mut header)) = self.header_by_height(height) else {
+            return Ok(context);
+        };
+        let mut height = height;
 
-            context.push((header.difficulty_threshold, header.time));
-            if context.len() == check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN {
-                break;
+        loop {
+            let computed = block::Hash::from(&*header);
+            if computed != hash {
+                return Err(StoreIncoherentError::HeaderHashMismatch {
+                    height,
+                    indexed: hash,
+                    computed,
+                });
             }
 
-            current_height = height.previous().ok();
-        }
+            context.push((header.difficulty_threshold, header.time));
 
-        context
+            if context.len() == check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN {
+                return Ok(context);
+            }
+            let Ok(below) = height.previous() else {
+                // The walk reached genesis: a short context is legitimate, and
+                // the difficulty functions handle it (MedianTime clamps
+                // negative heights to zero).
+                return Ok(context);
+            };
+
+            let Some((below_hash, below_header)) = self.header_by_height(below) else {
+                // Rows must be contiguous from genesis up to the header tip
+                // (full-block rows below the body tip — retained even under
+                // pruning — and zakura rows above it), so a missing row below
+                // a stored one is a gap, not the end of history.
+                return Err(StoreIncoherentError::Gap {
+                    height,
+                    missing: below,
+                });
+            };
+
+            if header.previous_block_hash != below_hash {
+                return Err(StoreIncoherentError::BrokenLinkage {
+                    height,
+                    expected_parent: header.previous_block_hash,
+                    actual_below: below_hash,
+                });
+            }
+
+            height = below;
+            hash = below_hash;
+            header = below_header;
+        }
     }
 
     /// Returns header-known, body-missing heights.
@@ -640,10 +686,7 @@ impl ZebraDb {
         &self,
         roots: impl IntoIterator<Item = BlockCommitmentRoots>,
     ) -> Result<(), rocksdb::Error> {
-        let cf = self
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let cf = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let mut batch = DiskWriteBatch::new();
         for roots in roots {
             batch.zs_insert(
@@ -668,10 +711,7 @@ impl ZebraDb {
         &self,
         heights: impl IntoIterator<Item = Height>,
     ) -> Result<(), rocksdb::Error> {
-        let cf = self
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let cf = self.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let mut batch = DiskWriteBatch::new();
         for height in heights {
             batch.zs_delete(&cf, height);
@@ -686,7 +726,7 @@ impl ZebraDb {
     // even when its body is absent because it was pruned (those rows are retained
     // by pruning, which only deletes `tx_by_loc`).
 
-    fn header_hash(&self, height: block::Height) -> Option<block::Hash> {
+    pub(crate) fn header_hash(&self, height: block::Height) -> Option<block::Hash> {
         self.hash(height)
             .or_else(|| self.zakura_header_hash(height))
     }
@@ -1033,6 +1073,7 @@ impl ZebraDb {
     /// - Propagates any errors from computing the block's chain value balance change or
     ///   from applying the change to the chain value balance
     #[allow(clippy::unwrap_in_result)]
+    #[allow(clippy::too_many_arguments)]
     pub(in super::super) fn write_block(
         &mut self,
         finalized: FinalizedBlock,
@@ -1040,7 +1081,7 @@ impl ZebraDb {
         network: &Network,
         source: &str,
         retention: RetentionPlan,
-        vct_data: Option<VctData>,
+        vct_data: VctWriteData,
     ) -> Result<block::Hash, CommitCheckpointVerifiedError> {
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
@@ -1582,7 +1623,7 @@ impl DiskWriteBatch {
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         store_raw_transactions: bool,
         precomputed_raw_txs: Option<Vec<RawBytes>>,
-        vct_data: Option<VctData>,
+        vct_data: VctWriteData,
     ) -> Result<(), CommitCheckpointVerifiedError> {
         // Commit block, transaction, and note commitment tree data.
         self.prepare_block_header_and_transaction_data_batch(
@@ -1591,10 +1632,8 @@ impl DiskWriteBatch {
             store_raw_transactions,
             precomputed_raw_txs,
         )?;
-        let zakura_header_commitment_roots_by_height = zebra_db
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let zakura_header_commitment_roots_by_height =
+            zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         self.zs_delete(&zakura_header_commitment_roots_by_height, finalized.height);
 
         // The consensus rules are silent on shielded transactions in the genesis block,
@@ -1814,6 +1853,12 @@ impl DiskWriteBatch {
     /// Full block verification is authoritative for the stored body. If a
     /// provisional Zakura header at this height differs, replace it with the
     /// block-derived header and drop stale provisional descendants.
+    ///
+    /// A block whose parent hash does not match the stored header row below
+    /// `height` is skipped without error: writing it would leave a gap or
+    /// broken link in the header store, so the store instead waits for
+    /// header-range sync to deliver the connecting rows (see the linkage
+    /// refusal below).
     #[allow(clippy::unwrap_in_result)]
     pub fn prepare_zakura_header_from_committed_block(
         &mut self,
@@ -1825,9 +1870,7 @@ impl DiskWriteBatch {
         let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
         let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
-        let zakura_roots_by_height = db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let zakura_roots_by_height = db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
 
         let hash = block.hash();
@@ -1837,6 +1880,25 @@ impl DiskWriteBatch {
         if existing_zakura_header.as_ref() == Some(&block.header)
             && db.zs_get::<_, _, block::Hash>(&zakura_hash_by_height, &height) == Some(hash)
         {
+            return Ok(());
+        }
+
+        // Seeds can jump to a non-finalized best tip whose parent is not the
+        // stored row below it. Refuse those seeds so the header store stays
+        // linked; header-range sync will later deliver the missing rows.
+        let hash_by_height = db.cf_handle("hash_by_height").unwrap();
+        let parent_hash: Option<block::Hash> = height.previous().ok().and_then(|parent_height| {
+            db.zs_get(&hash_by_height, &parent_height)
+                .or_else(|| db.zs_get(&zakura_hash_by_height, &parent_height))
+        });
+        if parent_hash != Some(block.header.previous_block_hash) {
+            tracing::debug!(
+                ?height,
+                ?hash,
+                parent = ?block.header.previous_block_hash,
+                stored_parent = ?parent_hash,
+                "skipping Zakura header seed that does not link to the stored row below it"
+            );
             return Ok(());
         }
 
@@ -1910,9 +1972,7 @@ impl DiskWriteBatch {
         let zakura_hash_by_height = db.cf_handle(ZAKURA_HEADER_HASH_BY_HEIGHT).unwrap();
         let zakura_height_by_hash = db.cf_handle(ZAKURA_HEADER_HEIGHT_BY_HASH).unwrap();
         let zakura_body_size_by_height = db.cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT).unwrap();
-        let zakura_roots_by_height = db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let zakura_roots_by_height = db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
         let tx_by_loc = db.cf_handle("tx_by_loc").unwrap();
 
         let existing_zakura_header: Option<Arc<block::Header>> =
@@ -2024,27 +2084,33 @@ impl DiskWriteBatch {
             .db
             .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
             .unwrap();
-        let roots_by_height = zebra_db
-            .db
-            .cf_handle(ZAKURA_HEADER_COMMITMENT_ROOTS_BY_HEIGHT)
-            .unwrap();
+        let roots_by_height = zebra_db.db.cf_handle(COMMITMENT_ROOTS_BY_HEIGHT).unwrap();
 
         let anchor_height = zebra_db
             .header_height(anchor)
             .or_else(|| (anchor == zebra_db.network().genesis_hash()).then_some(block::Height(0)))
             .ok_or(CommitHeaderRangeError::UnknownAnchor { anchor })?;
 
-        if anchor != zebra_db.network().genesis_hash()
-            && zebra_db.header_hash(anchor_height) != Some(anchor)
-        {
-            return Err(CommitHeaderRangeError::UnknownAnchor { anchor });
+        // The hash→height index knows the anchor, so a failed height→hash
+        // round-trip is a bijection violation in our own store — a local
+        // storage fault, not an unknown anchor supplied by the caller.
+        if anchor != zebra_db.network().genesis_hash() {
+            let stored = zebra_db.header_hash(anchor_height);
+            if stored != Some(anchor) {
+                return Err(StoreIncoherentError::BijectionMismatch {
+                    hash: anchor,
+                    height: anchor_height,
+                    stored,
+                }
+                .into());
+            }
         }
 
         let finalized_height = zebra_db.finalized_tip_height();
         let best_header_tip = zebra_db.best_header_tip().map(|(height, _)| height);
         let checkpoints = zebra_db.network().checkpoint_list();
 
-        let mut recent_headers = zebra_db.recent_header_context(anchor_height);
+        let mut recent_headers = zebra_db.recent_header_context(anchor_height)?;
         if recent_headers.is_empty() {
             if anchor == zebra_db.network().genesis_hash() && anchor_height == block::Height(0) {
                 return Err(CommitHeaderRangeError::MissingGenesisAnchor { anchor });
@@ -2055,6 +2121,14 @@ impl DiskWriteBatch {
         let mut first_conflicting_height = None;
         let mut validated_headers = Vec::with_capacity(headers.len());
 
+        // Each header must link to the anchor (for the first header) or to its
+        // predecessor in the range. Without this check, a range anchored at the
+        // same-height hash of a *different* branch can pass contextual
+        // difficulty validation and commit a suffix that does not link to the
+        // row below it — an on-disk linkage violation reachable from a single
+        // peer response.
+        let mut expected_parent = anchor;
+
         for (index, header) in headers.iter().enumerate() {
             let offset =
                 u32::try_from(index + 1).map_err(|_| CommitHeaderRangeError::HeightOverflow)?;
@@ -2063,6 +2137,16 @@ impl DiskWriteBatch {
             let hash = block::Hash::from(&**header);
             let body_size = body_sizes[index];
             let roots = &tree_aux_roots[index];
+
+            if header.previous_block_hash != expected_parent {
+                return Err(CommitHeaderRangeError::UnlinkedRange {
+                    height,
+                    expected_parent,
+                    actual_parent: header.previous_block_hash,
+                });
+            }
+            expected_parent = hash;
+
             if roots.height != height {
                 return Err(CommitHeaderRangeError::TreeAuxRootHeightMismatch {
                     expected_height: height,
@@ -2185,6 +2269,14 @@ impl DiskWriteBatch {
 
         for (index, (height, hash, header, body_size)) in validated_headers.into_iter().enumerate()
         {
+            // Finalized block heights already have authoritative block rows and
+            // verified roots, even when pruning has removed their transactions.
+            // Re-delivered headers must not recreate provisional zakura rows
+            // there, because those rows are only trimmed during body commit.
+            if zebra_db.contains_height(height) {
+                continue;
+            }
+
             let same_header = zebra_db.zakura_header_hash(height) == Some(hash);
             let advertised_body_size = match (
                 same_header,

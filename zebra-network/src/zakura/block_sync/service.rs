@@ -1,7 +1,8 @@
 use super::{config::*, events::*, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
-    PeerStreamSession, Service, SinkReject, Stream, StreamMode, ZakuraPeerId, FRAME_HEADER_BYTES,
+    PeerStreamSession, Service, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
+    FRAME_HEADER_BYTES,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::Instant;
@@ -217,6 +218,7 @@ struct BlockSyncServiceInner {
 
 #[derive(Debug)]
 struct BlockSyncPeerRecord {
+    conn_id: ZakuraConnId,
     session_id: u64,
     direction: ServicePeerDirection,
     cancel_token: CancellationToken,
@@ -412,6 +414,7 @@ impl Service for BlockSyncService {
         );
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
+        let close_cause = peer.close_cause();
         let block_sync_session = BlockSyncPeerSession::new(&session, peer.direction);
         let session_id = self.inner.next_session_id.fetch_add(1, Ordering::Relaxed);
         let (_session_peer, _stream_kind, recv, send, _session_cancel) = session.into_parts();
@@ -423,6 +426,32 @@ impl Service for BlockSyncService {
         // alive through the `BlockSyncPeerSession` clone the reactor holds, so
         // nothing is lost by dropping it.
         drop(send);
+
+        {
+            let mut peers = self
+                .inner
+                .peers
+                .lock()
+                .expect("block-sync peer map mutex is never poisoned");
+            if peers
+                .get(&peer_id)
+                .is_some_and(|record| record.conn_id > peer.conn_id)
+            {
+                service_cancel_token.cancel();
+                return;
+            }
+            if let Some(old_record) = peers.insert(
+                peer_id.clone(),
+                BlockSyncPeerRecord {
+                    conn_id: peer.conn_id,
+                    session_id,
+                    direction: peer.direction,
+                    cancel_token: service_cancel_token.clone(),
+                },
+            ) {
+                old_record.cancel_token.cancel();
+            }
+        }
 
         let run_cancel = service_cancel_token.clone();
         let on_teardown = {
@@ -451,7 +480,11 @@ impl Service for BlockSyncService {
         };
         let on_panic = {
             let connection_cancel_token = connection_cancel_token.clone();
-            move || connection_cancel_token.cancel()
+            let close_cause = close_cause.clone();
+            move || {
+                close_cause.record("service_panic");
+                connection_cancel_token.cancel();
+            }
         };
         // the per-peer pipe-routine is spawned HERE (the pipe spawn point), so
         // a protocol reject still cancels the whole connection via
@@ -463,6 +496,7 @@ impl Service for BlockSyncService {
         // flows.
         let pipe = {
             let connection_cancel_token = connection_cancel_token.clone();
+            let close_cause = close_cause.clone();
             let routine_wiring = self.inner.routine_wiring.clone();
             let block_sync_session = block_sync_session.clone();
             let peer_id = peer_id.clone();
@@ -494,7 +528,7 @@ impl Service for BlockSyncService {
                     }
                     None => drain_inbound(recv, run_cancel).await,
                 };
-                handle_pipe_exit("block-sync", &connection_cancel_token, result);
+                handle_pipe_exit("block-sync", &connection_cancel_token, &close_cause, result);
             }
         };
         // Let the returned handle drop to detach the supervised task (like
@@ -507,44 +541,35 @@ impl Service for BlockSyncService {
             pipe,
         );
 
-        {
-            let mut peers = self
-                .inner
-                .peers
-                .lock()
-                .expect("block-sync peer map mutex is never poisoned");
-            if let Some(old_record) = peers.insert(
-                peer_id.clone(),
-                BlockSyncPeerRecord {
-                    session_id,
-                    direction: peer.direction,
-                    cancel_token: service_cancel_token,
-                },
-            ) {
-                old_record.cancel_token.cancel();
-            }
-        }
-
         let _ = self
             .inner
             .lifecycle
             .send(BlockSyncEvent::PeerConnected(block_sync_session));
     }
 
-    fn remove_peer(&self, peer: &ZakuraPeerId) {
-        let removed = self
-            .inner
-            .peers
-            .lock()
-            .expect("block-sync peer map mutex is never poisoned")
-            .remove(peer);
+    fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        let removed = {
+            let mut peers = self
+                .inner
+                .peers
+                .lock()
+                .expect("block-sync peer map mutex is never poisoned");
+            if peers
+                .get(peer)
+                .is_some_and(|record| record.conn_id == conn_id)
+            {
+                peers.remove(peer)
+            } else {
+                None
+            }
+        };
         if let Some(record) = removed {
             record.cancel_token.cancel();
+            let _ = self
+                .inner
+                .lifecycle
+                .send(BlockSyncEvent::PeerDisconnected(peer.clone()));
         }
-        let _ = self
-            .inner
-            .lifecycle
-            .send(BlockSyncEvent::PeerDisconnected(peer.clone()));
     }
 
     fn deliver_frame(

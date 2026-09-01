@@ -5,7 +5,7 @@ use std::{
     fmt,
     io::{self, ErrorKind},
     net::{IpAddr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -14,7 +14,7 @@ use std::{
 use indexmap::IndexSet;
 use iroh::SecretKey;
 use rand::rngs::OsRng;
-use serde::{de, Deserialize, Deserializer, Serializer};
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use tokio::fs;
 
 use tracing::Span;
@@ -47,6 +47,10 @@ mod cache_dir;
 mod tests;
 
 pub use cache_dir::CacheDir;
+
+pub(crate) use cache_dir::{
+    default_network_identity_dir, zakura_node_secret_key_file_path as zakura_secret_key_file_path,
+};
 
 /// A sensitive iroh secret-key override for Zakura P2P node identity.
 #[derive(Clone, Deserialize, Eq, PartialEq)]
@@ -198,14 +202,39 @@ pub struct Config {
     /// initial peer set and address book.
     pub cache_dir: CacheDir,
 
+    /// The directory for long-term network identity secrets.
+    ///
+    /// The auto-generated Zakura iroh identity key is stored under this
+    /// directory as `<network>.zakura-iroh-secret-key`. Keep this directory
+    /// outside state or cache snapshot paths, or snapshots can clone the node's
+    /// long-term P2P identity.
+    ///
+    /// The default is `~/.zakura`.
+    pub identity_dir: PathBuf,
+
     /// An optional persistent iroh secret key for Zakura P2P identity.
     ///
     /// This is reserved for Zakura endpoint construction. If unset, a future Zakura endpoint
     /// implementation will generate an ed25519 iroh [`SecretKey`] on first use
-    /// and persist it under [`cache_dir`](Self::cache_dir), beside the peer cache.
+    /// and persist it under [`identity_dir`](Self::identity_dir), outside Zebra's
+    /// cache and state directories by default.
     ///
     /// This value is not used by the legacy TCP peer set.
     pub zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
+
+    /// Follow Zebra's default P2P stack selection for the configured network.
+    ///
+    /// This is enabled by default so Zebra can change network defaults during upgrades. When this
+    /// is `true`, Zebra ignores [`legacy_p2p`](Self::legacy_p2p) and
+    /// [`v2_p2p`](Self::v2_p2p) in `zebrad.toml`, and uses the selected network's binary defaults
+    /// instead.
+    ///
+    /// The current defaults are: legacy P2P on for Mainnet, Testnet, and Regtest; Zakura P2P v2
+    /// off on Mainnet; and Zakura P2P v2 on for Testnet and Regtest.
+    ///
+    /// Set `default_p2p = false` only when you want [`legacy_p2p`](Self::legacy_p2p) and
+    /// [`v2_p2p`](Self::v2_p2p) to be fixed manual overrides.
+    pub default_p2p: bool,
 
     /// Enable the experimental Zakura P2P v2 endpoint, capability advertisement, and upgrade hook.
     ///
@@ -214,14 +243,18 @@ pub struct Config {
     /// before constructing a legacy peer connection if [`legacy_p2p`](Self::legacy_p2p) is also
     /// enabled.
     ///
+    /// In `zebrad.toml`, this setting is used only when [`default_p2p`](Self::default_p2p) is
+    /// `false`.
+    ///
     /// Until the Zakura supervisor and endpoint connector support legacy upgrades, mutually
     /// capable peers continue on the legacy Zebra path after a temporary Zakura upgrade rejection.
     pub v2_p2p: bool,
 
     /// Enable the legacy TCP Zcash P2P listener, initial peer dialing, and peer crawler.
     ///
-    /// This is enabled by default to keep the current Zebra networking behavior. Disable it to run
-    /// only the native Zakura P2P v2 endpoint when [`v2_p2p`](Self::v2_p2p) is enabled.
+    /// In `zebrad.toml`, this setting is used only when [`default_p2p`](Self::default_p2p) is
+    /// `false`. Disable it to run only the native Zakura P2P v2 endpoint when
+    /// [`v2_p2p`](Self::v2_p2p) is enabled.
     pub legacy_p2p: bool,
 
     /// Native Zakura endpoint, connection, and bootstrap settings.
@@ -251,10 +284,12 @@ pub struct Config {
     #[serde(with = "humantime_serde")]
     pub crawl_new_peer_interval: Duration,
 
-    /// The maximum number of peer connections Zebra will keep for a given IP address
-    /// before it drops any additional peer connections with that IP.
+    /// The maximum number of legacy TCP peer connections Zebra will keep for a given IP address
+    /// before it drops any additional legacy peer connections with that IP.
     ///
     /// The default and minimum value are 1.
+    ///
+    /// Zakura uses [`ZakuraConfig::max_connections_per_ip`] for native v2 admission.
     ///
     /// # Security
     ///
@@ -626,31 +661,28 @@ impl Config {
     /// Resolution order:
     /// 1. If [`zakura_node_secret_key`](Self::zakura_node_secret_key) is configured,
     ///    it is parsed and used verbatim. An unparsable value is a hard error.
-    /// 2. Otherwise, if [`cache_dir`](Self::cache_dir) is enabled, the persisted key
-    ///    file is loaded; when it is missing or unreadable a fresh key is generated
-    ///    and written atomically with owner-only (`0o600`) permissions, so every
-    ///    later startup reuses the same identity.
-    /// 3. If the cache dir is disabled, an ephemeral key is generated for this run.
+    /// 2. Otherwise, the persisted key file under
+    ///    [`identity_dir`](Self::identity_dir) is loaded; when it is missing or
+    ///    unreadable a fresh key is generated and written atomically with
+    ///    owner-only (`0o600`) permissions, so every later startup reuses the
+    ///    same identity.
+    /// 3. If the key cannot be persisted, the freshly generated identity is used
+    ///    ephemerally for this run.
     ///
     /// # Security
     ///
     /// The persisted key file is the node's long-term private identity. It is
-    /// written beside the peer cache and restricted to owner read/write on Unix.
+    /// written outside the cache and state directories and restricted to owner
+    /// read/write on Unix.
     pub fn zakura_secret_key(&self) -> Result<SecretKey, ZakuraSecretKeyError> {
         if let Some(secret) = &self.zakura_node_secret_key {
             return SecretKey::from_str(secret.expose_secret())
                 .map_err(|_| ZakuraSecretKeyError::InvalidConfigured);
         }
 
-        match self
-            .cache_dir
-            .zakura_node_secret_key_file_path(&self.network)
-        {
-            Some(key_file) => Ok(load_or_generate_zakura_secret_key(&key_file)),
-            // The cache dir is disabled, so there is nowhere to persist a stable
-            // key: fall back to an ephemeral identity for this run.
-            None => Ok(SecretKey::generate(OsRng)),
-        }
+        let key_file = zakura_secret_key_file_path(&self.identity_dir, &self.network);
+
+        Ok(load_or_generate_zakura_secret_key(&key_file))
     }
 }
 
@@ -681,8 +713,8 @@ fn load_or_generate_zakura_secret_key(key_file: &Path) -> SecretKey {
     secret_key
 }
 
-/// Atomically writes `secret_key` to `key_file` as lowercase hex and restricts the
-/// file to owner-only access. Persistence failures are logged but not fatal.
+/// Atomically writes `secret_key` to `key_file` as lowercase hex and restricts
+/// the file to owner-only access. Persistence failures are logged but not fatal.
 fn persist_zakura_secret_key(key_file: &Path, secret_key: &SecretKey) {
     let encoded = hex::encode(secret_key.to_bytes());
 
@@ -754,8 +786,10 @@ impl Default for Config {
             initial_mainnet_peers: mainnet_peers,
             initial_testnet_peers: testnet_peers,
             cache_dir: CacheDir::default(),
+            identity_dir: default_network_identity_dir(),
             zakura_node_secret_key: None,
-            v2_p2p: true,
+            default_p2p: true,
+            v2_p2p: default_v2_p2p_for_network(&Network::Mainnet),
             legacy_p2p: true,
             zakura: ZakuraConfig::default(),
             crawl_new_peer_interval: DEFAULT_CRAWL_NEW_PEER_INTERVAL,
@@ -770,6 +804,81 @@ impl Default for Config {
             peerset_initial_target_size: DEFAULT_PEERSET_INITIAL_TARGET_SIZE,
             max_connections_per_ip: DEFAULT_MAX_CONNS_PER_IP,
         }
+    }
+}
+
+fn default_v2_p2p_for_network(network: &Network) -> bool {
+    !matches!(network, Network::Mainnet)
+}
+
+fn default_p2p_for_network(network: &Network) -> (bool, bool) {
+    let legacy_p2p = true;
+    let v2_p2p = default_v2_p2p_for_network(network);
+
+    (legacy_p2p, v2_p2p)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum V2P2pPreference {
+    #[default]
+    Default,
+    Explicit(bool),
+}
+
+impl V2P2pPreference {
+    fn resolve(self, network: &Network) -> bool {
+        match self {
+            V2P2pPreference::Default => default_v2_p2p_for_network(network),
+            V2P2pPreference::Explicit(v2_p2p) => v2_p2p,
+        }
+    }
+}
+
+impl Serialize for V2P2pPreference {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            V2P2pPreference::Default => serializer.serialize_str("default"),
+            V2P2pPreference::Explicit(v2_p2p) => serializer.serialize_bool(*v2_p2p),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for V2P2pPreference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct V2P2pPreferenceVisitor;
+
+        impl de::Visitor<'_> for V2P2pPreferenceVisitor {
+            type Value = V2P2pPreference;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("true, false, or \"default\"")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(V2P2pPreference::Explicit(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "default" => Ok(V2P2pPreference::Default),
+                    _ => Err(E::invalid_value(de::Unexpected::Str(value), &self)),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(V2P2pPreferenceVisitor)
     }
 }
 
@@ -834,11 +943,13 @@ struct DConfig {
     initial_mainnet_peers: IndexSet<String>,
     initial_testnet_peers: IndexSet<String>,
     cache_dir: CacheDir,
+    identity_dir: PathBuf,
     #[serde(default, skip_serializing)]
     zakura_node_secret_key: Option<ZakuraNodeSecretKey>,
-    #[serde(alias = "enable_p2p_v2")]
-    v2_p2p: bool,
-    legacy_p2p: bool,
+    default_p2p: bool,
+    #[serde(default, alias = "enable_p2p_v2")]
+    v2_p2p: V2P2pPreference,
+    legacy_p2p: Option<bool>,
     zakura: ZakuraConfig,
     peerset_initial_target_size: usize,
     #[serde(alias = "new_peer_interval", with = "humantime_serde")]
@@ -857,9 +968,11 @@ impl Default for DConfig {
             initial_mainnet_peers: config.initial_mainnet_peers,
             initial_testnet_peers: config.initial_testnet_peers,
             cache_dir: config.cache_dir,
+            identity_dir: config.identity_dir,
             zakura_node_secret_key: config.zakura_node_secret_key,
-            v2_p2p: config.v2_p2p,
-            legacy_p2p: config.legacy_p2p,
+            default_p2p: true,
+            v2_p2p: V2P2pPreference::Explicit(config.v2_p2p),
+            legacy_p2p: None,
             zakura: config.zakura,
             peerset_initial_target_size: config.peerset_initial_target_size,
             crawl_new_peer_interval: config.crawl_new_peer_interval,
@@ -916,7 +1029,9 @@ impl From<Config> for DConfig {
             initial_mainnet_peers,
             initial_testnet_peers,
             cache_dir,
+            identity_dir,
             zakura_node_secret_key,
+            default_p2p,
             v2_p2p,
             legacy_p2p,
             zakura,
@@ -945,6 +1060,7 @@ impl From<Config> for DConfig {
 
             other_kind => DNetwork::DefaultForKind(other_kind),
         };
+        let v2_p2p = V2P2pPreference::Explicit(v2_p2p);
 
         DConfig {
             listen_addr: listen_addr.to_string(),
@@ -954,9 +1070,11 @@ impl From<Config> for DConfig {
             initial_mainnet_peers,
             initial_testnet_peers,
             cache_dir,
+            identity_dir,
             zakura_node_secret_key,
+            default_p2p,
             v2_p2p,
-            legacy_p2p,
+            legacy_p2p: Some(legacy_p2p),
             zakura,
             peerset_initial_target_size,
             crawl_new_peer_interval,
@@ -978,7 +1096,9 @@ impl<'de> Deserialize<'de> for Config {
             initial_mainnet_peers,
             initial_testnet_peers,
             cache_dir,
+            identity_dir,
             zakura_node_secret_key,
+            default_p2p,
             v2_p2p,
             legacy_p2p,
             zakura,
@@ -1007,6 +1127,12 @@ impl<'de> Deserialize<'de> for Config {
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
             }
+        };
+
+        let (legacy_p2p, v2_p2p) = if default_p2p {
+            default_p2p_for_network(&network)
+        } else {
+            (legacy_p2p.unwrap_or(true), v2_p2p.resolve(&network))
         };
 
         let listen_addr = match listen_addr.parse::<SocketAddr>().or_else(|_| format!("{listen_addr}:{}", network.default_port()).parse()) {
@@ -1054,6 +1180,35 @@ impl<'de> Deserialize<'de> for Config {
         // warning) rather than rejecting too-small configs, so older configs keep
         // starting while checkpoint sync stays deadlock-free.
         let mut zakura = zakura;
+        zakura.apply_network_defaults(&network);
+        let default_zakura_bootstrap_peers =
+            ZakuraConfig::default_bootstrap_peers_for_network(&network);
+        if zakura.bootstrap_peers.is_empty() {
+            warn!(
+                ?network,
+                "no Zakura bootstrap peers configured; configure zakura.bootstrap_peers or make sure this node receives inbound Zakura connections"
+            );
+        } else if network.kind() != NetworkKind::Regtest
+            && zakura.bootstrap_peers != default_zakura_bootstrap_peers
+        {
+            warn!(
+                ?network,
+                configured_zakura_bootstrap_peers = ?zakura.bootstrap_peers,
+                ?default_zakura_bootstrap_peers,
+                "configured Zakura bootstrap peers differ from the default peers for this network"
+            );
+        }
+        if zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&zakura) {
+            warn!(
+                ?network,
+                listen_addr = ?zakura.listen_addr,
+                bootstrap_peers = ?zakura.bootstrap_peers,
+                "configured Zakura listen_addr is loopback-only, but bootstrap peers use \
+                 non-loopback addresses; native Zakura dials may fail with \
+                 `Can't assign requested address`. Use 0.0.0.0:<port> or another routable \
+                 interface address for public Zakura peers"
+            );
+        }
         zakura.block_sync.clamp_inflight_block_bytes_to_floor();
         // Likewise clamp the resident look-ahead budget (and its block cap) up to one
         // checkpoint range, so the resident-memory admission gate cannot deadlock checkpoint
@@ -1070,7 +1225,9 @@ impl<'de> Deserialize<'de> for Config {
             initial_mainnet_peers,
             initial_testnet_peers,
             cache_dir,
+            identity_dir,
             zakura_node_secret_key,
+            default_p2p,
             v2_p2p,
             legacy_p2p,
             zakura,
@@ -1079,6 +1236,20 @@ impl<'de> Deserialize<'de> for Config {
             max_connections_per_ip,
         })
     }
+}
+
+fn zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(zakura: &ZakuraConfig) -> bool {
+    let Some(listen_addr) = zakura.listen_addr else {
+        return false;
+    };
+
+    listen_addr.ip().is_loopback()
+        && zakura
+            .bootstrap_peers
+            .iter()
+            .filter_map(|peer| peer.rsplit_once('@'))
+            .filter_map(|(_node_id, addr)| addr.parse::<SocketAddr>().ok())
+            .any(|addr| !addr.ip().is_loopback())
 }
 
 /// Accepts an [`IndexSet`] of initial peers,

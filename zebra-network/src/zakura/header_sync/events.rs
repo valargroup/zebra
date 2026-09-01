@@ -28,7 +28,7 @@ pub struct HeaderSyncStartup {
     pub best_header_tip: Option<(block::Height, block::Hash)>,
     /// Shared sync exchange frontier stream.
     pub frontier_updates: Option<watch::Receiver<FrontierUpdate>>,
-    /// Local stream-5 advertisement.
+    /// Local header-sync v6 advertisement.
     pub config: ZakuraHeaderSyncConfig,
     /// Negotiated or local application frame cap for header-sync responses.
     pub max_frame_bytes: u32,
@@ -145,7 +145,7 @@ impl HeaderSyncHandle {
 /// Facts accepted by the header-sync reactor.
 #[derive(Clone, Debug)]
 pub enum HeaderSyncEvent {
-    /// A peer became available for stream-5 header sync.
+    /// A peer became available for header-sync v6.
     PeerConnected(HeaderSyncPeerSession),
     /// A peer disconnected; all of its outstanding work is dropped.
     PeerDisconnected(ZakuraPeerId),
@@ -185,6 +185,20 @@ pub enum HeaderSyncEvent {
         /// Duplicate block hash.
         hash: block::Hash,
     },
+    /// The node's block pipeline accepted an inbound `NewBlock` body, but it
+    /// did not land on the best chain. The block is remembered for dedup only:
+    /// a non-best-chain block must not advance the header or verified
+    /// frontiers and must not be forwarded to peers, or the whole Zakura layer
+    /// gossips a losing branch while the node's own chain stays on the best
+    /// one.
+    NewBlockAcceptedNonBestChain {
+        /// Source peer.
+        peer: ZakuraPeerId,
+        /// Accepted non-best-chain block height.
+        height: block::Height,
+        /// Accepted non-best-chain block hash.
+        hash: block::Hash,
+    },
     /// The node's block pipeline rejected an inbound `NewBlock` body.
     NewBlockRejected {
         /// Source peer.
@@ -192,21 +206,21 @@ pub enum HeaderSyncEvent {
         /// Rejected block hash.
         hash: block::Hash,
     },
-    /// Inbound stream-5 message from `peer`.
+    /// Inbound header-sync v6 message from `peer`.
     WireMessage {
         /// Serving peer.
         peer: ZakuraPeerId,
-        /// Decoded stream-5 message.
+        /// Decoded header-sync v6 message.
         msg: HeaderSyncMessage,
     },
-    /// Stream-5 frame decoding failed after handler admission.
+    /// Header-sync v6 frame decoding failed after handler admission.
     WireDecodeFailed {
         /// Peer that sent the malformed frame.
         peer: ZakuraPeerId,
         /// Decode/validation error.
         error: Arc<HeaderSyncWireError>,
     },
-    /// Stream-5 protocol failure decoded by the peer-owned session.
+    /// Header-sync v6 protocol failure decoded by the peer-owned session.
     WireProtocolFailure {
         /// Peer that sent the invalid message.
         peer: ZakuraPeerId,
@@ -267,10 +281,34 @@ pub enum HeaderSyncEvent {
     },
 }
 
+impl HeaderSyncEvent {
+    /// Low-cardinality variant label for reactor liveness metrics.
+    pub(super) fn metrics_label(&self) -> &'static str {
+        match self {
+            Self::PeerConnected(_) => "peer_connected",
+            Self::PeerDisconnected(_) => "peer_disconnected",
+            Self::AdvisoryHeaderSummary { .. } => "advisory_header_summary",
+            Self::FullBlockCommitted { .. } => "full_block_committed",
+            Self::NewBlockAccepted { .. } => "new_block_accepted",
+            Self::NewBlockDuplicate { .. } => "new_block_duplicate",
+            Self::NewBlockAcceptedNonBestChain { .. } => "new_block_accepted_non_best_chain",
+            Self::NewBlockRejected { .. } => "new_block_rejected",
+            Self::WireMessage { .. } => "wire_message",
+            Self::WireDecodeFailed { .. } => "wire_decode_failed",
+            Self::WireProtocolFailure { .. } => "wire_protocol_failure",
+            Self::StateFrontiersChanged(_) => "state_frontiers_changed",
+            Self::HeaderRangeCommitted { .. } => "header_range_committed",
+            Self::HeaderRangeCommitFailed { .. } => "header_range_commit_failed",
+            Self::HeaderRangeResponseFinished { .. } => "header_range_response_finished",
+            Self::HeaderRangeResponseReady { .. } => "header_range_response_ready",
+        }
+    }
+}
+
 /// Actions emitted by the header-sync reactor for the eventual node wiring.
 #[derive(Clone, Debug)]
 pub enum HeaderSyncAction {
-    /// Test-only observation of a stream-5 message sent directly through a typed session.
+    /// Test-only observation of a header-sync v6 message sent directly through a typed session.
     #[cfg(test)]
     SendMessage {
         /// Destination peer.
@@ -383,7 +421,7 @@ pub enum HeaderSyncMisbehavior {
     ResponseTooLong,
     /// Peer supplied a range that failed state/contextual commit.
     InvalidRange,
-    /// A stream-5 payload was malformed before semantic handling.
+    /// A header-sync v6 payload was malformed before semantic handling.
     MalformedMessage,
     /// A peer sent semantic `Status` messages faster than the v1 budget.
     StatusSpam,
@@ -393,7 +431,7 @@ pub enum HeaderSyncMisbehavior {
     GetHeadersSpam,
     /// A peer requested more headers than this node advertised it can serve.
     GetHeadersTooLong,
-    /// A stream-5 message came from a peer with no active header-sync state.
+    /// A header-sync v6 message came from a peer with no active header-sync state.
     UnknownPeer,
     /// A full-block tip flood failed stateless validation.
     InvalidNewBlock,

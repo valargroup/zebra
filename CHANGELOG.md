@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Zebra now tags the coinbase input of every block it mines with a `🌸`. The
+  `mining.extra_coinbase_data` option is now limited to 86 bytes (was 94);
+  Zebra refuses to start if it is exceeded.
+
+### Changed
+
+- Added `network.default_p2p = true`, which follows Zebra's binary P2P defaults
+  during upgrades and ignores `network.legacy_p2p` and `network.v2_p2p`: legacy
+  P2P is on for Mainnet, Testnet, and Regtest; Zakura P2P v2 is off on Mainnet
+  and on for Testnet and Regtest. Set `network.default_p2p = false` only when
+  both stack flags should be fixed manual overrides.
+- Verified-commitment-trees fast sync is now enabled by default when checkpoint
+  sync is enabled. Operators can keep checkpoint sync but opt out of the new
+  path by setting `consensus.vct_fast_sync = false`.
+- Refreshed the default Testnet Zakura bootstrap peer identities
+  (`DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS`) after the Testnet fleet's iroh node
+  keys were rotated. The previous hardcoded node IDs were stale, so a fresh node
+  using the default config could not discover the Testnet fleet over Zakura. The
+  peer IP addresses and Mainnet bootstrap peers are unchanged.
+
 ### Removed
 
 - Removed two Zakura block-sync config fields that never needed operator
@@ -18,12 +40,117 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Fixed
 
+- Fixed misleading Zakura connectivity telemetry: header-sync now records
+  record-only peer violations as `header_peer_violation_recorded` instead of
+  `header_peer_disconnect_requested`, header-sync exposes the authoritative
+  `zakura.p2p.connected_peers` gauge and freshness-derived
+  `zakura.p2p.healthy_peers` gauge, header- and block-sync expose active
+  reactor connection counts, discovery dials classify already-connected peers
+  separately from genuinely short-lived registrations, and the metrics
+  dashboard now reads the authoritative connected-peer gauge.
+- Zakura header-store consensus reads now verify store invariants as they
+  walk: the difficulty-context walk checks that every stored header is the
+  block its hash row names and links to the row below it, and the anchor
+  lookup distinguishes a corrupted index round-trip from a genuinely unknown
+  anchor. A corrupted store now surfaces as an explicit local
+  `StoreIncoherent` error (never scored against peers) instead of poisoning
+  difficulty validation and rejecting honest headers with
+  `InvalidDifficultyThreshold`.
+- Fixed three Zakura header-store write paths that could leave the on-disk
+  header store internally incoherent after chain forks, causing nodes to
+  reject valid headers from honest peers (`InvalidDifficultyThreshold` /
+  `UnknownAnchor`) and wedge below the network tip until manual intervention.
+  Header ranges must now link to their anchor and be internally contiguous
+  (rejected with the new `UnlinkedRange` error otherwise, which is classified
+  as a local, non-peer-scoring failure), header ranges re-delivered over
+  heights that already have committed block bodies no longer re-insert
+  provisional header rows below the body tip, and the header row seeded from
+  a committed best-chain block is skipped when it does not link to the stored
+  row below it (header-range sync converges the store instead).
+- Zebra can now audit the Zakura header store when the state database opens and
+  self-repair any incoherence (broken linkage, hash↔height index mismatches,
+  gaps with stranded rows above them, stale rows at committed heights) by
+  truncating the Zakura column families to the last coherent height in bounded
+  batches, then letting header sync re-download the truncated suffix. Operators
+  can opt in with `state.repair_zakura_header_store_on_startup = true`; each
+  repair emits a warning and the `state.zakura.header_store.incoherent` metric.
+- Fixed dual-stack Zakura fallback shutting down the Zakura serving layer. When
+  the stall watchdog resumes legacy `ChainSync`, Zakura now keeps its header-
+  and block-sync reactors alive as a serving/advertising bridge while an apply
+  gate drains in-flight Zakura body applies before legacy sync drives commits.
+- Fixed legacy peers being disconnected for returning empty `FindBlocks` or
+  `FindHeaders` responses when Zebra is at or near the network tip.
+- Kept an already-active mempool and `getblocktemplate` mining RPCs running
+  when the legacy sync status temporarily reports Zebra is far from the tip.
+  Initial mempool activation still waits until Zebra is within 100 blocks of
+  the tip.
+- Fixed a near-tip sync restart loop when a timed-out `AwaitUtxo` lookup in the
+  transaction verifier was converted to `InternalDowncastError` instead of a
+  missing transparent input.
+- Fixed Zakura nodes gossiping and following non-best-chain blocks. An inbound
+  `NewBlock` that did not land on the best chain (for example a testnet
+  min-difficulty branch) still advanced the node's Zakura header and verified
+  frontiers and was forwarded to peers, so a whole fleet could advertise and
+  propagate a losing branch over Zakura while each node's own chain stayed on
+  the best one — stranding zakura-only peers that followed the gossip. An
+  accepted `NewBlock` is now checked against the best chain before it advances
+  any frontier or is forwarded; non-best-chain accepts are remembered for dedup
+  only and counted in `sync.header.tip.new_block.non_best_chain`.
+- Fixed dual-stack nodes (`v2_p2p` and `legacy_p2p` both enabled) permanently
+  shutting down their own Zakura header- and block-sync drivers when a legacy
+  peer on a foreign fork answered the body-sync stall watchdog's cross-check
+  probe. The probe counted peer-offered block hashes that were missing from
+  our state as "blocks ahead" without checking they extend our chain, so a
+  canonical-network peer connected to a fork node tripped the fallback
+  threshold while the node was exactly at its own network tip. The probe now
+  requests headers and only counts a run that anchors at a block we already
+  have and links parent-to-parent; each probe decision is logged. Also added
+  header-sync reactor liveness metrics (`sync.header.reactor.iterations`,
+  per-event `started`/`finished` counters) and a loud log if the reactor loop
+  ever exits, since a stopped reactor previously left no trace at default log
+  levels.
+- Fixed healthy but quiet Zakura connections being closed by the application
+  idle reaper every idle window. The reaper only counts inbound application
+  messages and the periodic header-sync status refresh suppressed unchanged
+  statuses, so two peers idle at the same tip went mutually silent and reaped
+  their connection each idle timeout, then redialed — constant connection
+  churn between synced peers. Header sync now sends a redundant status as an
+  application keepalive on a spam-safe budget, so healthy connections stay
+  fresh while unused connections are still reaped. Service park decisions
+  (admission rejections and no-demand ordered streams) are now logged at info
+  and counted in metrics, since a parked peer is indistinguishable from a
+  wedged remote from the other side.
+- Moved the auto-generated Zakura iroh node identity key out of Zebra's cache
+  tree and into `network.identity_dir` (defaulting to
+  `~/.zakura/<network>.zakura-iroh-secret-key`), so cache or state snapshots do
+  not clone a node's long-term P2P identity.
+- Fixed Regtest Zakura defaults so they no longer inherit Mainnet bootstrap
+  peers. Regtest nodes now start with an empty Zakura bootstrap peer list and
+  log a separate warning when no Zakura bootstrap peers are configured.
+- Fixed a restarted or resyncing Zakura peer being locked out of block sync for
+  up to ~150s (occasionally longer) when it redialed the fleet from its stable
+  IP. The receiving node kept the peer's previous, now-dead connection as the
+  incumbent and rejected every redial as a duplicate until the incumbent aged
+  past the 300s eviction gate or was reaped by the QUIC idle timeout. A same-IP
+  duplicate (a restarted peer reclaiming its own slot) now evicts the stale
+  incumbent on a short gate so the redial reconnects within seconds, while a
+  just-registered incumbent is still kept so simultaneous-open races do not flap.
+- Fixed Zakura header-sync and block-sync peers getting stuck unable to serve
+  requests when an initial `Status` advertisement was dropped by a full outbound
+  queue. Status send bookkeeping now only records queued frames, header sync
+  retries unsent status advertisements, and block sync replies to the first
+  inbound status so peers converge after dropped connect-time advertisements.
+- Raised the default Zakura per-IP admission cap from 1 to 16 so NATed or
+  co-hosted v2 peers are not rejected while the legacy TCP per-IP default
+  remains 1.
 - Fixed a block-sync busy-spin under sustained byte-budget backpressure. The
   sequencer re-published its progress view (waking the reactor and every per-peer
   routine) even when no schedulable field had changed, which combined with the
   per-attempt floor-funding request to spin a routine's refill loop with no timer
   while the budget was pinned. The sequencer now wakes watchers only when a
   scheduling-relevant field actually changes.
+- Fixed a transient `getinfo` RPC panic while Zebra is committing early synced
+  blocks and concurrently calculating display-only chain-tip difficulty.
 - Fixed an out-of-memory crash during Zakura block sync when the header chain
   runs far ahead of the commit tip. The block-sync applying buffer holds decoded
   block bodies ahead of the in-order committer; its look-ahead budget counted
@@ -40,6 +167,10 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Performance
 
+- Reduce Zakura block-sync CPU overhead in the BBR-lite fill loop and trace path.
+  The byte-mode cold-start check now tests for fresh BDP samples without scanning
+  the BBR windows, and per-view trace rows skip expensive peer/work-queue
+  diagnostics while still reporting commit pipeline progress.
 - Improve Zakura block-sync download scheduling for checkpoint sync. A
   byte-denominated BBR-lite congestion controller (`block_sync/bbr.rs`) and
   per-peer admission control (`block_sync/admission.rs`) replace the previous
@@ -121,6 +252,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Use network-specific default Zakura bootstrap peers: Mainnet keeps the existing
+  native-P2P bootstrap list, while Testnet defaults to the Zakura testnet fleet.
 - Increased Zakura's default connection, handshake, stream-open, and QUIC
   window limits, and configured default native Zakura bootstrap peers. The
   larger defaults are intended for the production native-P2P sync path rather
@@ -250,6 +383,9 @@ and this project adheres to [Semantic Versioning](https://semver.org).
   root block or reconsider the same invalidated block twice.
 - Compare RPC authentication cookies in constant time after checking their
   length.
+- Make the Zakura body-sync stall watchdog use verified-tip progress only,
+  ignoring the best-header gap so fast header sync cannot trigger a false
+  fallback while block verification is still advancing.
 - Stop the Zakura body-sync watchdog from running two commit pipelines at once.
   When Zakura block sync stalled, the watchdog reactivated the legacy ChainSync
   body downloader but left the Zakura block- and header-sync drivers running, so

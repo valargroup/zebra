@@ -14,7 +14,8 @@ use thiserror::Error;
 #[cfg(test)]
 use zebra_chain::parallel::tree::NoteCommitmentTrees;
 use zebra_chain::{
-    block, orchard,
+    block::{self, merkle::AuthDataRoot, Block},
+    ironwood, orchard,
     parameters::{Network, NetworkUpgrade},
     sapling, sprout,
 };
@@ -23,6 +24,16 @@ use super::{
     commitment_aux::{CommitmentRootSource, FinalFrontiers, PeerSource},
     ZebraDb,
 };
+
+/// A buffered VCT successor block used to authenticate the current block's
+/// supplied note-commitment roots.
+#[derive(Clone, Debug)]
+pub struct NextVctBlock {
+    /// The successor block whose header commits to the current block's VCT roots.
+    pub(crate) block: Arc<Block>,
+    /// The successor block's precomputed ZIP-244 auth-data root, if available.
+    pub(crate) auth_data_root: Option<AuthDataRoot>,
+}
 
 /// Embedded verified final note-commitment frontiers for Mainnet.
 const MAINNET_FINAL_FRONTIERS: &[u8] = include_bytes!("vct/mainnet-frontier.bin");
@@ -158,7 +169,11 @@ impl VctState {
     pub(super) fn vct_roots_at_height(
         &self,
         height: block::Height,
-    ) -> Option<(sapling::tree::Root, orchard::tree::Root)> {
+    ) -> Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )> {
         if !self.enabled {
             return None;
         }
@@ -202,7 +217,7 @@ impl VctState {
         self.source.vct_last_checkpoint_height()
     }
 
-    /// The verified `(sapling, orchard, sprout)` frontiers to write as the tip
+    /// The verified `(sapling, orchard, sprout, ironwood)` frontiers to write as the tip
     /// treestate, when `height` is the checkpoint handoff height.
     #[allow(clippy::type_complexity)]
     pub(super) fn final_frontiers_for_last_checkpoint(
@@ -212,6 +227,7 @@ impl VctState {
         Arc<sapling::tree::NoteCommitmentTree>,
         Arc<orchard::tree::NoteCommitmentTree>,
         Arc<sprout::tree::NoteCommitmentTree>,
+        Arc<ironwood::tree::NoteCommitmentTree>,
     )> {
         let frontiers = self.source.final_frontiers();
         (frontiers.height == height).then(|| {
@@ -219,6 +235,7 @@ impl VctState {
                 frontiers.sapling.clone(),
                 frontiers.orchard.clone(),
                 frontiers.sprout.clone(),
+                frontiers.ironwood.clone(),
             )
         })
     }
@@ -260,6 +277,123 @@ impl VctState {
             prevalidated_count: AtomicU64::new(0),
         })
     }
+}
+
+/// Commit-time vct state carried by [`super::FinalizedState`]: the configured
+/// root source plus the commit-loop dedup and below-last-checkpoint state its
+/// fast path depends on, grouped so their invariants live next to the data they guard.
+#[derive(Clone, Debug)]
+pub(crate) struct VctCommitState {
+    /// The root source (peer/fixture/capture mode), or `None` for any of:
+    /// - checkpoint sync is disabled
+    /// - vct fast sync is disabled
+    /// - legacy Zebra checkpoint sync
+    source: Option<Arc<VctState>>,
+
+    /// `(height, hash)` of the next block already validated by the previous fast
+    /// commit's look-ahead, so its own commitment check can be skipped. Guarded by
+    /// hash identity, so a stale or cloned value can't cause an incorrect skip.
+    prevalidated_next: Option<(block::Height, block::Hash)>,
+
+    /// `true` while a vct sync is in-progress below the last checkpoint height.
+    /// During this time, we do not reconstruct per-height note-commitment trees.
+    /// As a result, the frontier is unknown.
+    is_vct_sync_below_last_checkpoint: bool,
+}
+
+impl VctCommitState {
+    /// Builds the commit state from a resolved `source` and an
+    /// `is_vct_sync_below_last_checkpoint` flag re-derived from durable state on open.
+    pub(super) fn new(
+        source: Option<Arc<VctState>>,
+        is_vct_sync_below_last_checkpoint: bool,
+    ) -> Self {
+        VctCommitState {
+            source,
+            prevalidated_next: None,
+            is_vct_sync_below_last_checkpoint,
+        }
+    }
+
+    /// The configured root source, or `None` for legacy recompute.
+    pub(super) fn source(&self) -> Option<&Arc<VctState>> {
+        self.source.as_ref()
+    }
+
+    /// `true` while the note-commitment frontier is below the last checkpoint height.
+    pub(super) fn is_below_last_checkpoint(&self) -> bool {
+        self.is_vct_sync_below_last_checkpoint
+    }
+
+    /// The cached successor prevalidation, if any.
+    pub(super) fn prevalidated_next(&self) -> Option<(block::Height, block::Hash)> {
+        self.prevalidated_next
+    }
+
+    /// Caches the next block's `(height, hash)` as already validated by this
+    /// fast commit's look-ahead.
+    pub(super) fn mark_prevalidated(&mut self, height: block::Height, hash: block::Hash) {
+        self.prevalidated_next = Some((height, hash));
+    }
+
+    /// Clears any cached successor prevalidation.
+    pub(super) fn clear_prevalidated_next(&mut self) {
+        self.prevalidated_next = None;
+    }
+
+    /// Test-only: overwrites the cached successor prevalidation, so tests can
+    /// install a stale or forged entry to exercise the dedup's guard checks.
+    #[cfg(test)]
+    pub(super) fn set_prevalidated_next(&mut self, next: Option<(block::Height, block::Hash)>) {
+        self.prevalidated_next = next;
+    }
+
+    /// Starts a VCT sync below the last checkpoint height: below the last checkpoint height,
+    /// the frontier is unknown as we are not reconstructing the trees every height.
+    pub(super) fn start_vct_sync_below_last_checkpoint(&mut self) {
+        self.is_vct_sync_below_last_checkpoint = true;
+    }
+
+    /// Stops a VCT sync at the last checkpoint height: the last checkpoint wrote the
+    /// real final frontier as the tip treestate.
+    pub(super) fn stop_vct_sync_at_last_checkpoint(&mut self) {
+        self.is_vct_sync_below_last_checkpoint = false;
+    }
+
+    /// Test-only: installs an arbitrary [`CommitmentRootSource`] as fast-mode
+    /// state, so the producer→consumer round-trip can be exercised in-process.
+    /// `requires_verified_successor` marks an untrusted source that must defer
+    /// tip roots until their successor is buffered.
+    #[cfg(test)]
+    pub(super) fn install_test_source(
+        &mut self,
+        source: Box<dyn CommitmentRootSource>,
+        requires_verified_successor: bool,
+    ) {
+        self.source = Some(VctState::test_with_source(
+            source,
+            requires_verified_successor,
+        ));
+    }
+}
+
+/// Fast-path (vct) outputs for the block being committed, passed as one
+/// parameter from the committer down through
+/// [`super::ZebraDb::write_block`] to [`super::ZebraDb::prepare_trees_batch`].
+///
+/// The fields are independent: a checkpoint-handoff block sets `sync_below`
+/// but leaves `anchor_roots` `None` (it writes the real frontier via the
+/// legacy path instead), while a non-handoff fast block sets both.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VctWriteData {
+    /// When `Some`, skip per-height tree writes and fold these roots into the anchor set.
+    pub anchor_roots: Option<(
+        sapling::tree::Root,
+        orchard::tree::Root,
+        ironwood::tree::Root,
+    )>,
+    /// When `Some(height)`, mark the database as vct-synced below `height`.
+    pub sync_below: Option<block::Height>,
 }
 
 /// The verified final frontiers embedded for `network`, if supported.
@@ -339,6 +473,7 @@ fn final_frontiers_bytes(height: block::Height, trees: &NoteCommitmentTrees) -> 
         sapling: trees.sapling.clone(),
         orchard: trees.orchard.clone(),
         sprout: trees.sprout.clone(),
+        ironwood: trees.ironwood.clone(),
     }
     .to_bytes()
 }
@@ -389,8 +524,13 @@ mod tests {
         let height = NetworkUpgrade::Heartwood
             .activation_height(&network)
             .expect("mainnet has a Heartwood activation height");
-        let root_map =
-            || std::iter::once((height.0, (Default::default(), Default::default()))).collect();
+        let root_map = || {
+            std::iter::once((
+                height.0,
+                (Default::default(), Default::default(), Default::default()),
+            ))
+            .collect()
+        };
         // The handoff is above the height under test, so the handoff exemption
         // does not mask the successor policy.
         let frontiers = || FinalFrontiers {
@@ -398,6 +538,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         };
 
         let trusted = VctState::test_with_source(
@@ -430,14 +571,21 @@ mod tests {
         let handoff = block::Height(10);
         let after_handoff = (handoff + 1).expect("test height is valid");
         let roots = std::collections::HashMap::from([
-            (handoff.0, (Default::default(), Default::default())),
-            (after_handoff.0, (Default::default(), Default::default())),
+            (
+                handoff.0,
+                (Default::default(), Default::default(), Default::default()),
+            ),
+            (
+                after_handoff.0,
+                (Default::default(), Default::default(), Default::default()),
+            ),
         ]);
         let frontiers = FinalFrontiers {
             height: handoff,
             sapling: Arc::new(sapling::tree::NoteCommitmentTree::default()),
             orchard: Arc::new(orchard::tree::NoteCommitmentTree::default()),
             sprout: Arc::new(sprout::tree::NoteCommitmentTree::default()),
+            ironwood: Arc::new(ironwood::tree::NoteCommitmentTree::default()),
         };
 
         let bounded = VctState::test_with_source(
@@ -481,6 +629,12 @@ mod tests {
             EXPECTED_MAINNET_FINAL_SPROUT_ROOT,
             "embedded mainnet final Sprout frontier root is pinned"
         );
+        assert_eq!(
+            frontiers.ironwood.root(),
+            ironwood::tree::NoteCommitmentTree::default().root(),
+            "the embedded mainnet-frontier.bin predates Ironwood, so it parses (backward \
+             compatibly) with the Ironwood frontier defaulted to the empty tree"
+        );
     }
 
     #[test]
@@ -507,6 +661,11 @@ mod tests {
             trees.sprout.root(),
             "captured sprout frontier round-trips"
         );
+        assert_eq!(
+            parsed.ironwood.root(),
+            trees.ironwood.root(),
+            "captured ironwood frontier round-trips"
+        );
     }
 
     #[test]
@@ -517,6 +676,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         };
 
         let _ = parse_embedded_final_frontiers(&frontiers.to_bytes(), block::Height(2));
@@ -568,6 +728,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         }
         .to_bytes()
         .into_iter()
@@ -615,6 +776,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         }
         .to_bytes();
 
@@ -643,6 +805,7 @@ mod tests {
             sapling: Arc::new(Default::default()),
             orchard: Arc::new(Default::default()),
             sprout: Arc::new(Default::default()),
+            ironwood: Arc::new(Default::default()),
         }
         .to_bytes();
         let path = std::env::temp_dir().join(format!(

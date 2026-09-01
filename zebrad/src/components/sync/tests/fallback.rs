@@ -1,18 +1,15 @@
 //! Tests for the Zakura body-sync stall watchdog
 //! ([`ChainSync::bootstrap_genesis_then_pause`]).
 //!
-//! These exercise the pure decision function [`zakura_block_sync_stalled`] and the
-//! [`stop_zakura_sync`] hand-off helper directly, so they are deterministic and need
-//! no clock, services, or live `ChainTip`.
+//! These exercise the pure decision function [`zakura_block_sync_stalled`] directly,
+//! so they are deterministic and need no clock, services, or live `ChainTip`.
 
-use tokio_util::sync::CancellationToken;
-
-use zebra_chain::block::Height;
+use zebra_chain::{block::Height, chain_sync_status::ChainSyncStatus};
 
 use super::super::{
-    legacy_probe_supports_fallback, stop_zakura_sync, zakura_block_sync_stalled,
-    zakura_watchdog_action, ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction,
-    ZAKURA_LEGACY_BEHIND_THRESHOLD,
+    engage_legacy_fallback_alongside_zakura, legacy_probe_supports_fallback,
+    zakura_block_sync_stalled, zakura_sync_status_length, zakura_watchdog_action, SyncStatus,
+    ZakuraLegacyProbe, ZakuraStallTracker, ZakuraWatchdogAction, ZAKURA_LEGACY_BEHIND_THRESHOLD,
 };
 
 /// The original height-only rule, reproduced here only to demonstrate the F-88602
@@ -34,18 +31,14 @@ fn legacy_stalled(
     }
 }
 
-/// A peer trickling next-height blocks over gossip bumps the verified tip without
-/// Zakura block sync running. The old height-only rule treats that as health and
-/// never falls back (the bug); the new rule sees the gap to the network frontier
-/// never closing and falls back.
+/// A peer trickling next-height blocks over gossip bumps the verified tip. The
+/// watchdog treats any verified-tip advance as progress and does not use the
+/// best-header frontier to decide whether Zakura is stalled.
 #[test]
-fn gossip_trickle_does_not_suppress_fallback() {
+fn verified_tip_progress_prevents_fallback() {
     let max_idle_polls = 5;
 
-    // The frontier sits far ahead and advances in lockstep with each gossiped block,
-    // so the gap stays pinned at 1_000: the node is materially behind the whole time.
     let mut verified = 0u32;
-    let mut header = 1_000u32;
 
     let mut legacy_last = Some(Height(verified));
     let mut legacy_idle = 0u64;
@@ -55,30 +48,23 @@ fn gossip_trickle_does_not_suppress_fallback() {
     let mut new_fell_back = false;
     for _ in 0..(max_idle_polls * 4) {
         verified += 1;
-        header += 1;
         legacy_fell_back |= legacy_stalled(
             &mut legacy_last,
             &mut legacy_idle,
             Some(Height(verified)),
             max_idle_polls,
         );
-        new_fell_back |= zakura_block_sync_stalled(
-            &mut tracker,
-            Some(Height(verified)),
-            Some(Height(header)),
-            max_idle_polls,
-        );
+        new_fell_back |=
+            zakura_block_sync_stalled(&mut tracker, Some(Height(verified)), max_idle_polls);
     }
 
     assert!(
         !legacy_fell_back,
-        "the legacy height-only rule never falls back under gossip trickle — this is the \
-         F-88602 bug the new rule must fix"
+        "the legacy height-only rule never falls back while the verified tip advances"
     );
     assert!(
-        new_fell_back,
-        "the watchdog must fall back when the verified tip only moves via gossip and the gap \
-         to the network frontier never closes"
+        !new_fell_back,
+        "the watchdog must not fall back while the verified tip advances"
     );
 }
 
@@ -87,28 +73,22 @@ fn gossip_trickle_does_not_suppress_fallback() {
 #[test]
 fn real_block_sync_progress_keeps_primary_path() {
     let max_idle_polls = 5;
-    let header = 10_000u32;
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
 
     let mut verified = 0u32;
     for _ in 0..60 {
         verified = verified.saturating_add(200);
         assert!(
-            !zakura_block_sync_stalled(
-                &mut tracker,
-                Some(Height(verified)),
-                Some(Height(header)),
-                max_idle_polls,
-            ),
+            !zakura_block_sync_stalled(&mut tracker, Some(Height(verified)), max_idle_polls,),
             "healthy bulk sync closing 200 blocks/poll must never fall back"
         );
     }
 }
 
-/// A node caught up to the frontier, with gossip keeping it current one block at a
-/// time, is healthy and must not fall back.
+/// A node advancing one verified block at a time is making progress and must
+/// not fall back.
 #[test]
-fn near_tip_with_gossip_stays_primary() {
+fn one_block_progress_stays_primary() {
     let max_idle_polls = 3;
     let mut tracker = ZakuraStallTracker::new(Some(Height(100)));
 
@@ -116,37 +96,26 @@ fn near_tip_with_gossip_stays_primary() {
     for _ in 0..20 {
         height += 1;
         assert!(
-            !zakura_block_sync_stalled(
-                &mut tracker,
-                Some(Height(height)),
-                Some(Height(height)),
-                max_idle_polls,
-            ),
-            "a node caught up to the frontier must not fall back"
+            !zakura_block_sync_stalled(&mut tracker, Some(Height(height)), max_idle_polls,),
+            "a node advancing one verified block at a time must not fall back"
         );
     }
 }
 
-/// Steady moderate sync that closes fewer than `ZAKURA_BLOCK_SYNC_MIN_CLOSURE`
-/// blocks in a single poll but accumulates across polls must still be credited as
-/// progress. Guards against a naive running-min anchor that would re-baseline every
-/// idle poll and false-positive a working sync.
+/// Steady moderate sync must be credited as progress. This guards against
+/// reintroducing a best-header gap rule that can false-positive while verified
+/// blocks are advancing.
 #[test]
 fn steady_moderate_sync_does_not_false_positive() {
     let max_idle_polls = 5;
-    let header = 100_000u32;
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
 
     let mut verified = 0u32;
     let mut fell_back = false;
     for _ in 0..400 {
         verified = verified.saturating_add(50);
-        fell_back |= zakura_block_sync_stalled(
-            &mut tracker,
-            Some(Height(verified)),
-            Some(Height(header.max(verified))),
-            max_idle_polls,
-        );
+        fell_back |=
+            zakura_block_sync_stalled(&mut tracker, Some(Height(verified)), max_idle_polls);
     }
     assert!(
         !fell_back,
@@ -154,40 +123,37 @@ fn steady_moderate_sync_does_not_false_positive() {
     );
 }
 
-/// With no network frontier known yet, the watchdog degrades to the original
-/// "verified tip moved at all" rule so behavior does not regress before header sync
-/// reports a frontier.
+/// The watchdog uses the original "verified tip moved at all" rule.
 #[test]
-fn without_header_tip_uses_legacy_tip_moved_rule() {
+fn uses_legacy_tip_moved_rule() {
     let max_idle_polls = 3;
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
 
-    // Tip advancing, no frontier known: treated as progress.
+    // Tip advancing: treated as progress.
     for v in 1..=10u32 {
         assert!(!zakura_block_sync_stalled(
             &mut tracker,
             Some(Height(v)),
-            None,
             max_idle_polls,
         ));
     }
 
-    // Tip frozen, no frontier known: idle accrues and it falls back after the window.
+    // Tip frozen: idle accrues and it falls back after the window.
     let frozen = Some(Height(10));
     let mut fell_back = false;
     for _ in 0..max_idle_polls {
-        fell_back = zakura_block_sync_stalled(&mut tracker, frozen, None, max_idle_polls);
+        fell_back = zakura_block_sync_stalled(&mut tracker, frozen, max_idle_polls);
     }
     assert!(
         fell_back,
-        "with no frontier and a frozen verified tip, the legacy rule still trips the fallback"
+        "with a frozen verified tip, the legacy rule still trips the fallback"
     );
 }
 
-/// The fleet-restart blind spot: every Zakura node restarts together and freezes
-/// at a common height with `header_tip == verified_tip`, so the gap is zero and
-/// the gap-based rule reads "caught up" forever. The legacy-informed probe must
-/// engage once the verified tip stays frozen while the node looks caught up.
+/// The fleet-restart blind spot: every Zakura node restarts together and
+/// freezes at a common height with `header_tip == verified_tip`, so the node
+/// looks caught up. The legacy-informed probe must engage once the verified tip
+/// stays frozen while the node looks caught up.
 #[test]
 fn frozen_with_zero_gap_arms_the_legacy_probe() {
     let min_frozen_polls = 3;
@@ -212,8 +178,8 @@ fn frozen_with_zero_gap_arms_the_legacy_probe() {
     );
 }
 
-/// A node still advancing its verified tip — however slowly — is left to the
-/// gap-based rule and must never arm the legacy probe.
+/// A node still advancing its verified tip — however slowly — must never arm
+/// the legacy probe.
 #[test]
 fn advancing_tip_never_arms_the_legacy_probe() {
     let min_frozen_polls = 3;
@@ -229,9 +195,8 @@ fn advancing_tip_never_arms_the_legacy_probe() {
     }
 }
 
-/// When the header gap is large the gap-based rule already owns the decision, so
-/// `looks_caught_up` is false and the legacy probe must stay off even with a
-/// frozen tip — the two triggers must not overlap.
+/// When the header gap is large, `looks_caught_up` is false and the legacy
+/// probe must stay off even with a frozen tip.
 #[test]
 fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
     let min_frozen_polls = 3;
@@ -241,29 +206,28 @@ fn frozen_but_materially_behind_leaves_probe_to_gap_rule() {
     for _ in 0..(min_frozen_polls * 4) {
         assert!(
             !probe.should_probe(frozen, false, min_frozen_polls),
-            "a large header gap is the gap-based rule's domain; the legacy probe must stay off"
+            "a large header gap means the legacy probe must stay off"
         );
     }
 }
 
-#[tokio::test]
-async fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
+/// The fallback decision fires on a frozen verified tip, and the hand-off keeps
+/// the Zakura reactors alive: legacy ChainSync resumes as the body-sync driver
+/// while Zakura quiesces into a serving/advertising bridge.
+#[test]
+fn stalled_zakura_with_legacy_fallback_keeps_zakura_reactors_alive() {
     let max_idle_polls = 3;
-    let token = CancellationToken::new();
-    let driver_view = token.child_token();
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
     let mut legacy_probe = ZakuraLegacyProbe::new(Some(Height(0)));
 
     let mut action = ZakuraWatchdogAction::ContinueWaiting;
-    let mut verified = 0u32;
     let mut header = 1_000u32;
     for _ in 0..=max_idle_polls {
-        verified += 1;
         header += 1;
         action = zakura_watchdog_action(
             &mut tracker,
             &mut legacy_probe,
-            Some(Height(verified)),
+            Some(Height(0)),
             Some(Height(header)),
             max_idle_polls,
             true,
@@ -273,33 +237,34 @@ async fn stalled_zakura_with_legacy_fallback_cancels_the_shutdown_token() {
     assert_eq!(
         action,
         ZakuraWatchdogAction::FallbackToLegacy,
-        "a material gap that never closes must trigger legacy fallback when it is enabled"
+        "a frozen verified tip must trigger legacy fallback when it is enabled"
     );
-    stop_zakura_sync(None, &Some(token)).await;
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
     assert!(
-        driver_view.is_cancelled(),
-        "falling back to legacy must cancel the Zakura sync drivers' shutdown token"
+        handoff.is_yielded_to_legacy(),
+        "fallback must yield Zakura block sync to legacy sync"
+    );
+    assert!(
+        handoff.begin_apply().is_none(),
+        "no new Zakura applies may start after the fallback engages"
     );
 }
 
 #[test]
 fn stalled_zakura_without_legacy_fallback_keeps_waiting() {
     let max_idle_polls = 3;
-    let token = CancellationToken::new();
-    let driver_view = token.child_token();
     let mut tracker = ZakuraStallTracker::new(Some(Height(0)));
     let mut legacy_probe = ZakuraLegacyProbe::new(Some(Height(0)));
 
     let mut saw_warn_only = false;
-    let mut verified = 0u32;
     let mut header = 1_000u32;
     for _ in 0..(max_idle_polls * 2) {
-        verified += 1;
         header += 1;
         let action = zakura_watchdog_action(
             &mut tracker,
             &mut legacy_probe,
-            Some(Height(verified)),
+            Some(Height(0)),
             Some(Height(header)),
             max_idle_polls,
             false,
@@ -317,18 +282,14 @@ fn stalled_zakura_without_legacy_fallback_keeps_waiting() {
         saw_warn_only,
         "Zakura-only stalls should still produce the warn-only watchdog action"
     );
-    assert!(
-        !driver_view.is_cancelled(),
-        "warn-only Zakura stalls must not cancel the Zakura shutdown token"
-    );
 }
 
-#[tokio::test]
-async fn frozen_zero_gap_with_legacy_peers_ahead_cancels_the_shutdown_token() {
+/// A frozen tip that looks caught up cross-checks legacy peers, and a probe at
+/// or above the behind threshold engages fallback without cancelling Zakura.
+#[test]
+fn frozen_zero_gap_with_legacy_peers_ahead_engages_fallback() {
     let max_idle_polls = 5;
     let frozen = Some(Height(1_000));
-    let token = CancellationToken::new();
-    let driver_view = token.child_token();
     let mut tracker = ZakuraStallTracker::new(frozen);
     let mut legacy_probe = ZakuraLegacyProbe::new(frozen);
 
@@ -354,10 +315,11 @@ async fn frozen_zero_gap_with_legacy_peers_ahead_cancels_the_shutdown_token() {
         "legacy peers at or above the behind threshold must trigger fallback"
     );
 
-    stop_zakura_sync(None, &Some(token)).await;
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    futures::executor::block_on(engage_legacy_fallback_alongside_zakura(&handoff));
     assert!(
-        driver_view.is_cancelled(),
-        "legacy-informed fallback must cancel the Zakura sync drivers' shutdown token"
+        handoff.is_yielded_to_legacy(),
+        "fallback must yield Zakura block sync to legacy sync"
     );
 }
 
@@ -373,33 +335,125 @@ fn legacy_probe_below_threshold_keeps_zakura_running() {
     );
 }
 
-/// The point of this test is to lock in the fallback behavior: when Zebra decides to stop using
-/// Zakura sync and fall back to legacy sync, it must signal the running Zakura driver tasks to shut down.
-/// This asserts that the shutdown token is cancelled when the fallback occurs.
-#[tokio::test]
-async fn fallback_cancels_the_zakura_shutdown_token() {
-    let token = CancellationToken::new();
-    assert!(
-        !token.is_cancelled(),
-        "precondition: a fresh token is not cancelled"
+#[test]
+fn zakura_sync_status_length_reports_local_header_gap() {
+    assert_eq!(
+        zakura_sync_status_length(Some(Height(100)), Some(Height(100))),
+        Some(0),
+        "a caught-up Zakura body tip should report a close-to-tip sync length"
     );
-
-    // A child token stands in for the drivers' observed shutdown: cancelling the shared token the
-    // watchdog holds must propagate to what the drivers actually await.
-    let driver_view = token.child_token();
-
-    stop_zakura_sync(None, &Some(token)).await;
-
-    assert!(
-        driver_view.is_cancelled(),
-        "falling back to legacy must cancel the Zakura sync drivers' shutdown token"
+    assert_eq!(
+        zakura_sync_status_length(Some(Height(100)), Some(Height(110))),
+        Some(10),
+        "a small local header/body gap should preserve the existing close-to-tip heuristic"
+    );
+    assert_eq!(
+        zakura_sync_status_length(Some(Height(110)), Some(Height(100))),
+        Some(0),
+        "a stale header-tip read should not make a synced body tip look behind"
+    );
+    assert_eq!(
+        zakura_sync_status_length(None, Some(Height(100))),
+        None,
+        "without a verified body tip, Zakura should not publish a readiness signal"
+    );
+    assert_eq!(
+        zakura_sync_status_length(Some(Height(100)), None),
+        None,
+        "without a header frontier, Zakura should not publish a readiness signal"
     );
 }
 
-/// On a Zakura-only node there is no endpoint shutdown token, so the hand-off helper must be a
-/// no-op rather than panic.
-#[tokio::test]
-async fn stop_zakura_sync_is_a_noop_without_a_token() {
-    // Must not panic.
-    stop_zakura_sync(None, &None).await;
+#[test]
+fn zakura_sync_status_lengths_drive_existing_mempool_gate() {
+    let (sync_status, mut recent_syncs) = SyncStatus::new();
+
+    assert!(
+        !sync_status.is_close_to_tip(),
+        "an empty sync-status history starts with mempool disabled"
+    );
+
+    recent_syncs.push_extend_tips_length(
+        zakura_sync_status_length(Some(Height(100)), Some(Height(100)))
+            .expect("caught-up Zakura tips produce a sync status length"),
+    );
+    assert!(
+        sync_status.is_close_to_tip(),
+        "a caught-up Zakura body/header frontier should activate the existing close-to-tip gate"
+    );
+
+    let (sync_status, mut recent_syncs) = SyncStatus::new();
+    recent_syncs.push_extend_tips_length(
+        zakura_sync_status_length(Some(Height(110)), Some(Height(100)))
+            .expect("local verified tip ahead of headers produces a sync status length"),
+    );
+    assert!(
+        sync_status.is_close_to_tip(),
+        "a locally mined block ahead of the peer header tip should activate the mempool gate"
+    );
+
+    let (sync_status, mut recent_syncs) = SyncStatus::new();
+    recent_syncs.push_extend_tips_length(
+        zakura_sync_status_length(Some(Height(100)), Some(Height(201)))
+            .expect("known Zakura tips produce a sync status length"),
+    );
+    assert!(
+        !sync_status.is_close_to_tip(),
+        "a Zakura body/header gap over 100 blocks should keep the existing close-to-tip gate disabled"
+    );
+}
+
+/// Locks in the fallback behavior: engaging legacy fallback must be a commit
+/// barrier for Zakura body applies, while leaving the reactors alive as a
+/// serving bridge.
+#[tokio::test(start_paused = true)]
+async fn fallback_handoff_drains_applies_without_cancelling_zakura() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let permit = handoff.begin_apply().expect("applies run before fallback");
+
+    let drain_handoff = handoff.clone();
+    let drain =
+        tokio::spawn(async move { engage_legacy_fallback_alongside_zakura(&drain_handoff).await });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !drain.is_finished(),
+        "the drain waits for in-flight applies"
+    );
+    assert!(
+        handoff.begin_apply().is_none(),
+        "no new Zakura applies may start once fallback begins"
+    );
+
+    drop(permit);
+    drain.await.expect("drain task completes");
+    assert!(handoff.is_yielded_to_legacy());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fallback_drain_does_not_lose_concurrent_last_apply_wakeup() {
+    let handoff = crate::commands::start::zakura::BlockSyncHandoff::new();
+    let permit = handoff.begin_apply().expect("applies run before fallback");
+
+    let drain_handoff = handoff.clone();
+    let drain = tokio::spawn(async move {
+        drain_handoff
+            .yield_to_legacy(std::time::Duration::from_secs(30))
+            .await;
+    });
+
+    let dropper = tokio::task::spawn_blocking(move || drop(permit));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        dropper.await.expect("dropper task completes");
+        drain.await.expect("drain task completes");
+    })
+    .await
+    .expect("drain must observe the final apply release without waiting for its timeout");
+
+    assert!(handoff.is_yielded_to_legacy());
+    assert!(
+        handoff.begin_apply().is_none(),
+        "no new Zakura applies may start after the concurrent drain"
+    );
 }

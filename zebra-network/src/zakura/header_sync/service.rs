@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
@@ -7,7 +10,7 @@ use super::{events::*, pipe::*, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, Flow, Frame, FramedRecv, FramedSend,
     OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServicePeerDirection, SessionGuard,
-    Sink, SinkReject, Stream, StreamMode, ZakuraPeerId, ZakuraSupervisorHandle,
+    Sink, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId, ZakuraSupervisorHandle,
     ZAKURA_CAP_HEADER_SYNC,
 };
 
@@ -28,7 +31,7 @@ pub(crate) fn header_sync_streams() -> &'static [Stream] {
     &HEADER_SYNC_SERVICE_STREAMS
 }
 
-/// Cloneable typed stream-5 sender and peer-local response expectations.
+/// Cloneable typed header-sync v6 sender and peer-local response expectations.
 #[derive(Clone, Debug)]
 pub struct HeaderSyncPeerSession {
     peer_id: ZakuraPeerId,
@@ -128,6 +131,16 @@ impl HeaderSyncPeerSession {
     /// Peer disconnect/local shutdown cancellation token.
     pub fn cancel_token(&self) -> CancellationToken {
         self.inner.cancel_token.clone()
+    }
+
+    /// Current free slots in this peer's bounded outbound stream queue.
+    pub fn outbound_capacity(&self) -> usize {
+        self.inner.send.capacity()
+    }
+
+    /// Total slots in this peer's bounded outbound stream queue.
+    pub fn outbound_max_capacity(&self) -> usize {
+        self.inner.send.max_capacity()
     }
 
     /// Send a typed status advertisement.
@@ -279,15 +292,25 @@ pub(crate) async fn drive_header_sync_actions(
     }
 }
 
-/// Native stream-5 header-sync service.
+/// Native header-sync v6 service.
 #[derive(Debug)]
 pub(crate) struct HeaderSyncService {
     header_sync: HeaderSyncHandle,
+    peers: Arc<StdMutex<HashMap<ZakuraPeerId, HeaderSyncPeerRecord>>>,
+}
+
+#[derive(Debug)]
+struct HeaderSyncPeerRecord {
+    conn_id: ZakuraConnId,
+    cancel_token: CancellationToken,
 }
 
 impl HeaderSyncService {
     pub(crate) fn new(header_sync: HeaderSyncHandle) -> Self {
-        Self { header_sync }
+        Self {
+            header_sync,
+            peers: Arc::new(StdMutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -335,9 +358,34 @@ impl Service for HeaderSyncService {
         // shared connection that other services (discovery, block-sync) ride on.
         let service_cancel_token = session.cancel_token();
         let connection_cancel_token = peer.cancel_token();
+        let close_cause = peer.close_cause();
+        let conn_id = peer.conn_id;
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let header_sync_session =
             HeaderSyncPeerSession::new_with_commands(&session, peer.direction, commands_tx);
+
+        {
+            let mut peers = self
+                .peers
+                .lock()
+                .expect("header-sync peer map mutex is never poisoned");
+            if peers
+                .get(&peer_id)
+                .is_some_and(|record| record.conn_id > conn_id)
+            {
+                service_cancel_token.cancel();
+                return;
+            }
+            if let Some(old_record) = peers.insert(
+                peer_id.clone(),
+                HeaderSyncPeerRecord {
+                    conn_id,
+                    cancel_token: header_sync_session.cancel_token(),
+                },
+            ) {
+                old_record.cancel_token.cancel();
+            }
+        }
 
         let _ = self
             .header_sync
@@ -364,10 +412,12 @@ impl Service for HeaderSyncService {
         // or parked exit leaves the connection alone.
         let pipe_cancel_token = service_cancel_token.clone();
         let protocol_connection_cancel_token = connection_cancel_token.clone();
+        let protocol_close_cause = close_cause.clone();
         let pipe = async move {
             handle_pipe_exit(
                 "header-sync",
                 &protocol_connection_cancel_token,
+                &protocol_close_cause,
                 run_peer(pipe, recv, pipe_cancel_token).await,
             );
         };
@@ -379,23 +429,61 @@ impl Service for HeaderSyncService {
         // old sink only sent `PeerDisconnected` on the normal return path, so a
         // panicking task leaked the peer's reactor state.
         let teardown_handle = self.header_sync.clone();
+        let teardown_peers = self.peers.clone();
         let teardown_peer = peer_id.clone();
         let on_teardown = move || {
-            let _ =
-                teardown_handle.send_lifecycle(HeaderSyncEvent::PeerDisconnected(teardown_peer));
+            let should_notify = {
+                let mut peers = teardown_peers
+                    .lock()
+                    .expect("header-sync peer map mutex is never poisoned");
+                if peers
+                    .get(&teardown_peer)
+                    .is_some_and(|record| record.conn_id == conn_id)
+                {
+                    peers.remove(&teardown_peer);
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_notify {
+                let _ = teardown_handle
+                    .send_lifecycle(HeaderSyncEvent::PeerDisconnected(teardown_peer));
+            }
         };
         let panic_connection_cancel_token = connection_cancel_token.clone();
-        let on_panic = move || panic_connection_cancel_token.cancel();
+        let panic_close_cause = close_cause.clone();
+        let on_panic = move || {
+            panic_close_cause.record("service_panic");
+            panic_connection_cancel_token.cancel();
+        };
 
         // Reuse the single supervised launcher; let the returned handle drop to
         // detach the task (the `PipeTeardown` still runs on every exit path).
         spawn_supervised_pipe(peer_id, service_cancel_token, on_teardown, on_panic, pipe);
     }
 
-    fn remove_peer(&self, peer: &ZakuraPeerId) {
-        let _ = self
-            .header_sync
-            .send_lifecycle(HeaderSyncEvent::PeerDisconnected(peer.clone()));
+    fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
+        let removed = {
+            let mut peers = self
+                .peers
+                .lock()
+                .expect("header-sync peer map mutex is never poisoned");
+            if peers
+                .get(peer)
+                .is_some_and(|record| record.conn_id == conn_id)
+            {
+                peers.remove(peer)
+            } else {
+                None
+            }
+        };
+        if let Some(record) = removed {
+            record.cancel_token.cancel();
+            let _ = self
+                .header_sync
+                .send_lifecycle(HeaderSyncEvent::PeerDisconnected(peer.clone()));
+        }
     }
 
     fn deliver_frame(
@@ -432,7 +520,7 @@ fn header_sync_guard_max_bytes() -> u32 {
         .expect("MAX_HS_MESSAGE_BYTES is a 2 MiB constant that fits in u32")
 }
 
-/// Testkit/no-reactor mode records stream-5 inbound frames without running header sync.
+/// Testkit/no-reactor mode records header-sync v6 inbound frames without running header sync.
 #[derive(Debug)]
 pub(crate) struct HeaderSyncPassthroughService {
     inner: Arc<dyn Service>,
@@ -499,7 +587,7 @@ impl Service for HeaderSyncPassthroughService {
         });
     }
 
-    fn remove_peer(&self, _peer: &ZakuraPeerId) {}
+    fn remove_peer(&self, _peer: &ZakuraPeerId, _conn_id: ZakuraConnId) {}
 
     fn deliver_frame(
         &self,

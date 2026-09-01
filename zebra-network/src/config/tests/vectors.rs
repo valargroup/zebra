@@ -1,6 +1,6 @@
 //! Fixed test vectors for zebra-network configuration.
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use static_assertions::const_assert;
 use zebra_chain::{
@@ -12,16 +12,28 @@ use zebra_chain::{
 };
 
 use crate::{
+    config::zakura_listens_on_loopback_with_non_loopback_bootstrap_peers,
+    config::zakura_secret_key_file_path,
     constants::{INBOUND_PEER_LIMIT_MULTIPLIER, OUTBOUND_PEER_LIMIT_MULTIPLIER},
     zakura::{
-        DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_ZAKURA_BOOTSTRAP_PEERS,
-        DEFAULT_ZAKURA_LISTEN_ADDR,
+        DEFAULT_HS_MAX_INFLIGHT, DEFAULT_HS_RANGE, DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS,
+        DEFAULT_ZAKURA_BOOTSTRAP_PEERS, DEFAULT_ZAKURA_LISTEN_ADDR,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
     },
     CacheDir, Config,
 };
 
+use super::super::load_or_generate_zakura_secret_key;
+
 fn default_zakura_bootstrap_peers() -> Vec<String> {
     DEFAULT_ZAKURA_BOOTSTRAP_PEERS
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn default_testnet_zakura_bootstrap_peers() -> Vec<String> {
+    DEFAULT_TESTNET_ZAKURA_BOOTSTRAP_PEERS
         .iter()
         .map(ToString::to_string)
         .collect()
@@ -79,7 +91,7 @@ fn ensure_peer_connection_limits_consistent() {
 fn testnet_params_serialization_roundtrip() {
     let _init_guard = zebra_test::init();
 
-    let config = Config {
+    let mut config = Config {
         network: testnet::Parameters::build()
             .with_disable_pow(true)
             .to_network()
@@ -87,6 +99,9 @@ fn testnet_params_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.legacy_p2p = true;
+    config.v2_p2p = true;
+    config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -121,32 +136,201 @@ fn zakura_node_secret_key_is_redacted_from_debug_and_serialization() {
 }
 
 #[test]
-fn p2p_protocol_flags_default_on_and_roundtrip() {
+fn identity_dir_defaults_and_roundtrips() {
     let _init_guard = zebra_test::init();
 
-    assert!(Config::default().v2_p2p);
+    let default_config = Config::default();
+    assert_eq!(
+        default_config
+            .identity_dir
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some(".zakura"),
+    );
+
+    let config: Config = toml::from_str("identity_dir = '/tmp/zakura-identities'")
+        .expect("identity_dir should parse as a path");
+    assert_eq!(
+        config.identity_dir,
+        std::path::PathBuf::from("/tmp/zakura-identities"),
+    );
+
+    let serialized = toml::to_string(&config).expect("config should serialize");
+    assert!(
+        serialized.contains("identity_dir = \"/tmp/zakura-identities\""),
+        "identity_dir should be included in generated network config",
+    );
+    let deserialized: Config = toml::from_str(&serialized).expect("serialized config should parse");
+    assert_eq!(config, deserialized);
+}
+
+#[test]
+fn p2p_protocol_flags_default_by_network_and_roundtrip() {
+    let _init_guard = zebra_test::init();
+
+    assert!(Config::default().default_p2p);
+    assert!(!Config::default().v2_p2p);
     assert!(Config::default().legacy_p2p);
     assert_eq!(
         Config::default().zakura.bootstrap_peers,
         default_zakura_bootstrap_peers()
     );
 
-    let config: Config = toml::from_str(
+    let mainnet_config: Config = toml::from_str("network = 'Mainnet'").unwrap();
+    assert!(!mainnet_config.v2_p2p);
+    assert!(mainnet_config.legacy_p2p);
+
+    let testnet_config: Config = toml::from_str("network = 'Testnet'").unwrap();
+    assert!(testnet_config.default_p2p);
+    assert!(testnet_config.v2_p2p);
+    assert!(testnet_config.legacy_p2p);
+
+    let regtest_config: Config = toml::from_str("network = 'Regtest'").unwrap();
+    assert!(regtest_config.v2_p2p);
+    assert!(regtest_config.legacy_p2p);
+
+    let default_testnet_config: Config = toml::from_str(
         r#"
+        network = 'Testnet'
+        v2_p2p = "default"
+        "#,
+    )
+    .unwrap();
+    assert!(default_testnet_config.v2_p2p);
+
+    let explicit_testnet_config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+        default_p2p = false
         v2_p2p = false
         legacy_p2p = false
         "#,
     )
     .unwrap();
-    assert!(!config.v2_p2p);
-    assert!(!config.legacy_p2p);
+    assert!(!explicit_testnet_config.v2_p2p);
+    assert!(!explicit_testnet_config.legacy_p2p);
+
+    let config: Config = toml::from_str(
+        r#"
+        default_p2p = false
+        v2_p2p = true
+        legacy_p2p = true
+        "#,
+    )
+    .unwrap();
+    assert!(config.v2_p2p);
+    assert!(config.legacy_p2p);
 
     let serialized = toml::to_string(&config).unwrap();
-    assert!(serialized.contains("v2_p2p = false"));
-    assert!(serialized.contains("legacy_p2p = false"));
+    assert!(serialized.contains("default_p2p = false"));
+    assert!(serialized.contains("v2_p2p = true"));
+    assert!(serialized.contains("legacy_p2p = true"));
 
     let deserialized: Config = toml::from_str(&serialized).unwrap();
     assert_eq!(config, deserialized);
+}
+
+#[test]
+fn zakura_bootstrap_peers_default_to_selected_network() {
+    let _init_guard = zebra_test::init();
+
+    let mainnet_config: Config = toml::from_str("network = 'Mainnet'").unwrap();
+    assert_eq!(
+        mainnet_config.zakura.bootstrap_peers,
+        default_zakura_bootstrap_peers()
+    );
+
+    let testnet_config: Config = toml::from_str("network = 'Testnet'").unwrap();
+    assert_eq!(
+        testnet_config.zakura.bootstrap_peers,
+        default_testnet_zakura_bootstrap_peers()
+    );
+}
+
+#[test]
+fn explicit_zakura_bootstrap_peers_override_network_defaults() {
+    let _init_guard = zebra_test::init();
+
+    let empty_config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        bootstrap_peers = []
+        "#,
+    )
+    .unwrap();
+    assert!(empty_config.zakura.bootstrap_peers.is_empty());
+
+    let custom_config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        custom_config.zakura.bootstrap_peers,
+        vec!["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
+    );
+}
+
+#[test]
+fn zakura_warns_on_loopback_listener_with_public_bootstrap_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        listen_addr = "127.0.0.1:18234"
+        "#,
+    )
+    .unwrap();
+
+    assert!(zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&config.zakura));
+}
+
+#[test]
+fn zakura_loopback_listener_allows_loopback_bootstrap_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        listen_addr = "127.0.0.1:18234"
+        bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8234"]
+        "#,
+    )
+    .unwrap();
+
+    assert!(!zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&config.zakura));
+}
+
+#[test]
+fn zakura_public_listener_allows_public_bootstrap_peers() {
+    let _init_guard = zebra_test::init();
+
+    let config: Config = toml::from_str(
+        r#"
+        network = 'Testnet'
+
+        [zakura]
+        listen_addr = "0.0.0.0:18234"
+        "#,
+    )
+    .unwrap();
+
+    assert!(!zakura_listens_on_loopback_with_non_loopback_bootstrap_peers(&config.zakura));
+    assert_eq!(
+        config.zakura.listen_addr,
+        Some("0.0.0.0:18234".parse::<SocketAddr>().unwrap())
+    );
 }
 
 #[test]
@@ -177,10 +361,101 @@ fn zakura_dev_network_defaults_off_and_roundtrips() {
 fn p2p_v2_old_enable_config_alias_still_parses() {
     let _init_guard = zebra_test::init();
 
-    let config: Config = toml::from_str("enable_p2p_v2 = false").unwrap();
+    let config: Config = toml::from_str("default_p2p = false\nenable_p2p_v2 = false").unwrap();
 
+    assert!(!config.default_p2p);
     assert!(!config.v2_p2p);
     assert!(config.legacy_p2p);
+}
+
+#[test]
+fn p2p_v2_default_config_value_follows_network_defaults() {
+    let _init_guard = zebra_test::init();
+
+    let mainnet_config: Config = toml::from_str(
+        r#"
+        network = "Mainnet"
+        v2_p2p = "default"
+        "#,
+    )
+    .unwrap();
+    assert!(!mainnet_config.v2_p2p);
+
+    let testnet_config: Config = toml::from_str(
+        r#"
+        network = "Testnet"
+        v2_p2p = "default"
+        "#,
+    )
+    .unwrap();
+    assert!(testnet_config.v2_p2p);
+
+    let invalid = toml::from_str::<Config>("v2_p2p = 'enabled'")
+        .expect_err("only true, false, and default are valid v2_p2p values");
+    assert!(
+        invalid.to_string().contains("expected true, false, or"),
+        "unexpected invalid v2_p2p error: {invalid}",
+    );
+}
+
+#[test]
+fn default_p2p_overrides_user_p2p_flags_for_upgrades() {
+    let _init_guard = zebra_test::init();
+
+    let mainnet_config: Config = toml::from_str(
+        r#"
+        network = "Mainnet"
+        default_p2p = true
+        legacy_p2p = false
+        v2_p2p = true
+        "#,
+    )
+    .unwrap();
+    assert!(mainnet_config.default_p2p);
+    assert!(mainnet_config.legacy_p2p);
+    assert!(!mainnet_config.v2_p2p);
+
+    let testnet_config: Config = toml::from_str(
+        r#"
+        network = "Testnet"
+        default_p2p = true
+        legacy_p2p = false
+        v2_p2p = false
+        "#,
+    )
+    .unwrap();
+    assert!(testnet_config.legacy_p2p);
+    assert!(testnet_config.v2_p2p);
+
+    let regtest_config: Config = toml::from_str(
+        r#"
+        network = "Regtest"
+        default_p2p = true
+        legacy_p2p = false
+        v2_p2p = false
+        "#,
+    )
+    .unwrap();
+    assert!(regtest_config.legacy_p2p);
+    assert!(regtest_config.v2_p2p);
+}
+
+#[test]
+fn default_p2p_false_preserves_user_p2p_flags() {
+    let _init_guard = zebra_test::init();
+
+    let manual_mainnet_config: Config = toml::from_str(
+        r#"
+        network = "Mainnet"
+        default_p2p = false
+        legacy_p2p = false
+        v2_p2p = true
+        "#,
+    )
+    .unwrap();
+    assert!(!manual_mainnet_config.default_p2p);
+    assert!(!manual_mainnet_config.legacy_p2p);
+    assert!(manual_mainnet_config.v2_p2p);
 }
 
 #[test]
@@ -189,6 +464,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
 
     let config: Config = toml::from_str(
         r#"
+        network = "Testnet"
         listen_addr = "127.0.0.1:8233"
         peerset_initial_target_size = 25
         "#,
@@ -200,9 +476,13 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
     assert!(config.legacy_p2p);
     assert_eq!(
         config.zakura.bootstrap_peers,
-        default_zakura_bootstrap_peers()
+        default_testnet_zakura_bootstrap_peers()
     );
     assert!(config.zakura.max_connections > 0);
+    assert_eq!(
+        config.zakura.max_connections_per_ip,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+    );
     assert!(config.zakura.max_pending_handshakes > 0);
     assert_eq!(
         config.zakura.header_sync.max_headers_per_response,
@@ -274,12 +554,14 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
     let config: Config = toml::from_str(
         r#"
+        default_p2p = false
         v2_p2p = true
         legacy_p2p = true
 
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
         max_connections = 7
+        max_connections_per_ip = 5
         max_pending_handshakes = 3
         stream_open_rate_per_second = 11
         message_rate_per_second = 13
@@ -299,11 +581,13 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     .unwrap();
 
     let serialized = toml::to_string(&config).unwrap();
+    assert!(serialized.contains("default_p2p = false"));
     assert!(serialized.contains("v2_p2p = true"));
     assert!(serialized.contains("legacy_p2p = true"));
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
     assert!(serialized.contains("max_connections = 7"));
+    assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
     assert!(serialized.contains("[zakura.header_sync]"));
     assert!(serialized.contains("max_headers_per_response = 333"));
@@ -380,6 +664,7 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
 
     let config: Config = toml::from_str(
         r#"
+        default_p2p = false
         v2_p2p = true
 
         [zakura]
@@ -396,6 +681,10 @@ fn zakura_bootstrap_peers_parse_in_nested_config() {
     assert!(config.legacy_p2p);
     assert_eq!(config.zakura.bootstrap_peers.len(), 1);
     assert_eq!(config.zakura.max_connections, 4);
+    assert_eq!(
+        config.zakura.max_connections_per_ip,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+    );
     assert_eq!(config.zakura.max_pending_handshakes, 2);
     assert_eq!(config.zakura.stream_open_rate_per_second, 3);
     assert_eq!(config.zakura.message_rate_per_second, 5);
@@ -409,6 +698,10 @@ fn default_config_uses_ipv6() {
     assert_eq!(config.listen_addr.to_string(), "[::]:8233");
     assert!(config.listen_addr.is_ipv6());
     assert_eq!(config.zakura.listen_addr, Some(DEFAULT_ZAKURA_LISTEN_ADDR));
+    assert_eq!(
+        config.zakura.max_connections_per_ip,
+        DEFAULT_ZAKURA_MAX_CONNS_PER_IP
+    );
 }
 
 #[test]
@@ -421,7 +714,7 @@ fn funding_streams_serialization_roundtrip() {
         .map(ConfiguredFundingStreams::from)
         .collect();
 
-    let config = Config {
+    let mut config = Config {
         network: testnet::Parameters::build()
             .with_funding_streams(fs)
             .to_network()
@@ -429,6 +722,9 @@ fn funding_streams_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.legacy_p2p = true;
+    config.v2_p2p = true;
+    config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -444,7 +740,7 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
 
     let soft_fork_height = Height(2_000_000);
 
-    let config = Config {
+    let mut config = Config {
         network: testnet::Parameters::build()
             .with_temporary_orchard_disabling_soft_fork_height(soft_fork_height)
             .to_network()
@@ -452,6 +748,9 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
         initial_testnet_peers: [].into(),
         ..Config::default()
     };
+    config.legacy_p2p = true;
+    config.v2_p2p = true;
+    config.zakura.apply_network_defaults(&config.network);
 
     let serialized = toml::to_string(&config).unwrap();
     let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -468,32 +767,20 @@ fn temporary_orchard_disabling_soft_fork_height_serialization_roundtrip() {
     );
 }
 
-/// With `v2_p2p` enabled, default config (no `zakura_node_secret_key`), and a
-/// writable cache dir, the generated Zakura iroh identity must be persisted on
-/// first use and reused on every later startup, so the node's `NodeId` is stable
-/// across restarts.
+/// With no `zakura_node_secret_key` and a writable identity directory, the
+/// generated Zakura iroh identity must be persisted on first use and reused on
+/// every later startup, so the node's `NodeId` is stable across restarts.
 ///
 /// This is the regression test for `claude-ephemeral-node-secret-on-restart`:
 /// before the fix, `Config::zakura_secret_key` generated a fresh ephemeral key on
-/// every call and never wrote the reserved cache-dir key file, so two startups
+/// every call and never wrote the reserved identity key file, so two startups
 /// produced different `NodeId`s and no key file existed.
 #[test]
 fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     let _init_guard = zebra_test::init();
 
-    let cache_dir = tempfile::tempdir().expect("failed to create temp cache dir");
-
-    let config = Config {
-        cache_dir: CacheDir::custom_path(cache_dir.path()),
-        zakura_node_secret_key: None,
-        v2_p2p: true,
-        ..Config::default()
-    };
-
-    let key_file = config
-        .cache_dir
-        .zakura_node_secret_key_file_path(&config.network)
-        .expect("an enabled cache dir must yield a key file path");
+    let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");
 
     // The key file must not exist before first use.
     assert!(
@@ -502,14 +789,12 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     );
 
     // First startup: generate and persist a fresh key.
-    let first = config
-        .zakura_secret_key()
-        .expect("default config should resolve a secret key");
+    let first = load_or_generate_zakura_secret_key(&key_file);
 
-    // The reserved cache-dir key file must now exist (atomic create+persist).
+    // The reserved identity key file must now exist (atomic create+persist).
     assert!(
         key_file.exists(),
-        "first startup must persist the generated key to the cache-dir key file",
+        "first startup must persist the generated identity key file",
     );
 
     // On Unix, the long-term private identity file must be owner-only (0o600).
@@ -524,28 +809,18 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
         assert_eq!(mode, 0o600, "persisted secret key file must be owner-only");
     }
 
-    // Second startup with a fresh `Config` reading the same cache dir (simulating
-    // a process restart) must reuse the persisted key, yielding the same `NodeId`.
-    let restart_config = Config {
-        cache_dir: CacheDir::custom_path(cache_dir.path()),
-        zakura_node_secret_key: None,
-        v2_p2p: true,
-        ..Config::default()
-    };
-    let after_restart = restart_config
-        .zakura_secret_key()
-        .expect("restart should resolve the persisted secret key");
+    // Second startup reading the same key file (simulating a process restart)
+    // must reuse the persisted key, yielding the same `NodeId`.
+    let after_restart = load_or_generate_zakura_secret_key(&key_file);
 
     assert_eq!(
         first.public(),
         after_restart.public(),
-        "node identity must be stable across restarts when persisted to the cache dir",
+        "node identity must be stable across restarts when persisted to the identity file",
     );
 
-    // Calling again on the same config must also be stable.
-    let again = config
-        .zakura_secret_key()
-        .expect("repeat resolution should succeed");
+    // Calling again must also be stable.
+    let again = load_or_generate_zakura_secret_key(&key_file);
     assert_eq!(
         first.public(),
         again.public(),
@@ -554,55 +829,64 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
 }
 
 /// A configured `zakura_node_secret_key` must always win and is never overwritten
-/// by the cache-dir persistence path; a disabled cache dir falls back to an
-/// ephemeral key without writing any file.
+/// by the automatic persistence path; a disabled cache dir still yields a
+/// persistent Zakura identity path outside the cache directory.
 #[test]
 fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
     let _init_guard = zebra_test::init();
 
-    let cache_dir = tempfile::tempdir().expect("failed to create temp cache dir");
+    let key_dir = tempfile::tempdir().expect("failed to create temp key dir");
+    let key_file = key_dir.path().join("mainnet.zakura-iroh-secret-key");
 
-    // Persist a key first so a key file exists in the cache dir.
-    let persisting = Config {
-        cache_dir: CacheDir::custom_path(cache_dir.path()),
-        zakura_node_secret_key: None,
-        v2_p2p: true,
-        ..Config::default()
-    };
-    let persisted = persisting.zakura_secret_key().expect("persist a key");
+    // Persist a key first so an automatic key exists.
+    let persisted = load_or_generate_zakura_secret_key(&key_file);
 
     // A configured key (64-char lowercase hex of the all-ones secret) must override
-    // the persisted cache-dir key.
+    // the persisted automatic key.
     let configured = "01".repeat(32);
-    let mut with_key: Config = toml::from_str(&format!("zakura_node_secret_key = '{configured}'"))
+    let with_key: Config = toml::from_str(&format!("zakura_node_secret_key = '{configured}'"))
         .expect("valid configured key parses");
-    with_key.cache_dir = CacheDir::custom_path(cache_dir.path());
     let from_config = with_key
         .zakura_secret_key()
         .expect("configured key should resolve");
     assert_ne!(
         from_config.public(),
         persisted.public(),
-        "configured key must override the persisted cache-dir key",
+        "configured key must override the persisted automatic key",
     );
 
-    // A disabled cache dir cannot persist, so it yields an ephemeral key and writes
-    // no file.
+    // A disabled cache dir still has a persistent Zakura identity path, which is
+    // outside the cache directory.
     let disabled = Config {
         cache_dir: CacheDir::disabled(),
         zakura_node_secret_key: None,
+        default_p2p: false,
         v2_p2p: true,
         ..Config::default()
     };
-    assert!(
-        disabled
-            .cache_dir
-            .zakura_node_secret_key_file_path(&disabled.network)
-            .is_none(),
-        "disabled cache dir must not yield a key file path",
+    let disabled_key_file = disabled.identity_dir.join("mainnet.zakura-iroh-secret-key");
+    assert_eq!(
+        disabled_key_file,
+        zakura_secret_key_file_path(&disabled.identity_dir, &disabled.network),
     );
-    // Resolving still succeeds (ephemeral), and successive calls may differ.
-    disabled
-        .zakura_secret_key()
-        .expect("disabled cache dir should still resolve an ephemeral key");
+    assert_eq!(
+        disabled.cache_dir.peer_cache_file_path(&disabled.network),
+        None,
+        "disabled cache dir must still disable the peer cache",
+    );
+    assert_eq!(
+        disabled_key_file
+            .parent()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str()),
+        Some(".zakura"),
+        "disabled cache dir must still store the Zakura identity outside the peer cache",
+    );
+    assert_eq!(
+        disabled_key_file
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("mainnet.zakura-iroh-secret-key"),
+        "disabled cache dir must still yield a persistent Zakura identity path outside the peer cache",
+    );
 }

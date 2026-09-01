@@ -252,32 +252,59 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                     .await
                 {
                     Ok(committed_hash) if committed_hash == hash => {
+                        // A contextually valid block also commits when it does
+                        // not land on the best chain, but only a best-chain
+                        // block may advance the header/verified frontiers or be
+                        // forwarded to peers: gossiping non-best-chain blocks
+                        // makes the whole Zakura layer follow a losing branch
+                        // while the node's own chain stays honest, stranding
+                        // zakura-only peers.
+                        let on_best_chain =
+                            new_block_is_on_best_chain(read_state.clone(), hash).await;
+                        let result_label = if on_best_chain {
+                            "accepted"
+                        } else {
+                            "accepted_non_best_chain"
+                        };
                         trace_header_commit_finish(
                             &trace,
                             "new_block",
                             &peer,
                             height,
                             hash,
-                            "accepted",
+                            result_label,
                             started,
                         );
                         trace_header_reactor_event(
                             &trace,
-                            "new_block_accepted",
+                            if on_best_chain {
+                                "new_block_accepted"
+                            } else {
+                                "new_block_accepted_non_best_chain"
+                            },
                             Some(&peer),
                             height,
                             hash,
                             1,
                         );
-                        let _ = handles
-                            .header_sync
-                            .send(HeaderSyncEvent::NewBlockAccepted {
+                        let event = if on_best_chain {
+                            HeaderSyncEvent::NewBlockAccepted {
                                 peer,
                                 height,
                                 hash,
                                 block,
-                            })
-                            .await;
+                            }
+                        } else {
+                            debug!(
+                                ?peer,
+                                ?height,
+                                ?hash,
+                                "Zakura NewBlock did not land on the best chain; \
+                                 not advancing frontiers or forwarding"
+                            );
+                            HeaderSyncEvent::NewBlockAcceptedNonBestChain { peer, height, hash }
+                        };
+                        let _ = handles.header_sync.send(event).await;
                     }
                     Ok(committed_hash) => {
                         trace_header_commit_finish(
@@ -740,6 +767,17 @@ pub(crate) async fn drive_zakura_header_sync_actions<State, ReadState, BlockVeri
                                     cs_trace::RESULT,
                                     commit_failure_result_label(kind),
                                 );
+                                insert_cs_hash(row, cs_trace::HASH, anchor);
+                                insert_cs_str(
+                                    row,
+                                    cs_trace::ERROR_VARIANT,
+                                    header_range_commit_error_label(error.as_ref()),
+                                );
+                                insert_cs_str(
+                                    row,
+                                    cs_trace::ERROR_DEBUG,
+                                    &header_range_commit_error_debug(error.as_ref()),
+                                );
                                 insert_cs_u64(row, cs_trace::ELAPSED_MS, elapsed_ms(started));
                             },
                         );
@@ -1096,6 +1134,44 @@ async fn log_missing_block_bodies<ReadState>(
     }
 }
 
+/// Returns whether a just-committed `NewBlock` landed on the best chain.
+///
+/// `ReadRequest::Depth` returns `Some` only for best-chain blocks, so it
+/// distinguishes a best-chain extension (or a reorg the block just won) from a
+/// side-chain commit. Read failures are treated as *not* best-chain: the
+/// node's own frontier still advances through the chain-tip mirror, so the
+/// only cost of a false negative is skipping one gossip forward, while a
+/// false positive would gossip a possibly losing branch.
+async fn new_block_is_on_best_chain<ReadState>(read_state: ReadState, hash: block::Hash) -> bool
+where
+    ReadState: Service<
+            zebra_state::ReadRequest,
+            Response = zebra_state::ReadResponse,
+            Error = zebra_state::BoxError,
+        > + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    match read_state
+        .oneshot(zebra_state::ReadRequest::Depth(hash))
+        .await
+    {
+        Ok(zebra_state::ReadResponse::Depth(depth)) => depth.is_some(),
+        Ok(response) => {
+            warn!(?response, "unexpected Depth response for Zakura NewBlock");
+            false
+        }
+        Err(error) => {
+            warn!(
+                ?hash,
+                ?error,
+                "failed to read Zakura NewBlock depth from state"
+            );
+            false
+        }
+    }
+}
+
 pub(crate) fn header_range_commit_failure_kind(
     error: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> HeaderSyncCommitFailureKind {
@@ -1112,6 +1188,18 @@ pub(crate) fn header_range_commit_failure_kind(
         // fork. Treat it as non-scoring so this stays a liveness/correctness guard,
         // not peer punishment.
         | zebra_state::CommitHeaderRangeError::LowerWorkConflict { .. }
+        // The reactor already validates every peer response against the requested
+        // anchor and for internal continuity (`validate_header_range_links`) and
+        // scores linkage failures there, then commits with that same anchor. So the
+        // store's own linkage check failing means the local anchor/response pairing
+        // went wrong, not that the peer misbehaved.
+        | zebra_state::CommitHeaderRangeError::UnlinkedRange { .. }
+        // Store incoherence is by definition a local storage fault: the range was
+        // rejected because our own header rows failed a linkage/bijection check
+        // while reading validation context, not because the peer's range was shown
+        // invalid. Scoring peers for it recreates the disconnect-honest-peers
+        // failure mode.
+        | zebra_state::CommitHeaderRangeError::StoreIncoherent(_)
         | zebra_state::CommitHeaderRangeError::CommitResponseDropped => {
             HeaderSyncCommitFailureKind::Local
         }
@@ -1131,6 +1219,88 @@ pub(crate) fn header_range_commit_failure_kind(
         }
         _ => HeaderSyncCommitFailureKind::Local,
     }
+}
+
+pub(crate) fn header_range_commit_error_label(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> &'static str {
+    let Some(error) = error.downcast_ref::<zebra_state::CommitHeaderRangeError>() else {
+        return "non_commit_header_range_error";
+    };
+
+    match error {
+        zebra_state::CommitHeaderRangeError::EmptyRange => "empty_range",
+        zebra_state::CommitHeaderRangeError::RangeTooLong { .. } => "range_too_long",
+        zebra_state::CommitHeaderRangeError::BodySizeCountMismatch { .. } => {
+            "body_size_count_mismatch"
+        }
+        zebra_state::CommitHeaderRangeError::TreeAuxRootCountMismatch { .. } => {
+            "tree_aux_root_count_mismatch"
+        }
+        zebra_state::CommitHeaderRangeError::TreeAuxRootHeightMismatch { .. } => {
+            "tree_aux_root_height_mismatch"
+        }
+        zebra_state::CommitHeaderRangeError::UnknownAnchor { .. } => "unknown_anchor",
+        zebra_state::CommitHeaderRangeError::MissingGenesisAnchor { .. } => {
+            "missing_genesis_anchor"
+        }
+        zebra_state::CommitHeaderRangeError::HeightOverflow => "height_overflow",
+        zebra_state::CommitHeaderRangeError::ImmutableConflict { .. } => "immutable_conflict",
+        zebra_state::CommitHeaderRangeError::ReorgTooDeep { .. } => "reorg_too_deep",
+        zebra_state::CommitHeaderRangeError::LowerWorkConflict { .. } => "lower_work_conflict",
+        zebra_state::CommitHeaderRangeError::CheckpointConflict { .. } => "checkpoint_conflict",
+        zebra_state::CommitHeaderRangeError::ConflictingFullBlockHeader { .. } => {
+            "conflicting_full_block_header"
+        }
+        zebra_state::CommitHeaderRangeError::ValidateContextError(error) => {
+            validate_context_error_label(error)
+        }
+        zebra_state::CommitHeaderRangeError::StorageWriteError { .. } => "storage_write_error",
+        zebra_state::CommitHeaderRangeError::SendCommitRequestFailed => {
+            "send_commit_request_failed"
+        }
+        zebra_state::CommitHeaderRangeError::CommitResponseDropped => "commit_response_dropped",
+        _ => "unknown_commit_header_range_error",
+    }
+}
+
+fn validate_context_error_label(error: &zebra_state::ValidateContextError) -> &'static str {
+    match error {
+        zebra_state::ValidateContextError::BlockPreviouslyInvalidated { .. } => {
+            "validate_context_error.block_previously_invalidated"
+        }
+        zebra_state::ValidateContextError::VctSuppliedRootUnavailable { .. } => {
+            "validate_context_error.vct_supplied_root_unavailable"
+        }
+        zebra_state::ValidateContextError::VctSuppliedRootAwaitingSuccessor { .. } => {
+            "validate_context_error.vct_supplied_root_awaiting_successor"
+        }
+        zebra_state::ValidateContextError::OrphanedBlock { .. } => {
+            "validate_context_error.orphaned_block"
+        }
+        zebra_state::ValidateContextError::NonSequentialBlock { .. } => {
+            "validate_context_error.non_sequential_block"
+        }
+        zebra_state::ValidateContextError::TimeTooEarly { .. } => {
+            "validate_context_error.time_too_early"
+        }
+        zebra_state::ValidateContextError::TimeTooLate { .. } => {
+            "validate_context_error.time_too_late"
+        }
+        zebra_state::ValidateContextError::InvalidDifficultyThreshold { .. } => {
+            "validate_context_error.invalid_difficulty_threshold"
+        }
+        _ => "validate_context_error.other",
+    }
+}
+
+fn header_range_commit_error_debug(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> String {
+    error
+        .downcast_ref::<zebra_state::CommitHeaderRangeError>()
+        .map(|error| format!("{error:?}"))
+        .unwrap_or_else(|| error.to_string())
 }
 
 pub(crate) async fn mirror_zakura_full_block_commits<ReadState>(

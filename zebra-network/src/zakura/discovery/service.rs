@@ -21,11 +21,11 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle, Flow,
-    Frame, FramedRecv, FramedSend, HeaderSyncEvent, HeaderSyncHandle, OrderedSendError, Peer,
-    PeerStreamSession, Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection, SinkReject,
-    Stream, StreamMode, ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
-    ZAKURA_CAP_HEADER_SYNC,
+    handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
+    CloseCause, Flow, Frame, FramedRecv, FramedSend, HeaderSyncEvent, HeaderSyncHandle,
+    OrderedSendError, Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision,
+    ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerId,
+    LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY, ZAKURA_CAP_HEADER_SYNC,
 };
 
 #[cfg(test)]
@@ -227,8 +227,10 @@ impl Service for DiscoveryService {
             peer.service_cancel_token(),
         );
         let discovery_session = DiscoveryPeerSession::new(&session, peer.direction);
+        let conn_id = peer.conn_id;
         let service_cancel = discovery_session.cancel_token();
         let connection_cancel = peer.cancel_token();
+        let close_cause = peer.close_cause();
         let other_service_negotiated =
             peer.negotiated & !(ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC) != 0;
         let (_peer_id, _stream_kind, recv, _send, _session_cancel) = session.into_parts();
@@ -244,22 +246,26 @@ impl Service for DiscoveryService {
         let admit_peer_id = discovery_session.peer_id().clone();
         let panic_service_cancel = service_cancel.clone();
         let panic_connection_cancel = connection_cancel.clone();
+        let panic_close_cause = close_cause.clone();
         spawn_supervised_peer_task(
             admit_peer_id,
             || {},
             move || {
+                panic_close_cause.record("service_panic");
                 panic_service_cancel.cancel();
                 panic_connection_cancel.cancel();
             },
             async move {
                 let decision = handle
                     .admit_peer(
+                        conn_id,
                         discovery_session.peer_id().clone(),
                         discovery_session.direction(),
                     )
                     .await;
                 if decision != ServiceAdmissionDecision::Admit {
-                    tracing::debug!(
+                    metrics::counter!("zakura.discovery.peer.parked").increment(1);
+                    tracing::info!(
                         peer = ?discovery_session.peer_id(),
                         direction = ?discovery_session.direction(),
                         ?decision,
@@ -275,20 +281,22 @@ impl Service for DiscoveryService {
                     block_sync,
                     peer_node_id,
                     discovery_session,
+                    conn_id,
                     recv,
                     service_cancel,
                     connection_cancel,
+                    close_cause,
                     other_service_negotiated,
                 });
             },
         );
     }
 
-    fn remove_peer(&self, peer: &ZakuraPeerId) {
+    fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId) {
         let handle = self.handle.clone();
         let peer = peer.clone();
         tokio::spawn(async move {
-            handle.remove_peer(&peer).await;
+            handle.remove_peer(&peer, conn_id).await;
         });
     }
 }
@@ -299,9 +307,11 @@ struct DiscoveryExchangeStart {
     block_sync: Option<BlockSyncHandle>,
     peer_node_id: NodeId,
     discovery_session: DiscoveryPeerSession,
+    conn_id: ZakuraConnId,
     recv: FramedRecv,
     service_cancel: CancellationToken,
     connection_cancel: CancellationToken,
+    close_cause: CloseCause,
     other_service_negotiated: bool,
 }
 
@@ -312,9 +322,11 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         block_sync,
         peer_node_id,
         discovery_session,
+        conn_id,
         recv,
         service_cancel,
         connection_cancel,
+        close_cause,
         other_service_negotiated,
     } = start;
     let peer_id = discovery_session.peer_id().clone();
@@ -331,6 +343,8 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     let sink_service_cancel = service_cancel.clone();
     let reject_connection_cancel = connection_cancel.clone();
     let panic_connection_cancel = connection_cancel.clone();
+    let reject_close_cause = close_cause.clone();
+    let panic_close_cause = close_cause.clone();
     let sink_peer_id = peer_id.clone();
     // A protocol reject is fatal to the connection; normal/parked exits leave it
     // for the source task to tear down once it knows no other service owns the
@@ -340,10 +354,14 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
         handle_pipe_exit(
             "discovery",
             &reject_connection_cancel,
+            &reject_close_cause,
             run_discovery_pipe(&mut pipe, recv, sink).await,
         );
     };
-    let on_panic = move || panic_connection_cancel.cancel();
+    let on_panic = move || {
+        panic_close_cause.record("service_panic");
+        panic_connection_cancel.cancel();
+    };
     // Let the returned handle drop to detach the supervised reader task; the
     // `PipeTeardown` still runs on every exit path.
     spawn_supervised_pipe(peer_id.clone(), sink_service_cancel, || {}, on_panic, pipe);
@@ -362,10 +380,13 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
     let source_task_peer_id = peer_id.clone();
     let panic_source_service_cancel = service_cancel.clone();
     let panic_source_connection_cancel = connection_cancel.clone();
+    let panic_source_close_cause = close_cause.clone();
+    let source_close_cause = close_cause.clone();
     spawn_supervised_peer_task(
         source_task_peer_id,
         || {},
         move || {
+            panic_source_close_cause.record("service_panic");
             panic_source_service_cancel.cancel();
             panic_source_connection_cancel.cancel();
         },
@@ -375,7 +396,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                 handle.mark_short_lived_exchange(&peer_node_id).await;
             }
             service_cancel.cancel();
-            handle.remove_peer(&peer_id).await;
+            handle.remove_peer(&peer_id, conn_id).await;
             if exchanged
                 && !peer_has_other_service_owner(
                     source_header_sync.as_ref(),
@@ -383,6 +404,7 @@ fn spawn_discovery_exchange(start: DiscoveryExchangeStart) {
                     other_service_negotiated,
                 )
             {
+                source_close_cause.record("discovery_exchange_complete");
                 connection_cancel.cancel();
             }
         },

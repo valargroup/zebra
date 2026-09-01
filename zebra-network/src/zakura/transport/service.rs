@@ -5,9 +5,9 @@ use std::{collections::HashMap, fmt, future::Future, net::IpAddr, pin::Pin};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use super::{FramedRecv, FramedSend};
+use super::{CloseCause, FramedRecv, FramedSend};
 use crate::{
-    zakura::{ServicePeerDirection, ZakuraPeerId},
+    zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId},
     BoxError,
 };
 
@@ -63,6 +63,8 @@ impl ServiceStream {
 pub struct Peer {
     /// Authenticated Zakura peer identity.
     pub id: ZakuraPeerId,
+    /// Supervisor registration generation that owns this service session.
+    pub conn_id: ZakuraConnId,
     /// Remote IP address when the transport knows it.
     pub remote_ip: Option<IpAddr>,
     /// Capabilities accepted by both peers.
@@ -72,6 +74,7 @@ pub struct Peer {
     streams: HashMap<u16, ServiceStream>,
     cancel_token: CancellationToken,
     service_cancel_token: CancellationToken,
+    close_cause: CloseCause,
 }
 
 impl Peer {
@@ -83,7 +86,8 @@ impl Peer {
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
         cancel_token: CancellationToken,
     ) -> Self {
-        Self::new_with_direction(
+        Self::new_with_conn_id_and_direction(
+            0,
             id,
             remote_ip,
             negotiated,
@@ -102,6 +106,50 @@ impl Peer {
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
         cancel_token: CancellationToken,
     ) -> Self {
+        Self::new_with_conn_id_and_direction(
+            0,
+            id,
+            remote_ip,
+            negotiated,
+            direction,
+            streams,
+            cancel_token,
+        )
+    }
+
+    /// Build a peer from transport streams, connection id, and direction.
+    pub(crate) fn new_with_conn_id_and_direction(
+        conn_id: ZakuraConnId,
+        id: ZakuraPeerId,
+        remote_ip: Option<IpAddr>,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+        streams: HashMap<u16, (FramedRecv, FramedSend)>,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self::new_with_conn_id_and_direction_and_close_cause(
+            conn_id,
+            id,
+            remote_ip,
+            negotiated,
+            direction,
+            streams,
+            cancel_token,
+            CloseCause::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_conn_id_and_direction_and_close_cause(
+        conn_id: ZakuraConnId,
+        id: ZakuraPeerId,
+        remote_ip: Option<IpAddr>,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+        streams: HashMap<u16, (FramedRecv, FramedSend)>,
+        cancel_token: CancellationToken,
+        close_cause: CloseCause,
+    ) -> Self {
         let streams = streams
             .into_iter()
             .map(|(kind, (recv, send))| {
@@ -111,16 +159,28 @@ impl Peer {
                 )
             })
             .collect::<HashMap<_, _>>();
-        Self::new_with_service_streams(id, remote_ip, negotiated, direction, streams, cancel_token)
+        Self::new_with_service_streams(
+            conn_id,
+            id,
+            remote_ip,
+            negotiated,
+            direction,
+            streams,
+            cancel_token,
+            close_cause,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_service_streams(
+        conn_id: ZakuraConnId,
         id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         negotiated: u64,
         direction: ServicePeerDirection,
         streams: HashMap<u16, ServiceStream>,
         cancel_token: CancellationToken,
+        close_cause: CloseCause,
     ) -> Self {
         let service_cancel_token = streams
             .values()
@@ -128,6 +188,7 @@ impl Peer {
             .map(|stream| stream.cancel_token.clone())
             .unwrap_or_else(|| cancel_token.child_token());
         Self::new_with_service_cancel_token(
+            conn_id,
             id,
             remote_ip,
             negotiated,
@@ -135,10 +196,13 @@ impl Peer {
             streams,
             cancel_token,
             service_cancel_token,
+            close_cause,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_service_cancel_token(
+        conn_id: ZakuraConnId,
         id: ZakuraPeerId,
         remote_ip: Option<IpAddr>,
         negotiated: u64,
@@ -146,15 +210,18 @@ impl Peer {
         streams: HashMap<u16, ServiceStream>,
         cancel_token: CancellationToken,
         service_cancel_token: CancellationToken,
+        close_cause: CloseCause,
     ) -> Self {
         Self {
             id,
+            conn_id,
             remote_ip,
             negotiated,
             direction,
             streams,
             cancel_token,
             service_cancel_token,
+            close_cause,
         }
     }
 
@@ -181,24 +248,33 @@ impl Peer {
         self.service_cancel_token.clone()
     }
 
+    /// Return the shared first-cause connection close recorder.
+    pub(crate) fn close_cause(&self) -> CloseCause {
+        self.close_cause.clone()
+    }
+
     /// Split this peer into fields so the registry can fan streams out by owner.
     pub(crate) fn into_parts(
         self,
     ) -> (
         ZakuraPeerId,
+        ZakuraConnId,
         Option<IpAddr>,
         u64,
         ServicePeerDirection,
         HashMap<u16, ServiceStream>,
         CancellationToken,
+        CloseCause,
     ) {
         (
             self.id,
+            self.conn_id,
             self.remote_ip,
             self.negotiated,
             self.direction,
             self.streams,
             self.cancel_token,
+            self.close_cause,
         )
     }
 }
@@ -234,7 +310,7 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     fn add_peer(&self, peer: Peer);
 
     /// Remove a disconnected peer.
-    fn remove_peer(&self, peer: &ZakuraPeerId);
+    fn remove_peer(&self, peer: &ZakuraPeerId, conn_id: ZakuraConnId);
 
     /// Deliver one request-response frame to this service.
     fn deliver_frame(

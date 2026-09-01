@@ -92,6 +92,48 @@ pub const COMMIT_STATE_TABLE: ZakuraTraceTable = ZakuraTraceTable {
     file_name: "commit_state.jsonl",
 };
 
+/// Failed non-blocking outbound queue sends for Zakura wire messages.
+pub const QUEUE_SEND_TABLE: ZakuraTraceTable = ZakuraTraceTable {
+    table: "queue_send",
+    file_name: "queue_send.jsonl",
+};
+
+/// Shared queue-send trace event names and field keys.
+pub mod queue_send_trace {
+    /// Trace row event field.
+    pub const EVENT: &str = "event";
+    /// Queue send failure event.
+    pub const QUEUE_SEND_FAILED: &str = "queue_send_failed";
+    /// Service label field (`header_sync`, `block_sync`, etc.).
+    pub const SERVICE: &str = "service";
+    /// Wire message label field (`Status`, `GetBlocks`, etc.).
+    pub const MESSAGE: &str = "message";
+    /// Peer field.
+    pub const PEER: &str = "peer";
+    /// Source peer field for forwarded messages.
+    pub const SOURCE_PEER: &str = "source_peer";
+    /// Destination peer field for forwarded messages.
+    pub const DESTINATION_PEER: &str = "destination_peer";
+    /// Bounded send error label (`full`, `closed`, or `encode`).
+    pub const ERROR: &str = "error";
+    /// Logical send reason field.
+    pub const REASON: &str = "reason";
+    /// Remaining outbound queue slots observed after the failed send.
+    pub const QUEUE_CAPACITY: &str = "queue_capacity";
+    /// Total outbound queue slots.
+    pub const QUEUE_MAX_CAPACITY: &str = "queue_max_capacity";
+    /// Range start height field.
+    pub const RANGE_START: &str = "range_start";
+    /// Range count field.
+    pub const RANGE_COUNT: &str = "range_count";
+    /// Returned response count field.
+    pub const RETURNED: &str = "returned";
+    /// Height field.
+    pub const HEIGHT: &str = "height";
+    /// Hash field.
+    pub const HASH: &str = "hash";
+}
+
 /// Shared block-sync trace event names and field keys.
 ///
 /// The block-sync body pipeline has no `tracing`-macro coverage in release
@@ -191,6 +233,8 @@ pub mod block_sync_trace {
     pub const PEERS_WANTING_SLOTS: &str = "peers_wanting_slots";
     /// Connected block-sync peers.
     pub const PEERS: &str = "peers";
+    /// Active reactor service sessions after this event.
+    pub const ACTIVE_CONNECTIONS: &str = "active_connections";
     /// Connected block-sync peers whose status we have received (schedulable).
     pub const PEERS_WITH_STATUS: &str = "peers_with_status";
     /// Lowest height still in the body-sync `needed` set (the gap to fetch next).
@@ -337,6 +381,8 @@ pub mod header_sync_trace {
     pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
     /// Destination peer count field.
     pub const DESTINATION_PEER_COUNT: &str = "destination_peer_count";
+    /// Active reactor service sessions after this event.
+    pub const ACTIVE_CONNECTIONS: &str = "active_connections";
     /// Bounded reason field.
     pub const REASON: &str = "reason";
 
@@ -348,6 +394,10 @@ pub mod header_sync_trace {
     pub const HEADER_STATUS_SENT: &str = "header_status_sent";
     /// Peer status received.
     pub const HEADER_STATUS_RECEIVED: &str = "header_status_received";
+    /// Header-sync peer connected to the reactor.
+    pub const HEADER_PEER_CONNECTED: &str = "header_peer_connected";
+    /// Header-sync peer disconnected from the reactor.
+    pub const HEADER_PEER_DISCONNECTED: &str = "header_peer_disconnected";
     /// Header range request sent.
     pub const HEADER_GET_HEADERS_SENT: &str = "header_get_headers_sent";
     /// Header range response received.
@@ -366,8 +416,8 @@ pub mod header_sync_trace {
     pub const HEADER_NEW_BLOCK_DEDUPED: &str = "header_new_block_deduped";
     /// Peer violation observed.
     pub const HEADER_PEER_VIOLATION: &str = "header_peer_violation";
-    /// Peer disconnect requested.
-    pub const HEADER_PEER_DISCONNECT_REQUESTED: &str = "header_peer_disconnect_requested";
+    /// Peer violation recorded without disconnecting the peer.
+    pub const HEADER_PEER_VIOLATION_RECORDED: &str = "header_peer_violation_recorded";
     /// Header frontier advanced.
     pub const HEADER_FRONTIER_ADVANCED: &str = "header_frontier_advanced";
     /// Header frontier re-anchored down to the verified block frontier.
@@ -394,6 +444,10 @@ pub mod commit_state_trace {
     pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
     /// Result label field.
     pub const RESULT: &str = "result";
+    /// Stable state error variant label field.
+    pub const ERROR_VARIANT: &str = "error_variant";
+    /// Debug-formatted state error field.
+    pub const ERROR_DEBUG: &str = "error_debug";
     /// Bounded reason field.
     pub const REASON: &str = "reason";
     /// Reactor-local block apply token field.
@@ -743,6 +797,17 @@ pub fn reject_reason_label(reason: ZakuraRejectReason) -> &'static str {
         ZakuraRejectReason::ResourceLimit => "resource_limit",
         ZakuraRejectReason::AlreadyConnected => "already_connected",
         ZakuraRejectReason::TemporaryUnavailable => "temporary_unavailable",
+    }
+}
+
+/// Return a stable, bounded label for non-blocking ordered-stream send errors.
+pub(crate) fn ordered_send_error_label(
+    error: &crate::zakura::transport::OrderedSendError,
+) -> &'static str {
+    match error {
+        crate::zakura::transport::OrderedSendError::Full => "full",
+        crate::zakura::transport::OrderedSendError::Closed => "closed",
+        crate::zakura::transport::OrderedSendError::Encode(_) => "encode",
     }
 }
 

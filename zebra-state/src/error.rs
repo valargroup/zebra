@@ -195,6 +195,68 @@ impl From<CommitHeaderRangeError> for CommitCheckpointVerifiedError {
     }
 }
 
+/// An internal invariant of the zakura header store was found violated while
+/// reading it.
+///
+/// This is a **local storage fault**, never evidence about a peer: readers
+/// return it instead of feeding rows from more than one branch (or from beside
+/// a gap) into consensus validation, where the corruption would otherwise
+/// surface as a misleading validation failure (`InvalidDifficultyThreshold`,
+/// `UnknownAnchor`) attributed to whoever supplied the input being validated.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoreIncoherentError {
+    /// The header row at `height` does not link to the stored row below it.
+    #[error(
+        "header store incoherent: header at {height:?} links to {expected_parent} but the stored row below is {actual_below}"
+    )]
+    BrokenLinkage {
+        /// Height of the header whose parent link failed to resolve.
+        height: block::Height,
+        /// The parent hash the header claims (`previous_block_hash`).
+        expected_parent: block::Hash,
+        /// The hash actually stored at `height - 1`.
+        actual_below: block::Hash,
+    },
+
+    /// A header row exists at `height` but the row below it is missing.
+    #[error(
+        "header store incoherent: no stored row at {missing:?} below the header at {height:?}"
+    )]
+    Gap {
+        /// Height of the stored header above the gap.
+        height: block::Height,
+        /// The missing height (`height - 1`).
+        missing: block::Height,
+    },
+
+    /// The header row at `height` is not the block its hash row names.
+    #[error(
+        "header store incoherent: header stored at {height:?} hashes to {computed} but the hash row names {indexed}"
+    )]
+    HeaderHashMismatch {
+        /// Height of the divergent rows.
+        height: block::Height,
+        /// The hash the height→hash index names.
+        indexed: block::Hash,
+        /// The stored header's actual hash.
+        computed: block::Hash,
+    },
+
+    /// The hash→height and height→hash indexes disagree about a hash.
+    #[error(
+        "header store incoherent: hash {hash} is indexed at {height:?} but that height stores {stored:?}"
+    )]
+    BijectionMismatch {
+        /// The hash whose round-trip failed.
+        hash: block::Hash,
+        /// The height the hash→height index reports for it.
+        height: block::Height,
+        /// What the height→hash index stores there instead.
+        stored: Option<block::Hash>,
+    },
+}
+
 /// An error describing why a header-only range could not be committed.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -258,6 +320,21 @@ pub enum CommitHeaderRangeError {
     #[error("header height overflow")]
     HeightOverflow,
 
+    /// A header in the range does not link to the anchor or to its predecessor,
+    /// so committing it would break the header store's linkage invariant.
+    #[error(
+        "header at {height:?} links to {actual_parent} instead of its predecessor {expected_parent}"
+    )]
+    UnlinkedRange {
+        /// Height of the first header that fails to link.
+        height: block::Height,
+        /// The hash of the row the header must link to (the anchor, or the
+        /// previous header in the range).
+        expected_parent: block::Hash,
+        /// The header's actual `previous_block_hash`.
+        actual_parent: block::Hash,
+    },
+
     /// A committed immutable header conflicts with the requested header.
     #[error("header at finalized height {height:?} conflicts with an existing header")]
     ImmutableConflict {
@@ -307,6 +384,15 @@ pub enum CommitHeaderRangeError {
         /// The conflicting height.
         height: block::Height,
     },
+
+    /// The local header store was found internally incoherent while reading
+    /// the context needed to validate the range.
+    ///
+    /// This is a local storage fault, not a peer validation failure: the range
+    /// was rejected because the store cannot supply trustworthy context, not
+    /// because the range itself was shown invalid.
+    #[error("header store incoherent while validating range: {0}")]
+    StoreIncoherent(#[from] StoreIncoherentError),
 
     /// Contextual header validation failed.
     #[error("could not contextually validate header")]
@@ -647,12 +733,14 @@ pub enum ValidateContextError {
 }
 
 impl ValidateContextError {
-    /// Returns the missing VCT supplied-root height for retryable root-fetch stalls.
+    /// Returns the missing VCT supplied-root height for retryable root stalls.
     ///
-    /// This is the subset of [`Self::vct_retryable_height`] that warrants a peer *refetch*:
-    /// the supplied root is absent or was evicted after failing verification, so a different
-    /// peer must supply a replacement. An await-successor stall ([`Self::vct_retryable_height`]
-    /// but not this) already has its root and only waits for the next block to be downloaded.
+    /// This is the subset of [`Self::vct_retryable_height`] where the supplied root itself is
+    /// missing: it was never delivered with its header range, or was evicted after failing
+    /// verification. It can only be filled by a later re-delivery of that header range (for
+    /// example another fanout peer's response); roots are not individually re-requested. An
+    /// await-successor stall ([`Self::vct_retryable_height`] but not this) already has its root
+    /// and only waits for the next block to be downloaded.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
         match self {
             ValidateContextError::VctSuppliedRootUnavailable { height } => Some(*height),
@@ -663,7 +751,8 @@ impl ValidateContextError {
     /// Returns the height for any retryable VCT root stall: either an absent/evicted supplied
     /// root ([`Self::VctSuppliedRootUnavailable`]) or one not yet verifiable because no successor
     /// is buffered to confirm it ([`Self::VctSuppliedRootAwaitingSuccessor`]). The write loop
-    /// parks and retries the same block for both; only the former additionally requests a refetch.
+    /// parks and retries the same block for both; the former polls slower because nothing is
+    /// actively fetching a replacement root.
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
         match self {
             ValidateContextError::VctSuppliedRootUnavailable { height }
@@ -764,12 +853,12 @@ mod tests {
     }
 
     /// An await-successor stall is retryable (the write loop parks and re-commits) but is
-    /// *not* a refetch case: the root is present, only its successor is missing. So it must
-    /// surface through `vct_retryable_height` while `vct_supplied_root_unavailable_height`
-    /// (which gates the peer refetch) stays `None` — otherwise the committer would spam
-    /// pointless refetches for a root it already holds.
+    /// *not* a missing-root case: the root is present, only its successor is missing. So it
+    /// must surface through `vct_retryable_height` while
+    /// `vct_supplied_root_unavailable_height` (which selects the slower missing-root wait)
+    /// stays `None` — otherwise the committer would poll slowly for a root it already holds.
     #[test]
-    fn await_successor_is_retryable_but_not_a_refetch() {
+    fn await_successor_is_retryable_but_not_root_unavailable() {
         let height = Height(7);
         let awaiting: CommitCheckpointVerifiedError =
             ValidateContextError::VctSuppliedRootAwaitingSuccessor { height }.into();
@@ -782,10 +871,10 @@ mod tests {
         assert_eq!(
             awaiting.vct_supplied_root_unavailable_height(),
             None,
-            "an await-successor stall must not trigger a peer refetch (the root is present)",
+            "an await-successor stall is not a missing root (the root is present)",
         );
 
-        // The unavailable case is both retryable and a refetch trigger.
+        // The unavailable case is both retryable and a missing root.
         let unavailable: CommitCheckpointVerifiedError =
             ValidateContextError::VctSuppliedRootUnavailable { height }.into();
         assert_eq!(unavailable.vct_retryable_height(), Some(height));
