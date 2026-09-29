@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org).
 
 ### Changed
 
+- Prepare the ZIP 2008 mainnet FPF/ZCG address rotation for NU7 (draft; deployment requires confirmation).
+
 - Verified-commitment-trees fast sync is now enabled by default when checkpoint
   sync is enabled. Operators can keep checkpoint sync but opt out of the new
   path by setting `consensus.vct_fast_sync = false`.
