@@ -172,7 +172,7 @@ RUN --mount=type=bind,source=tower-batch-control,target=tower-batch-control \
 
 # This stage starts from scratch using Debian and copies the built Zebra binaries
 # from the `release` stage along with other binaries and files.
-FROM debian:trixie-slim AS runtime
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS runtime
 
 ARG FEATURES
 ENV FEATURES=${FEATURES}
